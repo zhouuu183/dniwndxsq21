@@ -1,0 +1,228 @@
+import torch
+import torch.nn.functional as F
+
+
+PRIMARY_FACE_LABELS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17)
+PRIMARY_CONTEXT_LABELS = PRIMARY_FACE_LABELS + (13, 14, 18)
+OCCLUDER_LABELS = (14, 18)
+NECK_LABELS = (16, 17)
+CLOTH_LABELS = (18,)
+
+
+def _ensure_batch(mask: torch.Tensor) -> torch.Tensor:
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)
+    elif mask.dim() == 3:
+        mask = mask.unsqueeze(0)
+    return mask
+
+
+def _to_mask(mask: torch.Tensor) -> torch.Tensor:
+    mask = _ensure_batch(mask)
+    return (mask > 0.5).float()
+
+
+def _dilate(mask: torch.Tensor, width: int) -> torch.Tensor:
+    if width <= 0:
+        return mask
+    kernel = 2 * width + 1
+    return F.max_pool2d(mask, kernel_size=kernel, stride=1, padding=width)
+
+
+def _erode(mask: torch.Tensor, width: int) -> torch.Tensor:
+    if width <= 0:
+        return mask
+    kernel = 2 * width + 1
+    return 1.0 - F.max_pool2d(1.0 - mask, kernel_size=kernel, stride=1, padding=width)
+
+
+def _label_mask(parsing_mask: torch.Tensor, labels: tuple[int, ...]) -> torch.Tensor:
+    mask = torch.zeros_like(parsing_mask, dtype=torch.bool)
+    for label in labels:
+        mask |= parsing_mask == label
+    return mask
+
+
+def drop_parsing_labels(parsing_mask: torch.Tensor, labels: tuple[int, ...] | None = None) -> torch.Tensor:
+    parsing_mask = _ensure_batch(parsing_mask).clone()
+    labels = OCCLUDER_LABELS if labels is None else labels
+    for label in labels:
+        parsing_mask = torch.where(parsing_mask == label, torch.zeros_like(parsing_mask), parsing_mask)
+    return parsing_mask
+
+
+def build_primary_subject_support(
+    parsing_mask: torch.Tensor,
+    central_ratio: float = 0.65,
+    face_labels: tuple[int, ...] | None = None,
+    context_labels: tuple[int, ...] | None = None,
+) -> torch.Tensor:
+    parsing_mask = _ensure_batch(parsing_mask)
+    _, _, height, width = parsing_mask.shape
+
+    face_labels = PRIMARY_FACE_LABELS if face_labels is None else face_labels
+    context_labels = PRIMARY_CONTEXT_LABELS if context_labels is None else context_labels
+    face_mask = _label_mask(parsing_mask, face_labels)
+    context_mask = _label_mask(parsing_mask, context_labels)
+
+    y_margin = int(round((1.0 - central_ratio) * 0.5 * height))
+    x_margin = int(round((1.0 - central_ratio) * 0.5 * width))
+    central_window = torch.zeros_like(face_mask)
+    central_window[..., y_margin:height - y_margin, x_margin:width - x_margin] = True
+
+    support = torch.zeros_like(parsing_mask, dtype=torch.float32)
+    for idx in range(parsing_mask.shape[0]):
+        anchor = face_mask[idx : idx + 1] & central_window[idx : idx + 1]
+        if not anchor.any():
+            anchor = face_mask[idx : idx + 1]
+        if not anchor.any():
+            anchor = context_mask[idx : idx + 1] & central_window[idx : idx + 1]
+        if not anchor.any():
+            anchor = context_mask[idx : idx + 1]
+        if not anchor.any():
+            support[idx].fill_(1.0)
+            continue
+
+        coords = torch.nonzero(anchor[0, 0], as_tuple=False)
+        y_min = int(coords[:, 0].min().item())
+        y_max = int(coords[:, 0].max().item())
+        x_min = int(coords[:, 1].min().item())
+        x_max = int(coords[:, 1].max().item())
+
+        span = max(y_max - y_min + 1, x_max - x_min + 1)
+        pad_x = max(18, int(round(0.55 * span)))
+        pad_top = max(24, int(round(0.90 * span)))
+        pad_bottom = max(30, int(round(1.55 * span)))
+
+        y0 = max(0, y_min - pad_top)
+        y1 = min(height, y_max + pad_bottom + 1)
+        x0 = max(0, x_min - pad_x)
+        x1 = min(width, x_max + pad_x + 1)
+        support[idx, :, y0:y1, x0:x1] = 1.0
+
+    return support
+
+
+def apply_subject_support(parsing_mask: torch.Tensor, subject_support: torch.Tensor) -> torch.Tensor:
+    parsing_mask = _ensure_batch(parsing_mask)
+    subject_support = _to_mask(subject_support)
+    return torch.where(subject_support > 0.5, parsing_mask, torch.zeros_like(parsing_mask))
+
+
+def filter_parsing_to_primary_subject(
+    parsing_mask: torch.Tensor,
+    subject_support: torch.Tensor | None = None,
+    face_labels: tuple[int, ...] | None = None,
+    context_labels: tuple[int, ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    parsing_mask = _ensure_batch(parsing_mask)
+    if subject_support is None:
+        subject_support = build_primary_subject_support(
+            parsing_mask,
+            face_labels=face_labels,
+            context_labels=context_labels,
+        )
+    filtered = apply_subject_support(parsing_mask, subject_support)
+    return filtered, subject_support
+
+
+def restrict_hair_mask_to_subject(hair_mask: torch.Tensor, subject_support: torch.Tensor) -> torch.Tensor:
+    return (_to_mask(hair_mask) * _to_mask(subject_support)).clamp(0, 1)
+
+
+def build_delta_masks(
+    src_hair: torch.Tensor,
+    tgt_hair: torch.Tensor,
+    ref_hair: torch.Tensor | None = None,
+    boundary_width: int = 5,
+) -> dict[str, torch.Tensor]:
+    src = _to_mask(src_hair)
+    tgt = _to_mask(tgt_hair)
+    ref = _to_mask(ref_hair) if ref_hair is not None else tgt.clone()
+
+    add = (tgt * (1.0 - src)).clamp(0, 1)
+    remove = (src * (1.0 - tgt)).clamp(0, 1)
+    keep = (src * tgt).clamp(0, 1)
+
+    delta = (add + remove).clamp(0, 1)
+    boundary = (_dilate(delta, boundary_width) - _erode(delta, boundary_width)).clamp(0, 1)
+    ref_overlap = (ref * tgt).clamp(0, 1)
+
+    return {
+        "M_src": src,
+        "M_tgt": tgt,
+        "M_add": add,
+        "M_remove": remove,
+        "M_keep": keep,
+        "M_boundary": boundary,
+        "M_ref_overlap": ref_overlap,
+    }
+
+
+def enrich_delta_masks_with_halo(
+    src_parsing: torch.Tensor,
+    delta_masks: dict[str, torch.Tensor],
+    subject_support: torch.Tensor | None = None,
+    halo_width: int = 9,
+    face_labels: tuple[int, ...] | None = None,
+) -> dict[str, torch.Tensor]:
+    parsing = _ensure_batch(src_parsing)
+    if subject_support is None:
+        subject_support = build_primary_subject_support(parsing, face_labels=face_labels)
+
+    subject_support = _to_mask(subject_support)
+    face_labels = PRIMARY_FACE_LABELS if face_labels is None else face_labels
+    face_region = (_label_mask(parsing, face_labels).float() * subject_support).clamp(0, 1)
+    neck_region = (_label_mask(parsing, NECK_LABELS).float() * subject_support).clamp(0, 1)
+    cloth_region = (_label_mask(parsing, CLOTH_LABELS).float() * subject_support).clamp(0, 1)
+    body_region = (neck_region + cloth_region).clamp(0, 1)
+    context_region = (subject_support * (1.0 - face_region - body_region).clamp(0, 1)).clamp(0, 1)
+
+    remove = _to_mask(delta_masks["M_remove"])
+    tgt = _to_mask(delta_masks["M_tgt"])
+    remove_halo = (_dilate(remove, halo_width) - remove).clamp(0, 1)
+    remove_halo = (remove_halo * (1.0 - tgt) * subject_support).clamp(0, 1)
+    body_preserve = (_dilate(body_region, 11) * (1.0 - tgt)).clamp(0, 1)
+    cloth_guard = (_dilate(cloth_region, 9) * (1.0 - tgt)).clamp(0, 1)
+    body_preserve = (body_preserve + 0.75 * cloth_guard).clamp(0, 1)
+    remove_halo = (remove_halo * (1.0 - 0.90 * body_preserve)).clamp(0, 1)
+    remove_face = ((remove + 0.85 * remove_halo) * _dilate(face_region, 2)).clamp(0, 1)
+    remove_context = (remove_halo * context_region).clamp(0, 1)
+    remove_neck = ((remove + 0.45 * remove_halo) * _dilate(neck_region, 4) * (1.0 - 0.70 * cloth_guard)).clamp(0, 1)
+
+    _, _, height, _ = parsing.shape
+    y_coords = torch.linspace(0.0, 1.0, steps=height, device=parsing.device).view(1, 1, height, 1)
+    lower_region = (y_coords > 0.58).float()
+    remove_tail = ((remove + 0.90 * remove_halo) * lower_region * (1.0 - 0.55 * face_region) * (1.0 - 0.80 * body_preserve)).clamp(0, 1)
+
+    enriched = dict(delta_masks)
+    enriched.update(
+        {
+            "M_remove_halo": remove_halo,
+            "M_remove_face": remove_face,
+            "M_remove_neck": remove_neck,
+            "M_remove_context": remove_context,
+            "M_remove_tail": remove_tail,
+            "M_subject_support": subject_support,
+            "M_face_region": face_region,
+            "M_neck_region": neck_region,
+            "M_cloth_region": cloth_region,
+            "M_body_region": body_region,
+            "M_body_preserve": body_preserve,
+            "M_context_region": context_region,
+        }
+    )
+    return enriched
+
+
+def stack_satd_masks(delta_masks: dict[str, torch.Tensor]) -> torch.Tensor:
+    return torch.cat(
+        [
+            delta_masks["M_add"],
+            delta_masks["M_remove"],
+            delta_masks["M_keep"],
+            delta_masks["M_boundary"],
+            delta_masks["M_ref_overlap"],
+        ],
+        dim=1,
+    )
