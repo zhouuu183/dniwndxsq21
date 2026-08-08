@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+*.log
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.zip
+*.tar
+*.tar.gz
