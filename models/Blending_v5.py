@@ -502,12 +502,32 @@ class BlendingV5(Blending_v8):
         # hair toward the source.  Reuse the exact same transform, restricted
         # to the repaired target-hair mask, for a deterministic final hand-off.
         I_final_raw = I_final
+        # The V5 final compositor has already declared the semantic face and
+        # the recovered accessory target-owned.  Exclude both from the last
+        # high-resolution colour correction too; otherwise a dilated hair mask
+        # can reintroduce a narrow forehead/cheek colour band after PP has
+        # restored the correct target pixels.
+        final_color_exclude = torch.zeros(
+            I_final.shape[0],
+            1,
+            I_final.shape[-2],
+            I_final.shape[-1],
+            device=I_final.device,
+            dtype=I_final.dtype,
+        )
+        for key in ("earring_write_mask", "output_face_target_authority_mask"):
+            value = aux.get(key)
+            if value is not None:
+                final_color_exclude = torch.maximum(
+                    final_color_exclude,
+                    self._as_mask(value, I_final.shape[-2:], I_final.dtype),
+                )
         I_final, _ = self._restore_authoritative_color_after_pp(
             I_final_raw,
             color_before_pp,
             HM_X,
             kwargs,
-            earring_exclude_mask=aux.get("earring_write_mask"),
+            earring_exclude_mask=final_color_exclude,
         )
 
         if save_all:
@@ -619,6 +639,7 @@ class BlendingV5(Blending_v8):
                 "earring_fine_floor_support",
                 "output_source_earring_composite_mask",
                 "output_v5_earring_edit_mask",
+                "output_face_target_authority_mask",
                 "fine_mask",
                 "prior_mask",
                 "source_hair_face_feature_suppress_mask",

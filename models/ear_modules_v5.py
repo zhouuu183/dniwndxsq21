@@ -222,10 +222,17 @@ def build_weak_earring_masks(
             parsing = F.interpolate(parsing, size=image_size, mode="nearest")
         parser_mask = torch.clamp(parser_mask + (parsing.long() == RAW_EARRING).float(), 0, 1)
         source_ear_mask = parsing_label_mask(parsing, RAW_EAR_SURFACE_LABELS)
+        # This is a detection/search corridor, not a write mask.  The previous
+        # 18px lower extent was shorter than the radius of a normal hoop at
+        # 256px, so parser-missed hoops were reduced to the few pixels beside
+        # the lobe before the strong-object check even ran.  The final write
+        # mask remains constrained to connected visual evidence below.
         source_lobe_roi = torch.clamp(
             dilate_mask(source_ear_mask, 13)
             + dilate_mask(shift_mask(source_ear_mask, down=8), 15)
-            + dilate_mask(shift_mask(source_ear_mask, down=18), 11)
+            + dilate_mask(shift_mask(source_ear_mask, down=20), 13)
+            + dilate_mask(shift_mask(source_ear_mask, down=38), 11)
+            + dilate_mask(shift_mask(source_ear_mask, down=56), 9)
             + dilate_mask(parser_mask, 11),
             0,
             1,
@@ -698,9 +705,12 @@ def build_strong_earring_candidate(
         plausible = (
             (area >= float(min_area) * area_scale)
             & (density <= float(max_roi_density))
-            # A fully parser-missed wire may be labelled background, but a
-            # broad background region fails the candidate density/edge tests.
-            & (background_ratio <= 0.98)
+            # A fully parser-missed wire is commonly labelled background at
+            # every wire pixel.  Do not reject that exact case here: the small
+            # area/density, structured visual evidence, hair rejection and
+            # lobe-attachment checks above are what distinguish it from a broad
+            # lower-ear background patch.
+            & (background_ratio <= 1.0)
             & (hair_ratio <= 0.40)
             & near_lobe
         ).to(side.dtype).view(-1, 1, 1, 1)
@@ -1233,19 +1243,26 @@ def expand_valid_roi_by_completion(
         completed = F.interpolate(completed, size=valid.shape[-2:], mode="nearest")
     completed_bin = (completed > 0.5).float()
 
+    # Thin hoop wires routinely have one- or two-pixel antialiasing gaps at
+    # 256px.  Build a temporary connectivity guide for traversal only, then
+    # return the original visual pixels.  Returning the guide itself would
+    # reintroduce the background-filled hoop and ear-hole failure.
+    bridge = max(1, int(seed_dilate))
+    guide = dilate_mask(completed_bin, bridge)
     # Seed: completed-earring pixels already inside (or touching) the shell.
-    seed = (dilate_mask(valid, seed_dilate) * completed_bin).clamp(0, 1)
+    seed = (dilate_mask(valid, bridge) * guide).clamp(0, 1)
     if seed.sum() == 0:
         return valid
 
     grown = seed
     for _ in range(int(grow_iters)):
-        nxt = (dilate_mask(grown, 3) * completed_bin).clamp(0, 1)
+        nxt = (dilate_mask(grown, 3) * guide).clamp(0, 1)
         if nxt.sum() == grown.sum():
             break
         grown = nxt
 
-    return torch.clamp(valid + grown, 0, 1)
+    reached_visual = completed_bin * dilate_mask(grown, bridge)
+    return torch.clamp(valid + reached_visual, 0, 1)
 
 
 def _weighted_centroid(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

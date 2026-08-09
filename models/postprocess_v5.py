@@ -370,6 +370,12 @@ class PostProcessModelV5(nn.Module):
                 >= float(getattr(self.args, "min_target_ear_area", 8.0))
             ).to(reference.dtype).view(-1, 1, 1, 1)
         side_gate = torch.clamp(left_active * left_roi + right_active * right_roi, 0, 1)
+        # ``left/right_roi`` are deliberately compact ear-local regions.  They
+        # are suitable for deciding which side is visible, but are too short to
+        # be a final geometric clip for a parser-missed hoop.  Keep the scalar
+        # visibility decision separately so a validated outer arc can extend
+        # beyond the raw ear box without opening a covered side.
+        visible_side_gate = torch.clamp(left_active + right_active, 0, 1)
         earring_roi = earring_roi * side_gate
 
         left_lobe_anchor = self._mask_like(query_info.get("left_lobe_anchor"), reference)
@@ -394,10 +400,10 @@ class PostProcessModelV5(nn.Module):
         )
         trusted_object = (
             trusted_left * left_active + trusted_right * right_active
-        ).clamp(0, 1) * side_gate
+        ).clamp(0, 1) * visible_side_gate
         completion_candidate = (
             completion_left * left_active + completion_right * right_active
-        ).clamp(0, 1) * side_gate
+        ).clamp(0, 1) * visible_side_gate
 
         # A parser-missed hoop's outer arc must not be clipped by the original
         # ear shell. Expansion is confined to the validated, lobe-connected
@@ -407,7 +413,7 @@ class PostProcessModelV5(nn.Module):
             trusted_object,
             grow_iters=int(getattr(self.args, "earring_write_connectivity_iters", 32)),
             seed_dilate=max(1, int(getattr(self.args, "earring_write_bridge_dilate", 5))),
-        ) * side_gate
+        ) * visible_side_gate
 
         source_labels = ensure_mask_4d(source_parsing).to(device=reference.device)
         if source_labels.shape[-2:] != reference.shape[-2:]:
@@ -1936,14 +1942,12 @@ class PostProcessModelV5(nn.Module):
         )
         if target_authority is None:
             return image_01 * 2 - 1
-        protected = target_authority
 
-        hair_authority = resize_rgb(aux.get("authoritative_hair_highres_01"), mode="bicubic")
-        hair_preserve = self._target_output_preserve_mask(aux, image_01.shape[-2:])
-        if hair_authority is not None and hair_preserve is not None:
-            protected = protected * (1.0 - hair_preserve) + hair_authority * hair_preserve
-
-        mask_reference = image_01[:, :1] if hair_preserve is None else hair_preserve
+        # Compute the exact earring write region before composing the protected
+        # target.  Every other semantic face pixel is restored below after the
+        # high-resolution hair hand-off, which prevents that hand-off from
+        # bleeding colour into a parser-boundary forehead or cheek pixel.
+        mask_reference = image_01[:, :1]
         earring_edit = self._mask_like(aux.get("earring_write_mask"), mask_reference)
         no_earring = aux.get("no_earring_case_mask")
         if no_earring is not None:
@@ -1955,6 +1959,37 @@ class PostProcessModelV5(nn.Module):
         if ear_boundary is not None:
             earring_edit = earring_edit * (1.0 - self._mask_like(ear_boundary, earring_edit)).clamp(0, 1)
 
+        protected = target_authority
+        hair_authority = resize_rgb(aux.get("authoritative_hair_highres_01"), mode="bicubic")
+        hair_preserve = self._target_output_preserve_mask(aux, image_01.shape[-2:])
+        if hair_authority is not None and hair_preserve is not None:
+            protected = protected * (1.0 - hair_preserve) + hair_authority * hair_preserve
+
+        # ``authoritative_hair_highres`` is intentionally allowed to replace
+        # generated hair, but a hair-parser dilation can overlap the forehead,
+        # cheeks or an exposed ear by a few pixels.  In V5 these semantic face
+        # pixels have no PP task at all.  Give them back to the pre-PP target
+        # here, leaving only the already verified earring object open.
+        face_authority = torch.zeros_like(earring_edit)
+        for key in (
+            "target_face_surface_mask",
+            "target_skin_surface_mask",
+            "target_left_ear_mask",
+            "target_right_ear_mask",
+        ):
+            value = aux.get(key)
+            if value is not None:
+                face_authority = torch.maximum(face_authority, self._mask_like(value, face_authority))
+        target_parsing = aux.get("target_parsing")
+        if target_parsing is not None:
+            face_labels = parsing_label_mask(
+                target_parsing,
+                RAW_FACE_SURFACE_LABELS + RAW_SKIN_SURFACE_LABELS + RAW_DETAIL_LABELS,
+            )
+            face_authority = torch.maximum(face_authority, self._mask_like(face_labels, face_authority))
+        face_authority = face_authority * (1.0 - earring_edit).clamp(0, 1)
+        protected = protected * (1.0 - face_authority) + target_authority * face_authority
+
         if bool(getattr(self.args, "enable_direct_earring_restore", True)):
             reference = resize_rgb(
                 aux.get("earring_reference_01", aux.get("source_01")),
@@ -1964,6 +1999,7 @@ class PostProcessModelV5(nn.Module):
                 protected = protected * (1.0 - earring_edit) + reference * earring_edit
         else:
             protected = protected * (1.0 - earring_edit) + image_01 * earring_edit
+        aux["output_face_target_authority_mask"] = face_authority
         aux["output_source_earring_composite_mask"] = earring_edit
         aux["output_v5_earring_edit_mask"] = earring_edit
         return protected.clamp(0, 1) * 2 - 1

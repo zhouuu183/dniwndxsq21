@@ -69,7 +69,7 @@ PP_EXTRA_MASK_KEYS = (
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
 USER_FACE_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/mix_ear/")  #"/hf_h/images/FFHQ_short_long/"   hf_h/images/mix_ear/   HairFastGAN/images/ear/
-USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ_color/")  #"images/FFHQ_short_long"  HairFastGAN/images/FFHQ_short/   hf_h/images/FFHQ_short_long/
+USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ_short/")  #"images/FFHQ_short_long"  HairFastGAN/images/FFHQ_short/   hf_h/images/FFHQ_short_long/
 USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.9")
 USER_DATASET_SIZE_SMALL = 0  # 0 means use every source image.
 USER_CHUNK_SIZE_SMALL = 130
@@ -569,8 +569,13 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
     right_roi = resize_or_zero(query_info.get("right_ear_roi"))
     left_active = resize_or_zero(query_info.get("left_side_active"))
     right_active = resize_or_zero(query_info.get("right_side_active"))
-    visible_side_gate = torch.clamp(left_active * left_roi + right_active * right_roi, 0, 1)
-    earring_roi = earring_roi * visible_side_gate
+    # The compact ear ROIs decide whether a side is exposed.  They must not
+    # geometrically crop a validated parser-missed hoop after its outer arc has
+    # been recovered, otherwise generated supervision disagrees with V5
+    # inference and teaches the model to keep only lobe-adjacent dots.
+    ear_roi_gate = torch.clamp(left_active * left_roi + right_active * right_roi, 0, 1)
+    visible_side_gate = torch.clamp(left_active + right_active, 0, 1)
+    earring_roi = earring_roi * ear_roi_gate
 
     earlobe_anchor = (
         resize_or_zero(query_info.get("left_lobe_anchor")) * left_active * left_roi
@@ -591,8 +596,12 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
         resize_or_zero(query_info.get("left_lobe_anchor")),
         resize_or_zero(query_info.get("right_lobe_anchor")),
     )
-    selected_object = (trusted_left * left_active + trusted_right * right_active).clamp(0, 1)
-    candidate_mask = (completion_left * left_active + completion_right * right_active).clamp(0, 1)
+    selected_object = (
+        trusted_left * left_active + trusted_right * right_active
+    ).clamp(0, 1) * visible_side_gate
+    candidate_mask = (
+        completion_left * left_active + completion_right * right_active
+    ).clamp(0, 1) * visible_side_gate
     earring_roi = expand_valid_roi_by_completion(
         earring_roi,
         selected_object,
