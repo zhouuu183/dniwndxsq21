@@ -64,11 +64,11 @@ PP_EXTRA_MASK_KEYS = (
 )
 
 # ========================= User Config: edit here only =========================
-USER_DATASET_PROFILE = "full_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
+USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
 USER_FACE_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/mix_ear/")  #"/hf_h/images/FFHQ_short_long/"   hf_h/images/mix_ear/   HairFastGAN/images/ear/
 USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/hf_h/images/FFHQ_short_long/")  #"images/FFHQ_short_long"  HairFastGAN/images/FFHQ_short/   hf_h/images/FFHQ_short_long/
-USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.6")
+USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.9")
 USER_DATASET_SIZE_SMALL = 0  # 0 means use every source image.
 USER_CHUNK_SIZE_SMALL = 130
 USER_MASK_BATCH_SIZE_SMALL = 8
@@ -82,6 +82,10 @@ USER_MASK_BATCH_SIZE_FULL = 16
 
 USER_RANDOM_SEED = 3407
 USER_BLENDING_CHECKPOINT = "/root/shared-nvme/HairFastGAN/checkpoints/blending_3000best.pth"
+# PP target construction may deliberately use the pre-v8 blending checkpoint
+# above.  The resulting PP dataset records this choice in dataset_config.json;
+# it is not an inference default for a newly trained blending checkpoint.
+USER_ALLOW_LEGACY_BLENDING_CHECKPOINT_V8 = True
 USER_USE_SATD_V8 = True
 USER_SATD_CHECKPOINT_V8 = "/root/shared-nvme/HairFastGAN/checkpoints/satd_3000_best.pth"
 USER_SATD_BLEND_V8 = 0.28
@@ -191,6 +195,7 @@ RESOLVED_USER_CONFIG = {
     "size": ACTIVE_DATASET_SIZE,
     "output": ACTIVE_OUTPUT_DIR,
     "blending_checkpoint": USER_BLENDING_CHECKPOINT,
+    "allow_legacy_blending_checkpoint_v8": USER_ALLOW_LEGACY_BLENDING_CHECKPOINT_V8,
     "use_satd_v8": USER_USE_SATD_V8,
     "satd_checkpoint_v8": USER_SATD_CHECKPOINT_V8,
     "satd_blend_v8": USER_SATD_BLEND_V8,
@@ -343,6 +348,12 @@ def build_parser(defaults):
     parser.add_argument("--size", type=int, default=defaults["size"])
     parser.add_argument("--output", type=Path, default=defaults["output"])
     parser.add_argument("--blending_checkpoint", type=str, default=defaults["blending_checkpoint"])
+    parser.add_argument(
+        "--allow_legacy_blending_checkpoint_v8",
+        type=str2bool,
+        default=defaults["allow_legacy_blending_checkpoint_v8"],
+        help="Allow a pre-v8 blending checkpoint only while constructing PP data.",
+    )
     parser.add_argument("--use_satd_v8", type=str2bool, default=defaults["use_satd_v8"])
     parser.add_argument("--satd_checkpoint_v8", type=str, default=defaults["satd_checkpoint_v8"])
     parser.add_argument("--satd_blend_v8", type=float, default=defaults["satd_blend_v8"])
@@ -1209,6 +1220,7 @@ def main(args):
     model_args = model_parser.parse_args([])
     model_args.smooth = args.smooth
     model_args.blending_checkpoint = args.blending_checkpoint
+    model_args.allow_legacy_blending_checkpoint_v8 = args.allow_legacy_blending_checkpoint_v8
     model_args.use_satd_v8 = args.use_satd_v8
     model_args.satd_checkpoint_v8 = args.satd_checkpoint_v8
     model_args.satd_blend_v8 = args.satd_blend_v8
