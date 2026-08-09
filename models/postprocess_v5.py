@@ -567,6 +567,7 @@ class PostProcessModelV5(nn.Module):
             query_info.get("right_lobe_anchor", query_info.get("target_right_ear_mask", detection_ear_roi)),
             source_background_mask=(source_labels.long() == 0).to(dtype=query_mask.dtype),
             source_hair_mask=query_info.get("source_hair_mask"),
+            source_ear_mask=parsing_label_mask(source_parsing, RAW_EAR_SURFACE_LABELS),
         )
         query_info["strong_earring_candidate_core"] = strong_info["strong_candidate_mask"]
         query_info["left_strong_candidate"] = strong_info["left_strong_candidate"]

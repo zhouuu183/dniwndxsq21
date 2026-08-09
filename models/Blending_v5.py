@@ -363,6 +363,7 @@ class BlendingV5(Blending_v8):
         color_before_pp: torch.Tensor,
         target_hair_mask: torch.Tensor,
         kwargs: dict,
+        earring_exclude_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Lift the 256px colour decision to the high-res generated hair.
 
@@ -377,6 +378,16 @@ class BlendingV5(Blending_v8):
         low_delta = desired - low
         delta = F.interpolate(low_delta, size=image.shape[-2:], mode="bicubic", align_corners=False)
         mask = self._as_mask(target_hair_mask, image.shape[-2:], image.dtype)
+        if earring_exclude_mask is not None:
+            # A recovered earring can sit in front of target hair.  The final
+            # hair-colour correction must not recolour that exact object after
+            # V5 restored it.
+            exclude = self._as_mask(
+                earring_exclude_mask,
+                image.shape[-2:],
+                image.dtype,
+            )
+            mask = mask * (1.0 - exclude).clamp(0, 1)
         feather = max(0, int(kwargs.get(
             "hair_color_feather_radius_v8",
             getattr(self.opts, "hair_color_feather_radius_v8", 5),
@@ -496,6 +507,7 @@ class BlendingV5(Blending_v8):
             color_before_pp,
             HM_X,
             kwargs,
+            earring_exclude_mask=aux.get("earring_write_mask"),
         )
 
         if save_all:

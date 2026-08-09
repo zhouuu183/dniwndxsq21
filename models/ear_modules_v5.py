@@ -619,6 +619,7 @@ def build_strong_earring_candidate(
     *,
     source_background_mask: torch.Tensor | None = None,
     source_hair_mask: torch.Tensor | None = None,
+    source_ear_mask: torch.Tensor | None = None,
     min_area: float = 5.0,
     max_roi_density: float = 0.28,
 ) -> dict[str, torch.Tensor]:
@@ -641,6 +642,7 @@ def build_strong_earring_candidate(
     right_anchor = _resize_like_mask(right_lobe_anchor, reference)
     background = _resize_like_mask(source_background_mask, reference)
     hair = _resize_like_mask(source_hair_mask, reference)
+    source_ear = _resize_like_mask(source_ear_mask, reference)
     source_01 = F.interpolate(source_01, size=size, mode="bilinear", align_corners=False)
 
     edge = sobel_magnitude(source_01)
@@ -648,7 +650,23 @@ def build_strong_earring_candidate(
     local_contrast = (rgb_to_gray(source_01) - low_pass_filter(rgb_to_gray(source_01), 9, 2.0)).abs()
     edge_support = _masked_threshold_candidate(edge, ear_roi, max_ratio=0.35, std_ratio=0.55, floor=0.008)
     chroma_support = _masked_threshold_candidate(chroma + local_contrast, ear_roi, max_ratio=0.35, std_ratio=0.60, floor=0.018)
-    object_evidence = candidate * torch.clamp(edge_support + chroma_support, 0, 1)
+    contrast_support = _masked_threshold_candidate(
+        local_contrast,
+        ear_roi,
+        max_ratio=0.28,
+        std_ratio=0.40,
+        floor=0.006,
+    )
+
+    # Large metal hoops are often parser-missed and their thin wire may be
+    # absent from the weak candidate after thresholding.  Promote only the
+    # high-contrast wire *outside* the semantic ear surface; this admits the
+    # visible ring while rejecting the ear's own contour as a fake accessory.
+    # It remains subject to side, lobe and density checks below.
+    ear_exterior = (1.0 - dilate_mask(source_ear, 5)).clamp(0, 1)
+    visual_wire = edge_support * contrast_support * ear_exterior * ear_roi
+    candidate = torch.maximum(candidate, visual_wire)
+    object_evidence = candidate * torch.clamp(edge_support + chroma_support + contrast_support, 0, 1)
     # A parser-missed metal wire is often labelled background.  Do not erase it
     # pixel-wise here; reject components by *coverage ratio* below instead.
     # Hair still receives a strong attenuation because hair edges are the most
@@ -656,13 +674,19 @@ def build_strong_earring_candidate(
     object_evidence = object_evidence * (1.0 - 0.75 * hair).clamp(0, 1) * ear_roi
     object_evidence = dilate_mask(object_evidence, 3) * candidate * ear_roi
 
-    left, right = assign_components_to_ear_sides(
-        object_evidence,
+    # A hoop wire frequently has one-pixel gaps after 256px downsampling.  Use
+    # a small proxy solely to assign all arcs to the same ear side, then return
+    # the original thin evidence so no background is added to the write mask.
+    component_proxy = dilate_mask(object_evidence, 3) * ear_roi
+    left_proxy, right_proxy = assign_components_to_ear_sides(
+        component_proxy,
         left_roi,
         right_roi,
         left_anchor,
         right_anchor,
     )
+    left = object_evidence * (left_proxy > 0.5).to(object_evidence.dtype)
+    right = object_evidence * (right_proxy > 0.5).to(object_evidence.dtype)
     area_scale = float(size[0] * size[1]) / float(256 * 256)
 
     def validate(side: torch.Tensor, roi: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:

@@ -23,6 +23,7 @@ from models.ear_modules_v5 import (
     EarAnchoredQueryBuilder,
     FaceParsingHelperV5,
     HairMaskExtractorV5,
+    RAW_EAR_SURFACE_LABELS,
     RAW_EARRING,
     align_earring_reference_to_target,
     build_earring_highlight_mask,
@@ -34,6 +35,7 @@ from models.ear_modules_v5 import (
     build_weak_earring_masks,
     enhance_query_with_earring_recall,
     assign_components_to_ear_sides,
+    parsing_label_mask,
     resize_mask,
 )
 from utils.bicubic import BicubicDownSample
@@ -494,6 +496,7 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
         query_info.get("right_lobe_anchor", query_info.get("target_right_ear_mask", reference)),
         source_background_mask=(parsing.long() == 0).to(dtype=reference.dtype),
         source_hair_mask=query_info.get("source_hair_mask"),
+        source_ear_mask=parsing_label_mask(parsing, RAW_EAR_SURFACE_LABELS),
     )
     strong_candidate = strong_info["strong_candidate_mask"]
 
