@@ -496,6 +496,11 @@ class PostProcessModelV5(nn.Module):
         query_info["left_search_mask"], query_info["right_search_mask"] = assign_components_to_ear_sides(
             search_mask, left_roi, right_roi, left_lobe_anchor, right_lobe_anchor
         )
+        # Keep target-side openness separate from source-earring presence.
+        # A missed small source earring must not erase the fact that its target
+        # lobe is exposed before the high-resolution instance detector runs.
+        query_info["left_target_side_open"] = left_active
+        query_info["right_target_side_open"] = right_active
         query_info["left_side_active"] = left_active * active
         query_info["right_side_active"] = right_active * active
         query_info["target_hair_ear_bridge_mask"] = target_hair_bridge
@@ -1992,6 +1997,7 @@ class PostProcessModelV5(nn.Module):
         highres_instance_hole = torch.zeros_like(earring_edit)
         highres_geometry_trace = torch.zeros_like(earring_edit)
         highres_geometry_hole = torch.zeros_like(earring_edit)
+        highres_geometry_footprint = torch.zeros_like(earring_edit)
         if earring_reference is not None:
             source_seed = torch.zeros_like(earring_edit)
             for key in (
@@ -2017,20 +2023,18 @@ class PostProcessModelV5(nn.Module):
                 if aux.get("source_parsing") is not None
                 else None,
             )
-            left_active = resize_earring_mask(aux.get("left_side_active"))
-            right_active = resize_earring_mask(aux.get("right_side_active"))
-            highres_geometry_trace = torch.clamp(
-                highres_geometry["left_elliptical_hoop"] * left_active
-                + highres_geometry["right_elliptical_hoop"] * right_active,
-                0,
-                1,
+            left_active = resize_earring_mask(
+                aux.get("left_target_side_open", aux.get("left_side_active"))
             )
-            highres_geometry_hole = torch.clamp(
-                highres_geometry["left_elliptical_hoop_hole"] * left_active
-                + highres_geometry["right_elliptical_hoop_hole"] * right_active,
-                0,
-                1,
+            right_active = resize_earring_mask(
+                aux.get("right_target_side_open", aux.get("right_side_active"))
             )
+            left_geometry_trace = highres_geometry["left_elliptical_hoop"] * left_active
+            right_geometry_trace = highres_geometry["right_elliptical_hoop"] * right_active
+            left_geometry_hole = highres_geometry["left_elliptical_hoop_hole"] * left_active
+            right_geometry_hole = highres_geometry["right_elliptical_hoop_hole"] * right_active
+            highres_geometry_trace = torch.clamp(left_geometry_trace + right_geometry_trace, 0, 1)
+            highres_geometry_hole = torch.clamp(left_geometry_hole + right_geometry_hole, 0, 1)
             source_seed = torch.maximum(source_seed, highres_geometry_trace)
             highres_instances = refine_earring_instances_highres(
                 earring_reference,
@@ -2039,17 +2043,70 @@ class PostProcessModelV5(nn.Module):
                 aux.get("source_lobe_search_mask", aux.get("earring_search_mask")),
                 aux.get("left_lobe_anchor"),
                 aux.get("right_lobe_anchor"),
-                aux.get("left_side_active"),
-                aux.get("right_side_active"),
+                aux.get("left_target_side_open", aux.get("left_side_active")),
+                aux.get("right_target_side_open", aux.get("right_side_active")),
                 source_hair_mask=aux.get("source_hair_mask"),
                 source_ear_mask=parsing_label_mask(aux.get("source_parsing"), RAW_EAR_SURFACE_LABELS)
                 if aux.get("source_parsing") is not None
                 else None,
             )
-            highres_instance = highres_instances["instance_mask"].to(
+            left_instance = highres_instances["left_instance_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             )
+            right_instance = highres_instances["right_instance_mask"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            )
+            output_area_scale = float(
+                earring_edit.shape[-2] * earring_edit.shape[-1]
+            ) / float(256 * 256)
+
+            def restrict_ring_wall(
+                instance: torch.Tensor,
+                trace: torch.Tensor,
+                hole: torch.Tensor,
+                anchor: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                # A geometry-validated ring permits source pixels only in the
+                # narrow wall surrounding its target-owned centre.  This
+                # replaces the broad 256px mask that produced a black halo
+                # outside an otherwise correct hoop.
+                present = (
+                    (trace.flatten(1).sum(dim=1, keepdim=True) >= max(12.0, 3.0 * output_area_scale))
+                    & (hole.flatten(1).sum(dim=1, keepdim=True) >= max(8.0, 1.5 * output_area_scale))
+                ).to(instance.dtype).view(-1, 1, 1, 1)
+                wall_support = torch.clamp(
+                    dilate_mask(trace, 5)
+                    + dilate_mask(hole, 11) * (1.0 - hole).clamp(0, 1),
+                    0,
+                    1,
+                )
+                connector = instance * dilate_mask(anchor, 33)
+                constrained = torch.maximum(instance * wall_support, trace)
+                constrained = torch.maximum(constrained, connector)
+                constrained = constrained * (1.0 - hole).clamp(0, 1)
+                footprint = torch.clamp(
+                    dilate_mask(trace, 9) + dilate_mask(hole, 15),
+                    0,
+                    1,
+                ) * present
+                return torch.where(present > 0, constrained, instance), footprint
+
+            left_instance, left_footprint = restrict_ring_wall(
+                left_instance,
+                left_geometry_trace,
+                left_geometry_hole,
+                resize_earring_mask(aux.get("left_lobe_anchor")),
+            )
+            right_instance, right_footprint = restrict_ring_wall(
+                right_instance,
+                right_geometry_trace,
+                right_geometry_hole,
+                resize_earring_mask(aux.get("right_lobe_anchor")),
+            )
+            highres_instance = torch.clamp(left_instance + right_instance, 0, 1)
+            highres_geometry_footprint = torch.clamp(left_footprint + right_footprint, 0, 1)
             highres_instance_hole = highres_instances["hoop_hole_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
@@ -2058,16 +2115,13 @@ class PostProcessModelV5(nn.Module):
                 highres_instance_hole,
                 highres_geometry_hole,
             )
-            output_area_scale = float(
-                earring_edit.shape[-2] * earring_edit.shape[-1]
-            ) / float(256 * 256)
             geometry_present = (
                 highres_geometry_trace.flatten(1).sum(dim=1, keepdim=True)
                 >= max(12.0, 3.0 * output_area_scale)
             ).to(earring_edit.dtype).view(-1, 1, 1, 1)
             visual_instance_present = (
                 highres_instance.flatten(1).sum(dim=1, keepdim=True)
-                >= max(12.0, 5.0 * output_area_scale)
+                >= max(8.0, 2.0 * output_area_scale)
             ).to(earring_edit.dtype).view(-1, 1, 1, 1)
             if no_earring is not None:
                 # A multi-arc hoop or a compact, lobe-adjacent high-resolution
@@ -2082,17 +2136,20 @@ class PostProcessModelV5(nn.Module):
                 highres_instance_hole = highres_instance_hole * active
                 highres_geometry_trace = highres_geometry_trace * active
                 highres_geometry_hole = highres_geometry_hole * active
+                highres_geometry_footprint = highres_geometry_footprint * active
 
             refined_present = (
                 highres_instance.flatten(1).sum(dim=1, keepdim=True)
-                >= max(12.0, 5.0 * output_area_scale)
+                >= max(8.0, 2.0 * output_area_scale)
             )
             refined_present = refined_present.to(earring_edit.dtype).view(-1, 1, 1, 1)
             # Replace only the coarse neighbourhood covered by the real source
             # instance.  Keep a separately confirmed lobe connector; this is
             # part of a normal hanging earring, not an ear-background region.
             replacement = torch.clamp(
-                highres_instance_hole + dilate_mask(highres_instance, 9),
+                highres_instance_hole
+                + dilate_mask(highres_instance, 9)
+                + highres_geometry_footprint,
                 0,
                 1,
             ) * refined_present
@@ -2222,6 +2279,7 @@ class PostProcessModelV5(nn.Module):
         aux["output_highres_earring_hole"] = highres_instance_hole
         aux["output_highres_earring_geometry_seed"] = highres_geometry_trace
         aux["output_highres_earring_geometry_hole"] = highres_geometry_hole
+        aux["output_highres_earring_geometry_footprint"] = highres_geometry_footprint
         # Compatibility debug aliases.  They now show the real instance, not
         # a synthetic ellipse, so existing visualisation scripts stay useful.
         aux["output_highres_hoop_trace"] = highres_instance

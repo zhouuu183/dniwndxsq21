@@ -1195,14 +1195,15 @@ def build_elliptical_hoop_candidates(
                 continue
             # Coverage alone can be satisfied by one curved hair/background
             # edge.  A real hoop has support over multiple directions around
-            # its fitted perimeter.  Four of eight sectors retains partially
-            # reflective metal while rejecting the old fragmented squiggle.
+            # its fitted perimeter.  Small hoops occupy too few pixels for
+            # four sectors, but still need three independent arcs.
             support_y, support_x = np.where(ellipse_bool & support)
             if support_y.size == 0:
                 continue
             sector_angle = np.arctan2(support_y - center_y, support_x - center_x)
             sectors = np.unique(np.floor((sector_angle + np.pi) * (8.0 / (2.0 * np.pi))).astype(np.int32) % 8)
-            if sectors.size < 4:
+            required_sectors = 3 if minor <= 18.0 * coordinate_scale else 4
+            if sectors.size < required_sectors:
                 continue
             # The lobe must touch the fitted perimeter.  A background ellipse
             # farther from the ear is not a valid accessory candidate.
@@ -1316,6 +1317,8 @@ def refine_earring_hoops_highres(
     source_hair_mask: torch.Tensor | None = None,
     source_ear_mask: torch.Tensor | None = None,
     detection_size: int = 512,
+    min_axis: float = 6.0,
+    min_coverage: float = 0.28,
 ) -> dict[str, torch.Tensor]:
     """Trace a validated hoop at 512px for the final RGB composite.
 
@@ -1354,8 +1357,9 @@ def refine_earring_hoops_highres(
         resize_for_detection(right_lobe_anchor),
         source_hair_mask=resize_for_detection(source_hair_mask),
         source_ear_mask=resize_for_detection(source_ear_mask),
-        min_axis=12.0 * detector_scale,
+        min_axis=max(4.0 * detector_scale, float(min_axis) * detector_scale),
         max_axis=168.0 * detector_scale,
+        min_coverage=float(min_coverage),
     )
     return {
         key: F.interpolate(value, size=output_size, mode="nearest")
