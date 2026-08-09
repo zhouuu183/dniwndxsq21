@@ -2012,13 +2012,12 @@ class PostProcessModelV5(nn.Module):
         face_authority = face_authority * (1.0 - earring_edit).clamp(0, 1)
         protected = protected * (1.0 - face_authority) + target_authority * face_authority
 
-        # The generator target can still carry a low-frequency skin band even
-        # though the PP decoder is no longer allowed to modify the face.  Use
-        # one high-resolution source-face authority for the complete semantic
-        # face, rather than only label-1 skin: leaving brows, eyes, nose and
-        # their parser boundaries on the generated image was still enough to
-        # produce visible colour blocks across the face.  Hair, ears and
-        # accessories remain explicitly target-owned.
+        # Preserve facial identity detail without copying the source's
+        # low-frequency illumination.  Direct source RGB replacement made the
+        # source/SATD boundary visible as a coloured tile whenever their skin
+        # tones differed.  The transferred target owns colour and shading;
+        # source contributes only high-frequency pores, eyes and facial detail.
+        # Hair, ears and accessories remain explicitly target-owned.
         face_restore = torch.zeros_like(face_authority)
         if bool(getattr(self.args, "enable_direct_face_skin_restore", True)):
             source_reference = resize_rgb(aux.get("source_face_reference_01"), mode="bilinear")
@@ -2055,7 +2054,19 @@ class PostProcessModelV5(nn.Module):
                     * (1.0 - dilate_mask(source_earring + earring_edit, 5)).clamp(0, 1)
                 ).clamp(0, 1)
                 face_restore = erode_mask(face_restore, 5).clamp(0, 1)
-                protected = protected * (1.0 - face_restore) + source_reference * face_restore
+                # Keep the transition inside the semantic face and feather
+                # only the texture contribution.  This cannot introduce a
+                # different skin colour across an eyebrow/forehead boundary.
+                face_alpha = gaussian_blur(face_restore, kernel_size=17, sigma=3.5)
+                face_alpha = (face_alpha * target_face * face_authority).clamp(0, 1)
+                source_low = low_pass_filter(source_reference, kernel_size=31, sigma=6.0)
+                source_detail = source_reference - source_low
+                detail_gain = max(
+                    0.0,
+                    min(1.0, float(getattr(self.args, "direct_face_detail_gain", 0.80))),
+                )
+                protected = (protected + detail_gain * source_detail * face_alpha).clamp(0, 1)
+                face_restore = face_alpha
 
         if bool(getattr(self.args, "enable_direct_earring_restore", True)):
             reference = resize_rgb(

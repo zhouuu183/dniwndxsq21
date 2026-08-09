@@ -231,13 +231,17 @@ def build_weak_earring_masks(
         # 18px lower extent was shorter than the radius of a normal hoop at
         # 256px, so parser-missed hoops were reduced to the few pixels beside
         # the lobe before the strong-object check even ran.  The final write
-        # mask remains constrained to connected visual evidence below.
+        # mask remains constrained to connected visual evidence below.  The
+        # lower two shifts cover large but still face-local hoops; they do not
+        # grant write access by themselves.
         source_lobe_roi = torch.clamp(
             dilate_mask(source_ear_mask, 13)
             + dilate_mask(shift_mask(source_ear_mask, down=8), 15)
             + dilate_mask(shift_mask(source_ear_mask, down=20), 13)
             + dilate_mask(shift_mask(source_ear_mask, down=38), 11)
             + dilate_mask(shift_mask(source_ear_mask, down=56), 9)
+            + dilate_mask(shift_mask(source_ear_mask, down=80), 9)
+            + dilate_mask(shift_mask(source_ear_mask, down=108), 7)
             + dilate_mask(parser_mask, 11),
             0,
             1,
@@ -629,8 +633,8 @@ def build_elliptical_hoop_candidates(
     source_hair_mask: torch.Tensor | None = None,
     source_ear_mask: torch.Tensor | None = None,
     min_axis: float = 12.0,
-    max_axis: float = 132.0,
-    min_coverage: float = 0.42,
+    max_axis: float = 168.0,
+    min_coverage: float = 0.22,
 ) -> dict[str, torch.Tensor]:
     """Find a complete source hoop before allowing visual-only recovery.
 
@@ -677,13 +681,16 @@ def build_elliptical_hoop_candidates(
             return np.zeros_like(base_search, dtype=np.float32)
         anchor_y, anchor_x = points.mean(axis=0)
         y_grid, x_grid = np.ogrid[:height, :width]
-        # A hoop hangs from a lobe; this window is broad enough for the example
-        # long hoops but not so broad that the complete background is searched.
+        # A hoop hangs from a lobe.  This is a *detection* corridor: it needs
+        # to reach the lower half of a large hoop even when the parser misses
+        # every earring pixel.  Acceptance below still requires lobe contact
+        # and multi-arc image support, so this wider window cannot create a
+        # generic lower-ear write region.
         local_window = (
             (y_grid >= anchor_y - 24.0)
-            & (y_grid <= anchor_y + 96.0)
-            & (x_grid >= anchor_x - 72.0)
-            & (x_grid <= anchor_x + 72.0)
+            & (y_grid <= anchor_y + 128.0)
+            & (x_grid >= anchor_x - 88.0)
+            & (x_grid <= anchor_x + 88.0)
         )
         valid = base_search & local_window & ~hair_mask
         if int(valid.sum()) < 24:
@@ -706,14 +713,49 @@ def build_elliptical_hoop_candidates(
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
         )
         contours, _ = cv2.findContours(fit_edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        best_mask = None
-        best_score = -1.0
+        fitted_ellipses: list[tuple[float, float, float, float, float]] = []
         for contour in contours:
             if len(contour) < 12:
                 continue
             (center_x, center_y), (axis_x, axis_y), angle = cv2.fitEllipse(contour)
-            major = max(float(axis_x), float(axis_y))
-            minor = min(float(axis_x), float(axis_y))
+            fitted_ellipses.append(
+                (float(center_x), float(center_y), float(axis_x), float(axis_y), float(angle))
+            )
+
+        # Canny often breaks a reflective hoop into separate short arcs.  A
+        # circle proposal joins those arcs geometrically, but it is accepted
+        # only through the same edge-sector and lobe checks as a contour fit.
+        # This recovers a real large hoop without falling back to arbitrary
+        # dark/bright fragments beside an ear.
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        circles = cv2.HoughCircles(
+            blurred,
+            cv2.HOUGH_GRADIENT,
+            dp=1.0,
+            minDist=max(12.0, float(min_axis) * 0.75),
+            param1=max(24.0, float(high)),
+            param2=10.0,
+            minRadius=max(6, int(round(float(min_axis) / 2.0))),
+            maxRadius=max(7, int(round(float(max_axis) / 2.0))),
+        )
+        if circles is not None:
+            for center_x, center_y, radius in np.round(circles[0]).astype(np.float32):
+                center_y_int = int(round(center_y))
+                center_x_int = int(round(center_x))
+                if not (0 <= center_y_int < height and 0 <= center_x_int < width):
+                    continue
+                if not local_window[center_y_int, center_x_int]:
+                    continue
+                diameter = float(radius) * 2.0
+                fitted_ellipses.append((float(center_x), float(center_y), diameter, diameter, 0.0))
+
+        best_mask = None
+        best_score = -1.0
+        support = cv2.dilate(edges, np.ones((5, 5), dtype=np.uint8)) > 0
+        trace_support = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8)) > 0
+        for center_x, center_y, axis_x, axis_y, angle in fitted_ellipses:
+            major = max(axis_x, axis_y)
+            minor = min(axis_x, axis_y)
             if not (float(min_axis) <= minor <= major <= float(max_axis)):
                 continue
             if minor / max(major, 1e-6) < 0.32:
@@ -732,26 +774,38 @@ def build_elliptical_hoop_candidates(
                 lineType=cv2.LINE_8,
             )
             ellipse_bool = ellipse > 0
-            support = cv2.dilate(edges, np.ones((5, 5), dtype=np.uint8)) > 0
             coverage = float((ellipse_bool & support).sum()) / max(float(ellipse_bool.sum()), 1.0)
             if coverage < float(min_coverage):
+                continue
+            # Coverage alone can be satisfied by one curved hair/background
+            # edge.  A real hoop has support over multiple directions around
+            # its fitted perimeter.  Four of eight sectors retains partially
+            # reflective metal while rejecting the old fragmented squiggle.
+            support_y, support_x = np.where(ellipse_bool & support)
+            if support_y.size == 0:
+                continue
+            sector_angle = np.arctan2(support_y - center_y, support_x - center_x)
+            sectors = np.unique(np.floor((sector_angle + np.pi) * (8.0 / (2.0 * np.pi))).astype(np.int32) % 8)
+            if sectors.size < 4:
                 continue
             # The lobe must touch the fitted perimeter.  A background ellipse
             # farther from the ear is not a valid accessory candidate.
             lobe_touch = bool(
-                (cv2.dilate(ellipse, np.ones((17, 17), dtype=np.uint8)) > 0)[anchor_mask].any()
+                (cv2.dilate(ellipse, np.ones((25, 25), dtype=np.uint8)) > 0)[anchor_mask].any()
             )
             if not lobe_touch:
                 continue
             # The inside of a hoop remains target-owned.  Also do not write the
-            # source ear itself; the target ear boundary is authoritative.
-            trace = ellipse_bool & valid & ~cv2.dilate(
+            # source ear itself.  Only source pixels supported by a real edge
+            # are returned, so the fitted geometry can never copy background
+            # through the hollow centre or along an invented arc.
+            trace = ellipse_bool & trace_support & valid & ~cv2.dilate(
                 ear_mask.astype(np.uint8),
                 np.ones((5, 5), dtype=np.uint8),
             ).astype(bool)
-            if int(trace.sum()) < max(14, int(minor * 0.7)):
+            if int(trace.sum()) < max(12, int(minor * 0.35)):
                 continue
-            score = coverage * float(trace.sum())
+            score = coverage * float(sectors.size) * float(trace.sum())
             if score > best_score:
                 best_score = score
                 best_mask = trace
