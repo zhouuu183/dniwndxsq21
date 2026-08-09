@@ -200,7 +200,7 @@ def get_parser():
     parser.add_argument("--earring_write_dilate", type=int, default=3)
     parser.add_argument("--earring_write_connectivity_iters", type=int, default=32)
     parser.add_argument("--earring_write_connectivity_kernel", type=int, default=5)
-    parser.add_argument("--earring_write_bridge_dilate", type=int, default=5)
+    parser.add_argument("--earring_write_bridge_dilate", type=int, default=17)
     parser.add_argument("--earring_anchor_visible_dilate", type=int, default=3)
     parser.add_argument("--earring_align_max_shift", type=int, default=12)
     parser.add_argument("--ear_fine_support_dilate", type=int, default=3)

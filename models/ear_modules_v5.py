@@ -732,7 +732,7 @@ def extract_earring_object_core(
     *,
     connectivity_iters: int = 32,
     connectivity_kernel: int = 5,
-    bridge_dilate: int = 5,
+    bridge_dilate: int = 17,
 ) -> torch.Tensor:
     """Keep trusted/strong object pixels connected to an exposed lobe."""
 
@@ -756,7 +756,7 @@ def extract_visible_earring_segment(
     *,
     connectivity_iters: int = 32,
     connectivity_kernel: int = 5,
-    bridge_dilate: int = 5,
+    bridge_dilate: int = 17,
     threshold: float = 1e-4,
 ) -> torch.Tensor:
     """Keep only the earring pixels connected to a visible ear-lobe anchor.
@@ -851,7 +851,7 @@ def _build_earring_write_mask_legacy(
     write_dilate: int = 3,
     connectivity_iters: int = 32,
     connectivity_kernel: int = 5,
-    bridge_dilate: int = 5,
+    bridge_dilate: int = 17,
 ) -> torch.Tensor:
     """Build the narrow, final earring write-back mask.
 
@@ -977,7 +977,7 @@ def build_earring_write_masks(
     write_dilate: int = 3,
     connectivity_iters: int = 32,
     connectivity_kernel: int = 5,
-    bridge_dilate: int = 5,
+    bridge_dilate: int = 17,
 ) -> dict[str, torch.Tensor]:
     """Build independent core/completion/write masks for earring recovery.
 

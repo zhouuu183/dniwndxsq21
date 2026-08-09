@@ -132,7 +132,9 @@ class BlendingV5(Blending_v8):
             earring_write_connectivity_kernel=pp_policy_value(
                 "earring_write_connectivity_kernel", 5
             ),
-            earring_write_bridge_dilate=pp_policy_value("earring_write_bridge_dilate", 5),
+            # This is a connectivity-only radius.  It follows a thin hoop over
+            # parser/antialiasing gaps but never widens the final RGB write mask.
+            earring_write_bridge_dilate=pp_policy_value("earring_write_bridge_dilate", 17),
             earring_anchor_visible_dilate=pp_policy_value("earring_anchor_visible_dilate", 3),
             earring_fine_mask_floor=pp_value("earring_fine_mask_floor", 0.18),
             earring_fine_mask_dilate=pp_value("earring_fine_mask_dilate", 5),
@@ -154,6 +156,7 @@ class BlendingV5(Blending_v8):
             # earring object.  This policy must not be inherited from an old
             # PP checkpoint that allowed the decoder to redraw the face.
             enable_direct_earring_restore=True,
+            enable_direct_face_skin_restore=True,
             output_target_hair_preserve_dilate=pp_policy_value(
                 "output_target_hair_preserve_dilate", 5
             ),
@@ -495,6 +498,12 @@ class BlendingV5(Blending_v8):
             target_hair_mask=HM_X,
             authoritative_hair_highres=authoritative_hair_highres,
             authoritative_target_highres=I_blend,
+            # Keep accessory recovery in the original aligned source frame.
+            # I_1 is the 256px encoder tensor; using it here made thin metal
+            # hoops fade before the final high-resolution composite even when
+            # their write mask was accepted.
+            earring_reference=name_to_embed["face"].get("image_1024"),
+            source_face_reference=name_to_embed["face"].get("image_1024"),
             cleanup_masks=cleanup_masks,
         )
         I_final, _ = self.post_process.render_refined(self.net.generator, S_final, F_final, aux)
@@ -515,7 +524,11 @@ class BlendingV5(Blending_v8):
             device=I_final.device,
             dtype=I_final.dtype,
         )
-        for key in ("earring_write_mask", "output_face_target_authority_mask"):
+        for key in (
+            "earring_write_mask",
+            "output_face_target_authority_mask",
+            "output_direct_face_skin_restore_mask",
+        ):
             value = aux.get(key)
             if value is not None:
                 final_color_exclude = torch.maximum(
@@ -640,6 +653,7 @@ class BlendingV5(Blending_v8):
                 "output_source_earring_composite_mask",
                 "output_v5_earring_edit_mask",
                 "output_face_target_authority_mask",
+                "output_direct_face_skin_restore_mask",
                 "fine_mask",
                 "prior_mask",
                 "source_hair_face_feature_suppress_mask",

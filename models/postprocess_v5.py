@@ -412,7 +412,7 @@ class PostProcessModelV5(nn.Module):
             earring_roi,
             trusted_object,
             grow_iters=int(getattr(self.args, "earring_write_connectivity_iters", 32)),
-            seed_dilate=max(1, int(getattr(self.args, "earring_write_bridge_dilate", 5))),
+            seed_dilate=max(1, int(getattr(self.args, "earring_write_bridge_dilate", 17))),
         ) * visible_side_gate
 
         source_labels = ensure_mask_4d(source_parsing).to(device=reference.device)
@@ -432,7 +432,7 @@ class PostProcessModelV5(nn.Module):
 
         connectivity_iters = int(getattr(self.args, "earring_write_connectivity_iters", 32))
         connectivity_kernel = int(getattr(self.args, "earring_write_connectivity_kernel", 5))
-        bridge_dilate = int(getattr(self.args, "earring_write_bridge_dilate", 5))
+        bridge_dilate = int(getattr(self.args, "earring_write_bridge_dilate", 17))
         write_masks = build_earring_write_masks(
             trusted_object,
             completion_candidate,
@@ -1342,6 +1342,7 @@ class PostProcessModelV5(nn.Module):
         earring_supervision_mask: torch.Tensor | None = None,
         earring_highlight_mask: torch.Tensor | None = None,
         earring_reference: torch.Tensor | None = None,
+        source_face_reference: torch.Tensor | None = None,
         earring_mask_is_dataset: torch.Tensor | None = None,
         earring_reference_is_dataset: torch.Tensor | None = None,
         presence_target: torch.Tensor | None = None,
@@ -1476,6 +1477,8 @@ class PostProcessModelV5(nn.Module):
         reference_01 = source_01 if earring_reference is None else normalized_to_01(earring_reference)
         aux["earring_reference"] = reference_01
         aux["earring_reference_01"] = reference_01
+        face_reference_01 = source_01 if source_face_reference is None else normalized_to_01(source_face_reference)
+        aux["source_face_reference_01"] = face_reference_01
         aux["target_01"] = target_01
         aux["HT_E"] = ensure_mask_4d(HT_E).float() if HT_E is not None else None
         return final_s, final_f, aux
@@ -1932,6 +1935,23 @@ class PostProcessModelV5(nn.Module):
                 )
             return value.clamp(0, 1)
 
+        def resize_earring_mask(value: torch.Tensor | None) -> torch.Tensor:
+            """Upscale an accepted wire without turning it into a faint halo.
+
+            The earring write mask is an object mask, not a feathered face
+            blend.  Bilinear upsampling made a one-pixel 256px hoop into a
+            mostly transparent grey trace at output resolution.  Nearest
+            upsampling preserves exactly the verified pixels; it does not grow
+            the object into its hollow centre or surrounding background.
+            """
+            if value is None:
+                return torch.zeros_like(image_01[:, :1])
+            value = ensure_mask_4d(value).to(device=image_01.device, dtype=image_01.dtype)
+            value = value[:, :1]
+            if value.shape[-2:] != image_01.shape[-2:]:
+                value = F.interpolate(value, size=image_01.shape[-2:], mode="nearest")
+            return (value > 0.5).to(dtype=image_01.dtype)
+
         # V5 is a local earring recovery stage, not a second face generator.
         # Compositing from the pre-PP target makes every non-earring pixel
         # authoritative: no decoder-produced forehead halo, eye distortion or
@@ -1947,17 +1967,16 @@ class PostProcessModelV5(nn.Module):
         # target.  Every other semantic face pixel is restored below after the
         # high-resolution hair hand-off, which prevents that hand-off from
         # bleeding colour into a parser-boundary forehead or cheek pixel.
-        mask_reference = image_01[:, :1]
-        earring_edit = self._mask_like(aux.get("earring_write_mask"), mask_reference)
+        earring_edit = resize_earring_mask(aux.get("earring_write_mask"))
         no_earring = aux.get("no_earring_case_mask")
         if no_earring is not None:
-            earring_edit = earring_edit * (1.0 - self._mask_like(no_earring, earring_edit)).clamp(0, 1)
+            earring_edit = earring_edit * (1.0 - resize_earring_mask(no_earring)).clamp(0, 1)
         hoop_hole = aux.get("hoop_hole_mask")
         if hoop_hole is not None:
-            earring_edit = earring_edit * (1.0 - self._mask_like(hoop_hole, earring_edit)).clamp(0, 1)
+            earring_edit = earring_edit * (1.0 - resize_earring_mask(hoop_hole)).clamp(0, 1)
         ear_boundary = aux.get("target_ear_boundary_protect_mask")
         if ear_boundary is not None:
-            earring_edit = earring_edit * (1.0 - self._mask_like(ear_boundary, earring_edit)).clamp(0, 1)
+            earring_edit = earring_edit * (1.0 - resize_earring_mask(ear_boundary)).clamp(0, 1)
 
         protected = target_authority
         hair_authority = resize_rgb(aux.get("authoritative_hair_highres_01"), mode="bicubic")
@@ -1990,6 +2009,39 @@ class PostProcessModelV5(nn.Module):
         face_authority = face_authority * (1.0 - earring_edit).clamp(0, 1)
         protected = protected * (1.0 - face_authority) + target_authority * face_authority
 
+        # The generator target can still carry a low-frequency skin band even
+        # though the PP decoder is no longer allowed to modify the face.  For
+        # pixels which both parsers agree are ordinary skin, use the retained
+        # original 1024px source texture.  The source/target hair guards keep
+        # this out of bangs, the hairline, ears, eyes and the accessory region.
+        face_restore = torch.zeros_like(face_authority)
+        if bool(getattr(self.args, "enable_direct_face_skin_restore", True)):
+            source_reference = resize_rgb(aux.get("source_face_reference_01"), mode="bilinear")
+            source_parsing = aux.get("source_parsing")
+            target_parsing = aux.get("target_parsing")
+            if source_reference is not None and source_parsing is not None and target_parsing is not None:
+                source_skin = self._mask_like(parsing_label_mask(source_parsing, (1,)), face_authority)
+                target_skin = self._mask_like(parsing_label_mask(target_parsing, (1,)), face_authority)
+                source_hair = self._mask_like(aux.get("source_hair_mask"), face_authority)
+                target_hair = self._mask_like(aux.get("target_hair_mask"), face_authority)
+                source_hair = torch.maximum(
+                    source_hair,
+                    self._mask_like(parsing_label_mask(source_parsing, (RAW_HAIR,)), face_authority),
+                )
+                target_hair = torch.maximum(
+                    target_hair,
+                    self._mask_like(parsing_label_mask(target_parsing, (RAW_HAIR,)), face_authority),
+                )
+                face_restore = (
+                    source_skin
+                    * target_skin
+                    * (1.0 - dilate_mask(source_hair, 9)).clamp(0, 1)
+                    * (1.0 - dilate_mask(target_hair, 5)).clamp(0, 1)
+                    * (1.0 - dilate_mask(earring_edit, 3)).clamp(0, 1)
+                ).clamp(0, 1)
+                face_restore = erode_mask(face_restore, 3).clamp(0, 1)
+                protected = protected * (1.0 - face_restore) + source_reference * face_restore
+
         if bool(getattr(self.args, "enable_direct_earring_restore", True)):
             reference = resize_rgb(
                 aux.get("earring_reference_01", aux.get("source_01")),
@@ -2000,6 +2052,7 @@ class PostProcessModelV5(nn.Module):
         else:
             protected = protected * (1.0 - earring_edit) + image_01 * earring_edit
         aux["output_face_target_authority_mask"] = face_authority
+        aux["output_direct_face_skin_restore_mask"] = face_restore
         aux["output_source_earring_composite_mask"] = earring_edit
         aux["output_v5_earring_edit_mask"] = earring_edit
         return protected.clamp(0, 1) * 2 - 1
