@@ -624,6 +624,301 @@ def compute_earring_hole_mask(component_mask: torch.Tensor) -> torch.Tensor:
     return (filled - component).clamp(0, 1)
 
 
+def refine_earring_instances_highres(
+    source_01: torch.Tensor,
+    source_parsing: torch.Tensor | None,
+    coarse_object_mask: torch.Tensor | None,
+    search_mask: torch.Tensor | None,
+    left_lobe_anchor: torch.Tensor | None,
+    right_lobe_anchor: torch.Tensor | None,
+    left_side_active: torch.Tensor | None,
+    right_side_active: torch.Tensor | None,
+    *,
+    source_hair_mask: torch.Tensor | None = None,
+    source_ear_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Extract source earring *instances* at the final RGB resolution.
+
+    The PP network works at 256px, where a thin hoop frequently becomes a
+    few disconnected pixels.  Fitting a replacement ellipse made that failure
+    look like a different, flattened and over-thick earring.  This routine
+    instead uses the low-resolution mask only as a GrabCut foreground seed and
+    retains the object boundary from the source image itself.  It never writes
+    the surrounding crop: source hair is background, components must touch a
+    seed near the lobe, and enclosed holes are returned separately.
+    """
+
+    source_01 = normalized_to_01(source_01)
+    output_size = tuple(source_01.shape[-2:])
+    reference = source_01[:, :1]
+    zeros = torch.zeros_like(reference)
+    if cv2 is None:
+        return {
+            "instance_mask": zeros,
+            "hoop_hole_mask": zeros,
+            "left_instance_mask": zeros,
+            "right_instance_mask": zeros,
+            "left_hoop_hole_mask": zeros,
+            "right_hoop_hole_mask": zeros,
+        }
+
+    def nearest(value: torch.Tensor | None) -> torch.Tensor:
+        if value is None:
+            return torch.zeros_like(reference)
+        value = ensure_mask_4d(value).to(device=source_01.device, dtype=source_01.dtype)
+        if value.shape[-2:] != output_size:
+            value = F.interpolate(value, size=output_size, mode="nearest")
+        return (value[:, :1] > 0.5).to(dtype=source_01.dtype)
+
+    coarse = nearest(coarse_object_mask)
+    search = nearest(search_mask)
+    left_anchor = nearest(left_lobe_anchor)
+    right_anchor = nearest(right_lobe_anchor)
+    left_active = nearest(left_side_active)
+    right_active = nearest(right_side_active)
+    hair = nearest(source_hair_mask)
+    ear = nearest(source_ear_mask)
+    if source_parsing is None:
+        parser_earring = torch.zeros_like(reference)
+    else:
+        parsing = ensure_mask_4d(source_parsing).to(device=source_01.device)
+        if parsing.shape[-2:] != output_size:
+            parsing = F.interpolate(parsing.float(), size=output_size, mode="nearest")
+        parser_earring = (parsing.long() == RAW_EARRING).to(dtype=source_01.dtype)
+
+    image_np = np.clip(
+        source_01.detach().cpu().permute(0, 2, 3, 1).numpy() * 255.0,
+        0,
+        255,
+    ).astype(np.uint8)
+    coarse_np = coarse.detach().cpu().numpy() > 0.5
+    search_np = search.detach().cpu().numpy() > 0.5
+    parser_np = parser_earring.detach().cpu().numpy() > 0.5
+    hair_np = hair.detach().cpu().numpy() > 0.5
+    ear_np = ear.detach().cpu().numpy() > 0.5
+    left_anchor_np = left_anchor.detach().cpu().numpy() > 0.5
+    right_anchor_np = right_anchor.detach().cpu().numpy() > 0.5
+    left_active_np = left_active.detach().cpu().numpy() > 0.5
+    right_active_np = right_active.detach().cpu().numpy() > 0.5
+
+    batch, _, height, width = reference.shape
+    scale = max(height, width) / 256.0
+
+    def odd(value: float, minimum: int = 3) -> int:
+        kernel = max(minimum, int(round(value * scale)))
+        return kernel if kernel % 2 == 1 else kernel + 1
+
+    def component_mask_connected_to_seed(candidate: np.ndarray, seed: np.ndarray) -> np.ndarray:
+        if not candidate.any() or not seed.any():
+            return np.zeros_like(candidate, dtype=bool)
+        proxy = cv2.morphologyEx(
+            candidate.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+        )
+        count, labels = cv2.connectedComponents(proxy)
+        seed_touch = cv2.dilate(
+            seed.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(11), odd(11))),
+        ).astype(bool)
+        keep = np.zeros_like(candidate, dtype=bool)
+        for label in range(1, count):
+            component = labels == label
+            if np.any(component & seed_touch):
+                keep |= component
+        return candidate & keep
+
+    def enclosed_holes(instance: np.ndarray, local: np.ndarray) -> np.ndarray:
+        if int(instance.sum()) < max(12, int(round(5.0 * scale))):
+            return np.zeros_like(instance, dtype=bool)
+        closed = cv2.morphologyEx(
+            instance.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(5), odd(5))),
+        ).astype(bool)
+        background = (~closed & local).astype(np.uint8)
+        # ``local`` is an ear-local window, not the full image.  Its boundary
+        # is therefore the flood-fill border; otherwise every external pixel
+        # in a window away from the image edge would be misclassified as a
+        # hoop hole.
+        local_boundary = local & ~cv2.erode(
+            local.astype(np.uint8),
+            np.ones((3, 3), dtype=np.uint8),
+        ).astype(bool)
+        border = background & local_boundary.astype(np.uint8)
+        flood = border.copy()
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        while True:
+            grown = cv2.dilate(flood, kernel) & background
+            if np.array_equal(grown, flood):
+                break
+            flood = grown
+        hole = background.astype(bool) & ~flood.astype(bool)
+        # Reject an accidental large enclosed background patch.  A true hoop
+        # centre is local to the traced object and much smaller than the crop.
+        count, labels = cv2.connectedComponents(hole.astype(np.uint8))
+        accepted = np.zeros_like(hole, dtype=bool)
+        object_area = max(1, int(instance.sum()))
+        for label in range(1, count):
+            component = labels == label
+            area = int(component.sum())
+            near_wire = cv2.dilate(
+                instance.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(9), odd(9))),
+            ).astype(bool)
+            if max(8, int(round(2.0 * scale))) <= area <= max(64, object_area * 6) and np.any(component & near_wire):
+                accepted |= component
+        return accepted
+
+    def trace_side(
+        active: np.ndarray,
+        anchor: np.ndarray,
+        side_seed: np.ndarray,
+        side_search: np.ndarray,
+        side_hair: np.ndarray,
+        side_ear: np.ndarray,
+        image: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        empty = np.zeros((height, width), dtype=bool)
+        if not active.any():
+            return empty, empty
+        seed = side_seed.copy()
+        anchor_points = np.argwhere(anchor)
+        if anchor_points.size == 0:
+            seed_points = np.argwhere(seed)
+            if seed_points.size == 0:
+                return empty, empty
+            anchor_y, anchor_x = seed_points[np.argmin(seed_points[:, 0])]
+        else:
+            anchor_y, anchor_x = anchor_points.mean(axis=0)
+
+        y_grid, x_grid = np.ogrid[:height, :width]
+        local_window = (
+            (y_grid >= anchor_y - 30.0 * scale)
+            & (y_grid <= anchor_y + 136.0 * scale)
+            & (x_grid >= anchor_x - 96.0 * scale)
+            & (x_grid <= anchor_x + 96.0 * scale)
+        )
+        # Parser/strong evidence is mandatory.  A visible ear alone must not
+        # invent an accessory or reopen the old ear-background hole.
+        seed &= local_window
+        if int(seed.sum()) < max(3, int(round(0.75 * scale))):
+            return empty, empty
+
+        local = local_window & (side_search | cv2.dilate(
+            seed.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(31), odd(31))),
+        ).astype(bool))
+        ys, xs = np.where(local | seed | anchor)
+        if ys.size == 0:
+            return empty, empty
+        margin = odd(9)
+        y0, y1 = max(0, ys.min() - margin), min(height, ys.max() + margin + 1)
+        x0, x1 = max(0, xs.min() - margin), min(width, xs.max() + margin + 1)
+
+        crop_image = image[y0:y1, x0:x1]
+        crop_seed = seed[y0:y1, x0:x1]
+        crop_local = local[y0:y1, x0:x1]
+        crop_hair = side_hair[y0:y1, x0:x1]
+        crop_ear = side_ear[y0:y1, x0:x1]
+        init = np.full(crop_seed.shape, cv2.GC_BGD, dtype=np.uint8)
+        init[crop_local] = cv2.GC_PR_BGD
+        near_seed = cv2.dilate(
+            crop_seed.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(13), odd(13))),
+        ).astype(bool) & crop_local
+        init[near_seed] = cv2.GC_PR_FGD
+        init[crop_seed] = cv2.GC_FGD
+        # Known source hair is a background constraint, except exactly where
+        # parser/visual evidence confirms an earring in front of hair.
+        init[crop_hair & ~near_seed] = cv2.GC_BGD
+        ear_interior = cv2.erode(
+            crop_ear.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(7), odd(7))),
+        ).astype(bool)
+        init[ear_interior & ~near_seed] = cv2.GC_BGD
+
+        candidate = crop_seed.copy()
+        if int(crop_seed.sum()) >= 3 and crop_image.shape[0] >= 3 and crop_image.shape[1] >= 3:
+            background_model = np.zeros((1, 65), dtype=np.float64)
+            foreground_model = np.zeros((1, 65), dtype=np.float64)
+            try:
+                cv2.grabCut(
+                    crop_image,
+                    init,
+                    None,
+                    background_model,
+                    foreground_model,
+                    3,
+                    cv2.GC_INIT_WITH_MASK,
+                )
+                candidate = ((init == cv2.GC_FGD) | (init == cv2.GC_PR_FGD)) & crop_local
+            except cv2.error:
+                candidate = crop_seed.copy()
+        candidate |= crop_seed
+        candidate &= ~crop_hair | near_seed
+        candidate = component_mask_connected_to_seed(candidate, crop_seed)
+
+        # GraphCut can occasionally absorb a flat background region when a
+        # source parser label is tiny.  Fall back to genuine source edges plus
+        # the confirmed seed rather than pasting that region over target hair.
+        seed_area = max(1, int(crop_seed.sum()))
+        max_area = max(96, int(round(seed_area * 12.0)))
+        if int(candidate.sum()) > max_area:
+            gray = cv2.cvtColor(crop_image, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 24, 96) > 0
+            edge_band = cv2.dilate(
+                edges.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(5), odd(5))),
+            ).astype(bool)
+            candidate = component_mask_connected_to_seed((edge_band & crop_local) | crop_seed, crop_seed)
+
+        hole = enclosed_holes(candidate, crop_local)
+        instance = np.zeros((height, width), dtype=bool)
+        instance[y0:y1, x0:x1] = candidate & ~hole
+        holes = np.zeros((height, width), dtype=bool)
+        holes[y0:y1, x0:x1] = hole
+        return instance, holes
+
+    left_out = np.zeros((batch, 1, height, width), dtype=np.float32)
+    right_out = np.zeros_like(left_out)
+    left_hole_out = np.zeros_like(left_out)
+    right_hole_out = np.zeros_like(left_out)
+    for index in range(batch):
+        seed = coarse_np[index, 0] | parser_np[index, 0]
+        left_out[index, 0], left_hole_out[index, 0] = trace_side(
+            left_active_np[index, 0],
+            left_anchor_np[index, 0],
+            seed,
+            search_np[index, 0],
+            hair_np[index, 0],
+            ear_np[index, 0],
+            image_np[index],
+        )
+        right_out[index, 0], right_hole_out[index, 0] = trace_side(
+            right_active_np[index, 0],
+            right_anchor_np[index, 0],
+            seed,
+            search_np[index, 0],
+            hair_np[index, 0],
+            ear_np[index, 0],
+            image_np[index],
+        )
+
+    left_instance = torch.from_numpy(left_out).to(device=source_01.device, dtype=source_01.dtype)
+    right_instance = torch.from_numpy(right_out).to(device=source_01.device, dtype=source_01.dtype)
+    left_hole = torch.from_numpy(left_hole_out).to(device=source_01.device, dtype=source_01.dtype)
+    right_hole = torch.from_numpy(right_hole_out).to(device=source_01.device, dtype=source_01.dtype)
+    return {
+        "instance_mask": torch.clamp(left_instance + right_instance, 0, 1),
+        "hoop_hole_mask": torch.clamp(left_hole + right_hole, 0, 1),
+        "left_instance_mask": left_instance,
+        "right_instance_mask": right_instance,
+        "left_hoop_hole_mask": left_hole,
+        "right_hoop_hole_mask": right_hole,
+    }
+
+
 def build_elliptical_hoop_candidates(
     source_01: torch.Tensor,
     search_mask: torch.Tensor,
@@ -1024,25 +1319,6 @@ def build_strong_earring_candidate(
     ear_exterior = (1.0 - erode_mask(source_ear, 7)).clamp(0, 1)
     visual_wire = edge_support * contrast_support * ear_exterior * ear_roi
     candidate = torch.maximum(candidate, visual_wire)
-    elliptical_hoops = build_elliptical_hoop_candidates(
-        source_01,
-        ear_roi,
-        left_anchor,
-        right_anchor,
-        source_hair_mask=hair,
-        source_ear_mask=source_ear,
-    )
-    elliptical_candidate = torch.clamp(
-        elliptical_hoops["left_elliptical_hoop"] + elliptical_hoops["right_elliptical_hoop"],
-        0,
-        1,
-    )
-    elliptical_hole = torch.clamp(
-        elliptical_hoops["left_elliptical_hoop_hole"]
-        + elliptical_hoops["right_elliptical_hoop_hole"],
-        0,
-        1,
-    )
     object_evidence = candidate * torch.clamp(edge_support + chroma_support + contrast_support, 0, 1)
     # A parser-missed metal wire is often labelled background.  Do not erase it
     # pixel-wise here; reject components by *coverage ratio* below instead.
@@ -1050,22 +1326,23 @@ def build_strong_earring_candidate(
     # common visual false positive around an ear.
     object_evidence = object_evidence * (1.0 - 0.75 * hair).clamp(0, 1) * ear_roi
     object_evidence = dilate_mask(object_evidence, 3) * candidate * ear_roi
-    # A semantic label may grow a little into nearby visual evidence.  In the
-    # parser-missed case, however, partial generic edges are not an earring:
-    # only a closed, lobe-anchored elliptical hoop is accepted.  This removes
-    # the broken-metal artefact while retaining label-9 studs and pendants.
+    # A semantic earring label may grow into immediately adjacent observed
+    # pixels, but it must remain an image-derived object.  The previous policy
+    # discarded every parser-missed ordinary earring unless an ellipse fitter
+    # could redraw it, which is why solid earrings started disappearing.
     parser_neighbourhood = dilate_mask(parser_earring, 13)
-    object_evidence = object_evidence * parser_neighbourhood
-    # Once a lobe-connected hoop has passed its multi-arc geometry check, use
-    # neighbouring *observed* source wire to follow the real object rather
-    # than rendering the ideal fitted ellipse.  This keeps an imperfectly
-    # circular source hoop's own thickness and shape, while the edge/contrast
-    # gate prevents the surrounding source hair or background from joining it.
-    observed_hoop_wire = visual_wire * dilate_mask(elliptical_candidate, 9) * ear_roi
-    object_evidence = torch.maximum(
-        object_evidence,
-        torch.maximum(elliptical_candidate, observed_hoop_wire),
+    parser_present = (
+        parser_earring.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+    ).view(-1, 1, 1, 1)
+    parser_guided = torch.maximum(
+        parser_earring,
+        object_evidence * parser_neighbourhood,
     )
+    # With no parser label, keep the compact lobe-connected visual evidence.
+    # The component and density checks below, followed by the final direct
+    # instance extractor, prevent this from turning an exposed ear into a
+    # broad source-background paste.
+    object_evidence = torch.where(parser_present, parser_guided, object_evidence)
 
     # A hoop wire frequently has one-pixel gaps after 256px downsampling.  Use
     # a small proxy solely to assign all arcs to the same ear side, then return
@@ -1108,11 +1385,14 @@ def build_strong_earring_candidate(
         "strong_candidate_mask": torch.clamp(left + right, 0, 1),
         "left_strong_candidate": left,
         "right_strong_candidate": right,
-        "left_elliptical_hoop": elliptical_hoops["left_elliptical_hoop"],
-        "right_elliptical_hoop": elliptical_hoops["right_elliptical_hoop"],
-        "elliptical_hoop_hole": elliptical_hole,
-        "left_elliptical_hoop_hole": elliptical_hoops["left_elliptical_hoop_hole"],
-        "right_elliptical_hoop_hole": elliptical_hoops["right_elliptical_hoop_hole"],
+        # Kept as empty compatibility/debug entries for existing dataset
+        # readers.  Ellipse fitting no longer controls either RGB recovery or
+        # the hollow part of a hoop.
+        "left_elliptical_hoop": torch.zeros_like(left),
+        "right_elliptical_hoop": torch.zeros_like(right),
+        "elliptical_hoop_hole": torch.zeros_like(left),
+        "left_elliptical_hoop_hole": torch.zeros_like(left),
+        "right_elliptical_hoop_hole": torch.zeros_like(right),
     }
 
 

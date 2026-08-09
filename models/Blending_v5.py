@@ -656,6 +656,8 @@ class BlendingV5(Blending_v8):
                 "earring_fine_floor_support",
                 "output_source_earring_composite_mask",
                 "output_v5_earring_edit_mask",
+                "output_highres_earring_instance",
+                "output_highres_earring_hole",
                 "output_highres_hoop_trace",
                 "output_highres_hoop_hole",
                 "output_face_target_authority_mask",
