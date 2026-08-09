@@ -1265,6 +1265,43 @@ class PostProcessModelV5(nn.Module):
         # used by generic image helpers for an all-bright sample.
         aux["authoritative_hair_highres_01"] = ((authority + 1.0) * 0.5).clamp(0, 1)
 
+    @staticmethod
+    def _attach_authoritative_target_highres(
+        aux: dict[str, torch.Tensor],
+        authoritative_target_highres: torch.Tensor | None,
+        reference: torch.Tensor,
+    ) -> None:
+        """Store the pre-PP high-resolution target for normal-face authority.
+
+        V5 only needs to generate the verified earring object and a narrowly
+        defined revealed-skin repair.  Letting the PP decoder redraw the rest
+        of the face is what produced the dark facial ghosts in validation.  The
+        target is in StyleGAN's ``[-1, 1]`` range, just like the optional hair
+        authority above.
+        """
+
+        if authoritative_target_highres is None:
+            return
+        if not torch.is_tensor(authoritative_target_highres):
+            raise TypeError("authoritative_target_highres must be a torch.Tensor.")
+        authority = authoritative_target_highres
+        if authority.ndim == 3:
+            authority = authority.unsqueeze(0)
+        if authority.ndim != 4 or authority.size(1) != 3:
+            raise ValueError(
+                "authoritative_target_highres must have shape [B,3,H,W], "
+                f"got {tuple(authority.shape)}."
+            )
+        if authority.size(0) != reference.size(0):
+            raise ValueError(
+                "authoritative_target_highres batch size must match the PP input: "
+                f"{authority.size(0)} != {reference.size(0)}."
+            )
+        authority = authority.to(device=reference.device, dtype=reference.dtype)
+        if not bool(torch.isfinite(authority).all()):
+            raise ValueError("authoritative_target_highres contains non-finite values.")
+        aux["authoritative_target_highres_01"] = ((authority + 1.0) * 0.5).clamp(0, 1)
+
     def forward(
         self,
         source: torch.Tensor,
@@ -1276,6 +1313,7 @@ class PostProcessModelV5(nn.Module):
         source_hair_mask: torch.Tensor | None = None,
         target_hair_mask: torch.Tensor | None = None,
         authoritative_hair_highres: torch.Tensor | None = None,
+        authoritative_target_highres: torch.Tensor | None = None,
         query_mask: torch.Tensor | None = None,
         source_ear_mask: torch.Tensor | None = None,
         source_earring_object_mask: torch.Tensor | None = None,
@@ -1324,6 +1362,12 @@ class PostProcessModelV5(nn.Module):
                 authoritative_hair_highres,
                 source,
             )
+            self._attach_authoritative_target_highres(
+                aux,
+                authoritative_target_highres,
+                source,
+            )
+            aux["target_01"] = normalized_to_01(target)
             self._apply_source_content_gate(aux)
             return self.latent_avg.to(s_face.device) + s_face, f_face, aux
 
@@ -1356,6 +1400,11 @@ class PostProcessModelV5(nn.Module):
         self._attach_authoritative_hair_highres(
             aux,
             authoritative_hair_highres,
+            source,
+        )
+        self._attach_authoritative_target_highres(
+            aux,
+            authoritative_target_highres,
             source,
         )
         # Restrict every source-sampling mask to real source content (skin/ear/
@@ -1515,6 +1564,82 @@ class PostProcessModelV5(nn.Module):
         aux["output_target_hair_face_seam_mask"] = face_hair_seam
         aux["output_target_hair_preserve_mask"] = preserve
         aux["output_target_hair_earring_keep_mask"] = earring_keep
+        return preserve
+
+    def _normal_target_face_preserve_mask(
+        self,
+        aux: dict[str, torch.Tensor],
+        size: tuple[int, int],
+    ) -> torch.Tensor | None:
+        """Keep normal face pixels owned by the pre-PP target image.
+
+        Only two V5 paths are allowed to alter facial pixels: the exact
+        revealed-skin region (including its soft transition) and an accepted
+        earring object.  This makes the decoder unable to repaint cheeks, eyes
+        or the whole forehead with source-like low-frequency artefacts while
+        retaining the intended local repairs.
+        """
+
+        target_face = aux.get("target_face_surface_mask")
+        target_parsing = aux.get("target_parsing")
+        if target_face is None and target_parsing is None:
+            return None
+        if target_face is None:
+            preserve = torch.zeros_like(
+                resize_mask(parsing_label_mask(target_parsing, RAW_DETAIL_LABELS), size)
+            )
+        else:
+            preserve = (resize_mask(target_face, size) > 0.5).float()
+
+        # ``face_surface`` contains skin/neck labels only.  Eyes, brows, nose
+        # and mouth are separate parser classes, so protecting only skin still
+        # leaves the most noticeable facial features free to be corrupted by
+        # the PP decoder.  Target ears are also retained until a verified
+        # earring write explicitly opens its small local edit region.
+        if target_parsing is not None:
+            detail = resize_mask(
+                parsing_label_mask(target_parsing, RAW_DETAIL_LABELS),
+                size,
+            )
+            preserve = torch.maximum(preserve, detail)
+        for key in ("target_left_ear_mask", "target_right_ear_mask"):
+            ear = aux.get(key)
+            if ear is not None:
+                preserve = torch.maximum(preserve, resize_mask(ear, size))
+        preserve = (preserve > 0.5).float()
+
+        target_hair = aux.get("target_hair_mask")
+        if target_hair is not None:
+            preserve = preserve * (1.0 - resize_mask(target_hair, size)).clamp(0, 1)
+
+        revealed = aux.get("revealed_skin_blend_mask", aux.get("revealed_skin_mask"))
+        if revealed is not None:
+            revealed = resize_mask(revealed, size).clamp(0, 1)
+            revealed_dilate = int(
+                getattr(self.args, "output_revealed_skin_preserve_dilate", 5)
+            )
+            if revealed_dilate > 0:
+                revealed = dilate_mask(revealed, revealed_dilate)
+            preserve = preserve * (1.0 - revealed).clamp(0, 1)
+
+        # The earring itself remains a learned local edit.  A tiny dilation
+        # prevents a hard target/earring seam, but no broad ear ROI or search
+        # proposal is allowed to open the normal-face authority.
+        earring_write = aux.get("earring_write_mask")
+        if earring_write is not None:
+            earring_edit = resize_mask(earring_write, size).clamp(0, 1)
+            edit_dilate = int(getattr(self.args, "output_earring_face_exclude_dilate", 2))
+            if edit_dilate > 0:
+                earring_edit = dilate_mask(earring_edit, edit_dilate)
+            preserve = preserve * (1.0 - earring_edit).clamp(0, 1)
+
+        hoop_hole = aux.get("hoop_hole_mask")
+        if hoop_hole is not None:
+            # A hoop centre is target owned even when it happens to overlap the
+            # parser's face surface near an ear.
+            preserve = torch.maximum(preserve, resize_mask(hoop_hole, size)).clamp(0, 1)
+
+        aux["output_normal_face_preserve_mask"] = preserve
         return preserve
 
     @staticmethod
@@ -1809,10 +1934,34 @@ class PostProcessModelV5(nn.Module):
                 align_corners=False,
             )
         authority = authority.clamp(0, 1)
-        preserve = self._target_output_preserve_mask(aux, image_01.shape[-2:])
-        if preserve is None:
-            return image_01 * 2 - 1
-        protected = image_01 * (1.0 - preserve) + authority * preserve
+        hair_preserve = self._target_output_preserve_mask(aux, image_01.shape[-2:])
+        protected = image_01
+        if hair_preserve is not None:
+            protected = protected * (1.0 - hair_preserve) + authority * hair_preserve
+
+        # In production this is the 1024px pre-PP image.  Dataset training
+        # intentionally falls back to the stored 256px PP target, which makes
+        # the initial preview an honest target-anchored baseline instead of a
+        # decoder hallucination over the whole face.
+        target_authority = aux.get("authoritative_target_highres_01", aux.get("target_01"))
+        face_preserve = self._normal_target_face_preserve_mask(aux, image_01.shape[-2:])
+        if target_authority is not None and face_preserve is not None:
+            target_authority = target_authority.to(
+                device=image_01.device,
+                dtype=image_01.dtype,
+            )
+            if target_authority.shape[-2:] != image_01.shape[-2:]:
+                target_authority = F.interpolate(
+                    target_authority,
+                    size=image_01.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            target_authority = target_authority.clamp(0, 1)
+            protected = (
+                protected * (1.0 - face_preserve)
+                + target_authority * face_preserve
+            )
         return protected.clamp(0, 1) * 2 - 1
 
     def render_refined(

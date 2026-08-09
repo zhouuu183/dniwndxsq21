@@ -479,6 +479,7 @@ class BlendingV5(Blending_v8):
             HM_3E,
             target_hair_mask=HM_X,
             authoritative_hair_highres=authoritative_hair_highres,
+            authoritative_target_highres=I_blend,
             cleanup_masks=cleanup_masks,
         )
         I_final, _ = self.post_process.render_refined(self.net.generator, S_final, F_final, aux)

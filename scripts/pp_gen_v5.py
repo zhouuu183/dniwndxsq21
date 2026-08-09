@@ -667,6 +667,11 @@ class RenderedPairDataset(Dataset):
             "shape_reference_path": str(self.donor_gallery_root / shape_name),
             "color_reference_path": str(self.donor_gallery_root / color_name),
             "source_full": load_image(source_path),
+            # Dataset parts must be self-contained.  Previewing them on a
+            # training machine with a different gallery mount used to silently
+            # replace both references with the target image.
+            "shape_reference_full": load_image(self.donor_gallery_root / shape_name),
+            "color_reference_full": load_image(self.donor_gallery_root / color_name),
             "target_full": load_image(target_path),
             "pre_reference_color_full": load_image(pre_reference_path),
             "cleanup_masks": item.get("cleanup_masks", {}),
@@ -741,6 +746,12 @@ class DatasetItemBatchBuilder:
                 "shape_reference_path": [item["shape_reference_path"] for item in batch_items],
                 "color_reference_path": [item["color_reference_path"] for item in batch_items],
                 "source_full": torch.stack([item["source_full"] for item in batch_items], dim=0),
+                "shape_reference_full": torch.stack(
+                    [item["shape_reference_full"] for item in batch_items], dim=0
+                ),
+                "color_reference_full": torch.stack(
+                    [item["color_reference_full"] for item in batch_items], dim=0
+                ),
                 "target_full": torch.stack([item["target_full"] for item in batch_items], dim=0),
                 "pre_reference_color_full": torch.stack(
                     [item["pre_reference_color_full"] for item in batch_items],
@@ -794,6 +805,14 @@ class DatasetItemBatchBuilder:
             shape_reference_paths = batch["shape_reference_path"]
             color_reference_paths = batch["color_reference_path"]
             source_full = batch["source_full"].to(self.device, non_blocking=False)
+            shape_reference_full = batch["shape_reference_full"].to(
+                self.device,
+                non_blocking=False,
+            )
+            color_reference_full = batch["color_reference_full"].to(
+                self.device,
+                non_blocking=False,
+            )
             target_full = batch["target_full"].to(self.device, non_blocking=False)
             pre_reference_color_full = batch["pre_reference_color_full"].to(
                 self.device,
@@ -802,6 +821,8 @@ class DatasetItemBatchBuilder:
             batch_cleanup_masks = batch.get("cleanup_masks", {})
 
             source_256 = self._resize_to_256(source_full).clip(0, 1)
+            shape_reference_256 = self._resize_to_256(shape_reference_full).clip(0, 1)
+            color_reference_256 = self._resize_to_256(color_reference_full).clip(0, 1)
             target_256 = self._resize_to_256(target_full).clip(0, 1)
             pre_reference_color_256 = self._resize_to_256(pre_reference_color_full).clip(0, 1)
             source_hair_input = self._resize_for_hair_parser(source_full)
@@ -968,6 +989,8 @@ class DatasetItemBatchBuilder:
                     "source_path": source_paths[idx],
                     "shape_reference_path": shape_reference_paths[idx],
                     "color_reference_path": color_reference_paths[idx],
+                    "shape_reference": shape_reference_256[idx].cpu(),
+                    "color_reference": color_reference_256[idx].cpu(),
                     "target": target_256[idx].cpu(),
                     # Keep both stages for reproducible validation previews.  The
                     # training target is always the authoritative color stage.
@@ -1023,8 +1046,10 @@ class DatasetItemBatchBuilder:
 
             del batch
             del dataset_items
-            del source_full, target_full, pre_reference_color_full
-            del source_256, target_256, pre_reference_color_256
+            del source_full, shape_reference_full, color_reference_full
+            del target_full, pre_reference_color_full
+            del source_256, shape_reference_256, color_reference_256
+            del target_256, pre_reference_color_256
             del source_hair_d, target_hair_d, target_hair_e, target_mask
             del source_parsing, target_parsing, query_info, cleanup_masks
             del weak_earring, earring_policy, earring_search_mask, source_earring_mask

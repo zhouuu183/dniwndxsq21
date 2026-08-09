@@ -1539,13 +1539,26 @@ class PPDatasetV5(Dataset):
                 dtype=torch.float32,
             )
         if self.include_preview_references:
-            sample["shape_reference"] = self.load_preview_reference(
-                item.get("shape_reference_path"),
-                sample["target"],
+            embedded_shape = item.get("shape_reference")
+            embedded_color = item.get("color_reference")
+            # New V5 dataset parts embed the references so previews remain
+            # meaningful when generation and training use different mounts.
+            # Path loading is retained only for already-generated old parts.
+            sample["shape_reference"] = (
+                embedded_shape.clone()
+                if torch.is_tensor(embedded_shape)
+                else self.load_preview_reference(
+                    item.get("shape_reference_path"),
+                    sample["target"],
+                )
             )
-            sample["color_reference"] = self.load_preview_reference(
-                item.get("color_reference_path"),
-                sample["target"],
+            sample["color_reference"] = (
+                embedded_color.clone()
+                if torch.is_tensor(embedded_color)
+                else self.load_preview_reference(
+                    item.get("color_reference_path"),
+                    sample["target"],
+                )
             )
         return self.transform(sample)
 
