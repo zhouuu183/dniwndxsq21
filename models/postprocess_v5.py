@@ -574,10 +574,13 @@ class PostProcessModelV5(nn.Module):
             source_background_mask=(source_labels.long() == 0).to(dtype=query_mask.dtype),
             source_hair_mask=query_info.get("source_hair_mask"),
             source_ear_mask=parsing_label_mask(source_parsing, RAW_EAR_SURFACE_LABELS),
+            parser_earring_mask=source_earring_detection_mask,
         )
         query_info["strong_earring_candidate_core"] = strong_info["strong_candidate_mask"]
         query_info["left_strong_candidate"] = strong_info["left_strong_candidate"]
         query_info["right_strong_candidate"] = strong_info["right_strong_candidate"]
+        query_info["left_elliptical_hoop"] = strong_info["left_elliptical_hoop"]
+        query_info["right_elliptical_hoop"] = strong_info["right_elliptical_hoop"]
         parser_earring, no_earring = self._source_earring_case_masks(
             source_parsing,
             query_info,

@@ -497,6 +497,7 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
         source_background_mask=(parsing.long() == 0).to(dtype=reference.dtype),
         source_hair_mask=query_info.get("source_hair_mask"),
         source_ear_mask=parsing_label_mask(parsing, RAW_EAR_SURFACE_LABELS),
+        parser_earring_mask=parser_earring,
     )
     strong_candidate = strong_info["strong_candidate_mask"]
 
@@ -644,6 +645,8 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
         "strong_earring_candidate_core": strong_candidate * active,
         "left_strong_candidate": strong_info["left_strong_candidate"] * active,
         "right_strong_candidate": strong_info["right_strong_candidate"] * active,
+        "left_elliptical_hoop": strong_info["left_elliptical_hoop"] * active,
+        "right_elliptical_hoop": strong_info["right_elliptical_hoop"] * active,
         "earring_candidate_mask": candidate_mask * search_mask * active,
         "selected_object_mask": selected_object,
         "earring_search_mask": search_mask,

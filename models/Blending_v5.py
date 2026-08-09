@@ -615,6 +615,8 @@ class BlendingV5(Blending_v8):
                 "earring_final_alpha",
                 "left_strong_candidate",
                 "right_strong_candidate",
+                "left_elliptical_hoop",
+                "right_elliptical_hoop",
                 "target_left_ear",
                 "target_right_ear",
                 "left_lobe_anchor",

@@ -5,6 +5,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+try:
+    import cv2
+except ImportError:  # pragma: no cover - the project runtime normally provides OpenCV.
+    cv2 = None
+
 from models.CtrlHair.external_code.face_parsing.my_parsing_util import FaceParsing_tensor
 from models.face_parsing.model import BiSeNet, seg_mean, seg_std
 from utils.bicubic import BicubicDownSample
@@ -615,6 +620,167 @@ def compute_earring_hole_mask(component_mask: torch.Tensor) -> torch.Tensor:
     return (filled - component).clamp(0, 1)
 
 
+def build_elliptical_hoop_candidates(
+    source_01: torch.Tensor,
+    search_mask: torch.Tensor,
+    left_lobe_anchor: torch.Tensor,
+    right_lobe_anchor: torch.Tensor,
+    *,
+    source_hair_mask: torch.Tensor | None = None,
+    source_ear_mask: torch.Tensor | None = None,
+    min_axis: float = 12.0,
+    max_axis: float = 132.0,
+    min_coverage: float = 0.42,
+) -> dict[str, torch.Tensor]:
+    """Find a complete source hoop before allowing visual-only recovery.
+
+    A parser-missed hoop cannot be reconstructed from a handful of independent
+    Sobel pixels: copying those pixels produces the broken metal squiggle seen
+    beside the ear.  This helper accepts an image-only fallback only when its
+    Canny contour supports a fitted ellipse around an actual lobe.  It returns
+    the thin fitted trace, never the ellipse interior or a broad ear rectangle.
+    """
+
+    reference = ensure_mask_4d(search_mask).float()
+    zeros = torch.zeros_like(reference)
+    if cv2 is None:
+        return {"left_elliptical_hoop": zeros, "right_elliptical_hoop": zeros}
+
+    source_01 = normalized_to_01(source_01)
+    size = reference.shape[-2:]
+    source_01 = F.interpolate(source_01, size=size, mode="bilinear", align_corners=False)
+    search = _resize_like_mask(search_mask, reference)
+    left_anchor = _resize_like_mask(left_lobe_anchor, reference)
+    right_anchor = _resize_like_mask(right_lobe_anchor, reference)
+    hair = _resize_like_mask(source_hair_mask, reference)
+    ear = _resize_like_mask(source_ear_mask, reference)
+
+    source_np = source_01.detach().cpu().permute(0, 2, 3, 1).numpy()
+    search_np = (search.detach().cpu().numpy() > 0.5)
+    hair_np = (hair.detach().cpu().numpy() > 0.5)
+    ear_np = (ear.detach().cpu().numpy() > 0.5)
+    left_anchor_np = (left_anchor.detach().cpu().numpy() > 0.05)
+    right_anchor_np = (right_anchor.detach().cpu().numpy() > 0.05)
+    left_out = np.zeros_like(search_np, dtype=np.float32)
+    right_out = np.zeros_like(search_np, dtype=np.float32)
+    height, width = size
+
+    def trace_for_anchor(
+        image: np.ndarray,
+        base_search: np.ndarray,
+        hair_mask: np.ndarray,
+        ear_mask: np.ndarray,
+        anchor_mask: np.ndarray,
+    ) -> np.ndarray:
+        points = np.argwhere(anchor_mask)
+        if points.size == 0:
+            return np.zeros_like(base_search, dtype=np.float32)
+        anchor_y, anchor_x = points.mean(axis=0)
+        y_grid, x_grid = np.ogrid[:height, :width]
+        # A hoop hangs from a lobe; this window is broad enough for the example
+        # long hoops but not so broad that the complete background is searched.
+        local_window = (
+            (y_grid >= anchor_y - 24.0)
+            & (y_grid <= anchor_y + 96.0)
+            & (x_grid >= anchor_x - 72.0)
+            & (x_grid <= anchor_x + 72.0)
+        )
+        valid = base_search & local_window & ~hair_mask
+        if int(valid.sum()) < 24:
+            return np.zeros_like(base_search, dtype=np.float32)
+
+        gray = np.clip(np.round(image.mean(axis=2) * 255.0), 0, 255).astype(np.uint8)
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        gradient = np.hypot(grad_x, grad_y)
+        masked_gradient = gradient[valid]
+        low = max(8, int(np.percentile(masked_gradient, 55) * 0.50))
+        high = max(low + 12, int(np.percentile(masked_gradient, 82)))
+        edges = cv2.Canny(gray, low, min(255, high))
+        edges[~valid] = 0
+        # Join antialiased wire fragments for contour fitting only.  The final
+        # mask below is a thin ellipse and therefore never copies this closure.
+        fit_edges = cv2.morphologyEx(
+            edges,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        )
+        contours, _ = cv2.findContours(fit_edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        best_mask = None
+        best_score = -1.0
+        for contour in contours:
+            if len(contour) < 12:
+                continue
+            (center_x, center_y), (axis_x, axis_y), angle = cv2.fitEllipse(contour)
+            major = max(float(axis_x), float(axis_y))
+            minor = min(float(axis_x), float(axis_y))
+            if not (float(min_axis) <= minor <= major <= float(max_axis)):
+                continue
+            if minor / max(major, 1e-6) < 0.32:
+                continue
+
+            ellipse = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(
+                ellipse,
+                (int(round(center_x)), int(round(center_y))),
+                (max(1, int(round(axis_x / 2.0))), max(1, int(round(axis_y / 2.0)))),
+                float(angle),
+                0,
+                360,
+                255,
+                2,
+                lineType=cv2.LINE_8,
+            )
+            ellipse_bool = ellipse > 0
+            support = cv2.dilate(edges, np.ones((5, 5), dtype=np.uint8)) > 0
+            coverage = float((ellipse_bool & support).sum()) / max(float(ellipse_bool.sum()), 1.0)
+            if coverage < float(min_coverage):
+                continue
+            # The lobe must touch the fitted perimeter.  A background ellipse
+            # farther from the ear is not a valid accessory candidate.
+            lobe_touch = bool(
+                (cv2.dilate(ellipse, np.ones((17, 17), dtype=np.uint8)) > 0)[anchor_mask].any()
+            )
+            if not lobe_touch:
+                continue
+            # The inside of a hoop remains target-owned.  Also do not write the
+            # source ear itself; the target ear boundary is authoritative.
+            trace = ellipse_bool & valid & ~cv2.dilate(
+                ear_mask.astype(np.uint8),
+                np.ones((5, 5), dtype=np.uint8),
+            ).astype(bool)
+            if int(trace.sum()) < max(14, int(minor * 0.7)):
+                continue
+            score = coverage * float(trace.sum())
+            if score > best_score:
+                best_score = score
+                best_mask = trace
+        if best_mask is None:
+            return np.zeros_like(base_search, dtype=np.float32)
+        return best_mask.astype(np.float32)
+
+    for index in range(reference.size(0)):
+        left_out[index, 0] = trace_for_anchor(
+            source_np[index],
+            search_np[index, 0],
+            hair_np[index, 0],
+            ear_np[index, 0],
+            left_anchor_np[index, 0],
+        )
+        right_out[index, 0] = trace_for_anchor(
+            source_np[index],
+            search_np[index, 0],
+            hair_np[index, 0],
+            ear_np[index, 0],
+            right_anchor_np[index, 0],
+        )
+
+    return {
+        "left_elliptical_hoop": torch.from_numpy(left_out).to(reference.device, reference.dtype),
+        "right_elliptical_hoop": torch.from_numpy(right_out).to(reference.device, reference.dtype),
+    }
+
+
 def build_strong_earring_candidate(
     source_01: torch.Tensor,
     candidate_mask: torch.Tensor,
@@ -627,6 +793,7 @@ def build_strong_earring_candidate(
     source_background_mask: torch.Tensor | None = None,
     source_hair_mask: torch.Tensor | None = None,
     source_ear_mask: torch.Tensor | None = None,
+    parser_earring_mask: torch.Tensor | None = None,
     min_area: float = 5.0,
     max_roi_density: float = 0.28,
 ) -> dict[str, torch.Tensor]:
@@ -650,6 +817,7 @@ def build_strong_earring_candidate(
     background = _resize_like_mask(source_background_mask, reference)
     hair = _resize_like_mask(source_hair_mask, reference)
     source_ear = _resize_like_mask(source_ear_mask, reference)
+    parser_earring = _resize_like_mask(parser_earring_mask, reference)
     source_01 = F.interpolate(source_01, size=size, mode="bilinear", align_corners=False)
 
     edge = sobel_magnitude(source_01)
@@ -673,6 +841,19 @@ def build_strong_earring_candidate(
     ear_exterior = (1.0 - dilate_mask(source_ear, 5)).clamp(0, 1)
     visual_wire = edge_support * contrast_support * ear_exterior * ear_roi
     candidate = torch.maximum(candidate, visual_wire)
+    elliptical_hoops = build_elliptical_hoop_candidates(
+        source_01,
+        ear_roi,
+        left_anchor,
+        right_anchor,
+        source_hair_mask=hair,
+        source_ear_mask=source_ear,
+    )
+    elliptical_candidate = torch.clamp(
+        elliptical_hoops["left_elliptical_hoop"] + elliptical_hoops["right_elliptical_hoop"],
+        0,
+        1,
+    )
     object_evidence = candidate * torch.clamp(edge_support + chroma_support + contrast_support, 0, 1)
     # A parser-missed metal wire is often labelled background.  Do not erase it
     # pixel-wise here; reject components by *coverage ratio* below instead.
@@ -680,6 +861,13 @@ def build_strong_earring_candidate(
     # common visual false positive around an ear.
     object_evidence = object_evidence * (1.0 - 0.75 * hair).clamp(0, 1) * ear_roi
     object_evidence = dilate_mask(object_evidence, 3) * candidate * ear_roi
+    # A semantic label may grow a little into nearby visual evidence.  In the
+    # parser-missed case, however, partial generic edges are not an earring:
+    # only a closed, lobe-anchored elliptical hoop is accepted.  This removes
+    # the broken-metal artefact while retaining label-9 studs and pendants.
+    parser_neighbourhood = dilate_mask(parser_earring, 13)
+    object_evidence = object_evidence * parser_neighbourhood
+    object_evidence = torch.maximum(object_evidence, elliptical_candidate)
 
     # A hoop wire frequently has one-pixel gaps after 256px downsampling.  Use
     # a small proxy solely to assign all arcs to the same ear side, then return
@@ -722,6 +910,8 @@ def build_strong_earring_candidate(
         "strong_candidate_mask": torch.clamp(left + right, 0, 1),
         "left_strong_candidate": left,
         "right_strong_candidate": right,
+        "left_elliptical_hoop": elliptical_hoops["left_elliptical_hoop"],
+        "right_elliptical_hoop": elliptical_hoops["right_elliptical_hoop"],
     }
 
 
