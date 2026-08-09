@@ -27,6 +27,7 @@ from models.ear_modules_v5 import (
     build_earring_search_mask,
     build_earring_write_masks,
     build_strong_earring_candidate,
+    expand_valid_roi_by_completion,
     build_revealed_skin_mask,
     build_weak_earring_masks,
     dilate_mask,
@@ -398,6 +399,16 @@ class PostProcessModelV5(nn.Module):
             completion_left * left_active + completion_right * right_active
         ).clamp(0, 1) * side_gate
 
+        # A parser-missed hoop's outer arc must not be clipped by the original
+        # ear shell. Expansion is confined to the validated, lobe-connected
+        # object itself, never to a geometric ear/background region.
+        earring_roi = expand_valid_roi_by_completion(
+            earring_roi,
+            trusted_object,
+            grow_iters=int(getattr(self.args, "earring_write_connectivity_iters", 32)),
+            seed_dilate=max(1, int(getattr(self.args, "earring_write_bridge_dilate", 5))),
+        ) * side_gate
+
         source_labels = ensure_mask_4d(source_parsing).to(device=reference.device)
         if source_labels.shape[-2:] != reference.shape[-2:]:
             source_labels = F.interpolate(
@@ -546,7 +557,10 @@ class PostProcessModelV5(nn.Module):
         strong_info = build_strong_earring_candidate(
             source_01,
             weak_masks["earring_candidate_mask"],
-            detection_ear_roi,
+            # A parser-missed hoop commonly extends beyond the raw ear ROI.
+            # Source-lobe support follows the real ear downward while remaining
+            # semantic/side constrained, so it is safe to use for validation.
+            weak_masks.get("source_lobe_search_mask", detection_ear_roi),
             query_info.get("left_ear_roi", detection_ear_roi),
             query_info.get("right_ear_roi", detection_ear_roi),
             query_info.get("left_lobe_anchor", query_info.get("target_left_ear_mask", detection_ear_roi)),
@@ -1452,7 +1466,9 @@ class PostProcessModelV5(nn.Module):
         aux["injected_fine_mask_64"] = fine_mask_64
         aux["source_01"] = source_01
         aux["detail_reference_01"] = source_01
-        aux["earring_reference"] = source_01
+        reference_01 = source_01 if earring_reference is None else normalized_to_01(earring_reference)
+        aux["earring_reference"] = reference_01
+        aux["earring_reference_01"] = reference_01
         aux["target_01"] = target_01
         aux["HT_E"] = ensure_mask_4d(HT_E).float() if HT_E is not None else None
         return final_s, final_f, aux
@@ -1889,79 +1905,66 @@ class PostProcessModelV5(nn.Module):
             return image
 
         image_01 = ((image + 1) / 2).clamp(0, 1)
-        # Harmonize the revealed forehead first, on the raw generated skin, before
-        # any target-hair hand-off.  This is a no-op in training and when there is
-        # no revealed region or too little recovered-skin reference.
-        image_01 = self._harmonize_revealed_skin(image_01, aux)
-
         if not bool(getattr(self.args, "enable_output_target_preserve", True)):
             return image_01 * 2 - 1
-        authority = aux.get("authoritative_hair_highres_01")
-        if authority is None:
-            # Standalone training/data paths do not have I_blend's 1024px
-            # authority.  Falling back to the current high-resolution render is
-            # an intentional no-op for geometry/texture; it is preferable to
-            # enlarging target_01 over the whole hair and erasing strand detail.
-            authority = image_01
 
-        # Match v58's single generated earring path: no final RGB hard paste.
-        aux["output_source_earring_composite_mask"] = torch.zeros(
-            image_01.size(0),
-            1,
-            image_01.size(2),
-            image_01.size(3),
-            device=image_01.device,
-            dtype=image_01.dtype,
-        )
-        if authority.ndim == 3:
-            authority = authority.unsqueeze(0)
-        if authority.ndim != 4 or authority.size(1) != 3:
-            raise ValueError(
-                "authoritative_hair_highres_01 must have shape [B,3,H,W], "
-                f"got {tuple(authority.shape)}."
-            )
-        if authority.size(0) != image_01.size(0):
-            raise ValueError(
-                "authoritative_hair_highres_01 batch size must match the render: "
-                f"{authority.size(0)} != {image_01.size(0)}."
-            )
-        authority = authority.to(device=image_01.device, dtype=image_01.dtype)
-        if authority.shape[-2:] != image_01.shape[-2:]:
-            authority = F.interpolate(
-                authority,
-                size=image_01.shape[-2:],
-                mode="bicubic",
-                align_corners=False,
-            )
-        authority = authority.clamp(0, 1)
-        hair_preserve = self._target_output_preserve_mask(aux, image_01.shape[-2:])
-        protected = image_01
-        if hair_preserve is not None:
-            protected = protected * (1.0 - hair_preserve) + authority * hair_preserve
-
-        # In production this is the 1024px pre-PP image.  Dataset training
-        # intentionally falls back to the stored 256px PP target, which makes
-        # the initial preview an honest target-anchored baseline instead of a
-        # decoder hallucination over the whole face.
-        target_authority = aux.get("authoritative_target_highres_01", aux.get("target_01"))
-        face_preserve = self._normal_target_face_preserve_mask(aux, image_01.shape[-2:])
-        if target_authority is not None and face_preserve is not None:
-            target_authority = target_authority.to(
-                device=image_01.device,
-                dtype=image_01.dtype,
-            )
-            if target_authority.shape[-2:] != image_01.shape[-2:]:
-                target_authority = F.interpolate(
-                    target_authority,
+        def resize_rgb(value: torch.Tensor | None, *, mode: str) -> torch.Tensor | None:
+            if value is None:
+                return None
+            if value.ndim == 3:
+                value = value.unsqueeze(0)
+            if value.ndim != 4 or value.size(1) != 3 or value.size(0) != image_01.size(0):
+                raise ValueError("V5 RGB authority must have shape [B,3,H,W].")
+            value = value.to(device=image_01.device, dtype=image_01.dtype)
+            if value.shape[-2:] != image_01.shape[-2:]:
+                value = F.interpolate(
+                    value,
                     size=image_01.shape[-2:],
-                    mode="bilinear",
+                    mode=mode,
                     align_corners=False,
                 )
-            target_authority = target_authority.clamp(0, 1)
-            protected = (
-                protected * (1.0 - face_preserve)
-                + target_authority * face_preserve
+            return value.clamp(0, 1)
+
+        # V5 is a local earring recovery stage, not a second face generator.
+        # Compositing from the pre-PP target makes every non-earring pixel
+        # authoritative: no decoder-produced forehead halo, eye distortion or
+        # three-tone face can survive at the final output.
+        target_authority = resize_rgb(
+            aux.get("authoritative_target_highres_01", aux.get("target_01")),
+            mode="bilinear",
+        )
+        if target_authority is None:
+            return image_01 * 2 - 1
+        protected = target_authority
+
+        hair_authority = resize_rgb(aux.get("authoritative_hair_highres_01"), mode="bicubic")
+        hair_preserve = self._target_output_preserve_mask(aux, image_01.shape[-2:])
+        if hair_authority is not None and hair_preserve is not None:
+            protected = protected * (1.0 - hair_preserve) + hair_authority * hair_preserve
+
+        mask_reference = image_01[:, :1] if hair_preserve is None else hair_preserve
+        earring_edit = self._mask_like(aux.get("earring_write_mask"), mask_reference)
+        no_earring = aux.get("no_earring_case_mask")
+        if no_earring is not None:
+            earring_edit = earring_edit * (1.0 - self._mask_like(no_earring, earring_edit)).clamp(0, 1)
+        hoop_hole = aux.get("hoop_hole_mask")
+        if hoop_hole is not None:
+            earring_edit = earring_edit * (1.0 - self._mask_like(hoop_hole, earring_edit)).clamp(0, 1)
+        ear_boundary = aux.get("target_ear_boundary_protect_mask")
+        if ear_boundary is not None:
+            earring_edit = earring_edit * (1.0 - self._mask_like(ear_boundary, earring_edit)).clamp(0, 1)
+
+        if bool(getattr(self.args, "enable_direct_earring_restore", True)):
+            reference = resize_rgb(
+                aux.get("earring_reference_01", aux.get("source_01")),
+                mode="bilinear",
             )
+            if reference is not None:
+                protected = protected * (1.0 - earring_edit) + reference * earring_edit
+        else:
+            protected = protected * (1.0 - earring_edit) + image_01 * earring_edit
+        aux["output_source_earring_composite_mask"] = earring_edit
+        aux["output_v5_earring_edit_mask"] = earring_edit
         return protected.clamp(0, 1) * 2 - 1
 
     def render_refined(

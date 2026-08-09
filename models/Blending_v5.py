@@ -150,6 +150,10 @@ class BlendingV5(Blending_v8):
             # checkpoint args may contain ``False`` from the broad-paste path;
             # honoring that flag would reopen ear holes at inference.
             enable_output_target_preserve=True,
+            # Final output is target-authoritative outside the validated
+            # earring object.  This policy must not be inherited from an old
+            # PP checkpoint that allowed the decoder to redraw the face.
+            enable_direct_earring_restore=True,
             output_target_hair_preserve_dilate=pp_policy_value(
                 "output_target_hair_preserve_dilate", 5
             ),
@@ -602,6 +606,7 @@ class BlendingV5(Blending_v8):
                 "fine_mask_before_floor",
                 "earring_fine_floor_support",
                 "output_source_earring_composite_mask",
+                "output_v5_earring_edit_mask",
                 "fine_mask",
                 "prior_mask",
                 "source_hair_face_feature_suppress_mask",

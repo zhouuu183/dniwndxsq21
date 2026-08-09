@@ -29,6 +29,7 @@ from models.ear_modules_v5 import (
     build_earring_search_mask,
     build_earring_write_masks,
     build_strong_earring_candidate,
+    expand_valid_roi_by_completion,
     build_revealed_skin_mask,
     build_weak_earring_masks,
     enhance_query_with_earring_recall,
@@ -40,7 +41,7 @@ from utils.image_utils import list_image_files
 from utils.train import seed_everything
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
-DATASET_CONFIG_SCHEMA_VERSION = 2
+DATASET_CONFIG_SCHEMA_VERSION = 3
 DATASET_POLICY_FILES = (
     "scripts/pp_gen_v5.py",
     "hair_swap_v5.py",
@@ -66,7 +67,7 @@ PP_EXTRA_MASK_KEYS = (
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
 USER_FACE_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/mix_ear/")  #"/hf_h/images/FFHQ_short_long/"   hf_h/images/mix_ear/   HairFastGAN/images/ear/
-USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/hf_h/images/FFHQ_short_long/")  #"images/FFHQ_short_long"  HairFastGAN/images/FFHQ_short/   hf_h/images/FFHQ_short_long/
+USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ_color/")  #"images/FFHQ_short_long"  HairFastGAN/images/FFHQ_short/   hf_h/images/FFHQ_short_long/
 USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.9")
 USER_DATASET_SIZE_SMALL = 0  # 0 means use every source image.
 USER_CHUNK_SIZE_SMALL = 130
@@ -484,7 +485,9 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
     strong_info = build_strong_earring_candidate(
         source_01,
         weak_earring.get("earring_candidate_mask", torch.zeros_like(reference)),
-        query_info.get("ear_roi", reference),
+        # Parser-missed hoops extend beyond the raw ear shell.  The lobe search
+        # support remains tied to the actual source ear, not a generic box.
+        weak_earring.get("source_lobe_search_mask", query_info.get("ear_roi", reference)),
         query_info.get("left_ear_roi", reference),
         query_info.get("right_ear_roi", reference),
         query_info.get("left_lobe_anchor", query_info.get("target_left_ear_mask", reference)),
@@ -587,6 +590,12 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
     )
     selected_object = (trusted_left * left_active + trusted_right * right_active).clamp(0, 1)
     candidate_mask = (completion_left * left_active + completion_right * right_active).clamp(0, 1)
+    earring_roi = expand_valid_roi_by_completion(
+        earring_roi,
+        selected_object,
+        grow_iters=int(args.earring_write_connectivity_iters),
+        seed_dilate=max(1, int(args.earring_write_bridge_dilate)),
+    ) * visible_side_gate
 
     source_background = (parsing.long() == 0).to(dtype=reference.dtype)
     source_non_earring = (parsing.long() != RAW_EARRING).to(dtype=reference.dtype)
