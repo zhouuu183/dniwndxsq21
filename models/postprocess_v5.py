@@ -2013,18 +2013,26 @@ class PostProcessModelV5(nn.Module):
         protected = protected * (1.0 - face_authority) + target_authority * face_authority
 
         # The generator target can still carry a low-frequency skin band even
-        # though the PP decoder is no longer allowed to modify the face.  For
-        # pixels which both parsers agree are ordinary skin, use the retained
-        # original 1024px source texture.  The source/target hair guards keep
-        # this out of bangs, the hairline, ears, eyes and the accessory region.
+        # though the PP decoder is no longer allowed to modify the face.  Use
+        # one high-resolution source-face authority for the complete semantic
+        # face, rather than only label-1 skin: leaving brows, eyes, nose and
+        # their parser boundaries on the generated image was still enough to
+        # produce visible colour blocks across the face.  Hair, ears and
+        # accessories remain explicitly target-owned.
         face_restore = torch.zeros_like(face_authority)
         if bool(getattr(self.args, "enable_direct_face_skin_restore", True)):
             source_reference = resize_rgb(aux.get("source_face_reference_01"), mode="bilinear")
             source_parsing = aux.get("source_parsing")
             target_parsing = aux.get("target_parsing")
             if source_reference is not None and source_parsing is not None and target_parsing is not None:
-                source_skin = self._mask_like(parsing_label_mask(source_parsing, (1,)), face_authority)
-                target_skin = self._mask_like(parsing_label_mask(target_parsing, (1,)), face_authority)
+                source_face = self._mask_like(
+                    parsing_label_mask(source_parsing, RAW_FACE_SURFACE_LABELS + RAW_DETAIL_LABELS),
+                    face_authority,
+                )
+                target_face = self._mask_like(
+                    parsing_label_mask(target_parsing, RAW_FACE_SURFACE_LABELS + RAW_DETAIL_LABELS),
+                    face_authority,
+                )
                 source_hair = self._mask_like(aux.get("source_hair_mask"), face_authority)
                 target_hair = self._mask_like(aux.get("target_hair_mask"), face_authority)
                 source_hair = torch.maximum(
@@ -2035,14 +2043,18 @@ class PostProcessModelV5(nn.Module):
                     target_hair,
                     self._mask_like(parsing_label_mask(target_parsing, (RAW_HAIR,)), face_authority),
                 )
+                source_earring = self._mask_like(
+                    parsing_label_mask(source_parsing, (RAW_EARRING,)),
+                    face_authority,
+                )
                 face_restore = (
-                    source_skin
-                    * target_skin
-                    * (1.0 - dilate_mask(source_hair, 9)).clamp(0, 1)
-                    * (1.0 - dilate_mask(target_hair, 5)).clamp(0, 1)
-                    * (1.0 - dilate_mask(earring_edit, 3)).clamp(0, 1)
+                    source_face
+                    * target_face
+                    * (1.0 - dilate_mask(source_hair, 17)).clamp(0, 1)
+                    * (1.0 - dilate_mask(target_hair, 9)).clamp(0, 1)
+                    * (1.0 - dilate_mask(source_earring + earring_edit, 5)).clamp(0, 1)
                 ).clamp(0, 1)
-                face_restore = erode_mask(face_restore, 3).clamp(0, 1)
+                face_restore = erode_mask(face_restore, 5).clamp(0, 1)
                 protected = protected * (1.0 - face_restore) + source_reference * face_restore
 
         if bool(getattr(self.args, "enable_direct_earring_restore", True)):
