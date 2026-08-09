@@ -3,16 +3,30 @@ from __future__ import annotations
 import argparse
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from models.Blending_v8 import Blending_v8, hair_color_debug_ab_to_rgb
+from models.Blending_v8 import Blending_v8
 from models.Encoders import ClipBlendingModel
 from models.Net import Net
 from models.postprocess_v5 import PostProcessModelV5, load_checkpoint_compat
 from utils.bicubic import BicubicDownSample
 from utils.blending_checkpoint_v8 import validate_blending_checkpoint_policy_v8
+from utils.hair_color_match_v8 import gaussian_blur2d, lab_to_rgb, rgb_to_lab
 from utils.image_utils import DilateErosion
+from utils.mask_delta_v8 import filter_parsing_to_primary_subject
 from utils.save_utils import save_gen_image, save_latents, save_vis_mask
+
+
+def hair_color_debug_ab_to_rgb(image: torch.Tensor, ab: torch.Tensor) -> torch.Tensor:
+    """Render a Lab A/B debug tensor without depending on Blending_v8 internals."""
+    was_normalized = bool(image.detach().amin() < -0.05)
+    image_01 = ((image + 1.0) * 0.5 if was_normalized else image).clamp(0, 1)
+    lab = rgb_to_lab(image_01)
+    if ab.shape[-2:] != lab.shape[-2:]:
+        ab = F.interpolate(ab, size=lab.shape[-2:], mode="bilinear", align_corners=False)
+    result = lab_to_rgb(torch.cat((lab[:, :1], ab.to(dtype=lab.dtype)), dim=1))
+    return result * 2.0 - 1.0 if was_normalized else result
 
 
 class BlendingV5(Blending_v8):
@@ -165,6 +179,206 @@ class BlendingV5(Blending_v8):
             print(f"[BlendingV5] Unexpected PP keys: {len(result.unexpected_keys)}")
             print(result.unexpected_keys[:20])
 
+    @staticmethod
+    def _as_mask(mask: torch.Tensor, size: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        mask = mask[:, :1].to(dtype=dtype)
+        if mask.shape[-2:] != size:
+            mask = F.interpolate(mask, size=size, mode="bilinear", align_corners=False)
+        return mask.clamp(0, 1)
+
+    @torch.inference_mode()
+    def _prepare_color_transfer(self, align_shape, name_to_embed):
+        """Keep V5 runnable against the standalone V8 blending implementation.
+
+        V5 uses V8 as a base class, but V8 intentionally exposes only its public
+        ``blend_images`` API.  This copy is the narrow common pre-PP contract V5
+        needs; keeping it here prevents a V8 refactor from breaking PP dataset
+        generation at import/runtime.
+        """
+        I_1 = name_to_embed["face"]["image_norm_256"]
+        I_2 = name_to_embed["shape"]["image_norm_256"]
+        I_3 = name_to_embed["color"]["image_norm_256"]
+
+        face_mask, _ = filter_parsing_to_primary_subject(name_to_embed["face"]["mask"])
+        color_mask, _ = filter_parsing_to_primary_subject(name_to_embed["color"]["mask"])
+        HM_1 = (face_mask == 13).to(dtype=I_1.dtype)
+        HM_3 = (color_mask == 13).to(dtype=I_1.dtype)
+        HM_1D, _ = self.dilate_erosion.mask(HM_1)
+        HM_3D, HM_3E = self.dilate_erosion.mask(HM_3)
+
+        latent_S_1 = name_to_embed["face"]["S"]
+        latent_S_3 = name_to_embed["color"]["S"]
+        latent_F_align = align_shape["latent_F_align"]
+        HM_X = align_shape.get("HM_X_repaired", align_shape["HM_X"])
+        HM_XD, _ = self.dilate_erosion.mask(HM_X)
+        target_mask = (1 - HM_1D) * (1 - HM_3D) * (1 - HM_XD)
+
+        if I_1 is not I_3 or I_1 is not I_2:
+            S_blend_6_18 = self.blending_encoder(
+                latent_S_1[:, 6:],
+                latent_S_3[:, 6:],
+                I_1 * target_mask,
+                I_3 * HM_3E,
+            )
+            S_blend = torch.cat((latent_S_1[:, :6], S_blend_6_18), dim=1)
+        else:
+            S_blend = latent_S_1
+
+        return I_1, I_2, I_3, latent_F_align, HM_3E, target_mask, S_blend
+
+    @torch.inference_mode()
+    def _reference_dominant_color(
+        self,
+        image: torch.Tensor,
+        reference: torch.Tensor,
+        target_hair_mask: torch.Tensor,
+        reference_hair_mask: torch.Tensor,
+        kwargs: dict,
+        *,
+        return_debug: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+        """Transfer global colour while retaining the generated hair's local sheen.
+
+        Reference and target heads are not pixel-aligned.  Consequently the
+        reference may control Lab statistics, but never where a highlight lands.
+        The target's high-frequency Lab residual is retained, so this operation
+        cannot turn all hair regions into one flat colour.
+        """
+        if bool(getattr(self.opts, "disable_reference_dominant_hair_color_v8", False)):
+            return image, None
+
+        strength = float(kwargs.get(
+            "hair_color_reference_strength_v8",
+            getattr(self.opts, "hair_color_reference_strength_v8", 0.9),
+        ))
+        if strength <= 0:
+            return image, None
+
+        image_is_normalized = bool(image.detach().amin() < -0.05)
+        image_01 = ((image + 1.0) * 0.5 if image_is_normalized else image).clamp(0, 1)
+        reference_01 = ((reference + 1.0) * 0.5 if reference.detach().amin() < -0.05 else reference).clamp(0, 1)
+        if reference_01.shape[-2:] != image_01.shape[-2:]:
+            reference_01 = F.interpolate(
+                reference_01,
+                size=image_01.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        target_mask = self._as_mask(target_hair_mask, image_01.shape[-2:], image_01.dtype)
+        reference_mask = self._as_mask(reference_hair_mask, reference_01.shape[-2:], image_01.dtype)
+        if target_mask.flatten(1).sum(dim=1).min().item() < 4 or reference_mask.flatten(1).sum(dim=1).min().item() < 4:
+            return image, None
+
+        target_lab = rgb_to_lab(image_01)
+        reference_lab = rgb_to_lab(reference_01)
+        target_ab, reference_ab = target_lab[:, 1:], reference_lab[:, 1:]
+        target_l, reference_l = target_lab[:, :1], reference_lab[:, :1]
+        target_area = target_mask.sum(dim=(-2, -1), keepdim=True).clamp(min=4.0)
+        reference_area = reference_mask.sum(dim=(-2, -1), keepdim=True).clamp(min=4.0)
+
+        def masked_stats(values: torch.Tensor, mask: torch.Tensor, area: torch.Tensor):
+            mean = (values * mask).sum(dim=(-2, -1), keepdim=True) / area
+            variance = ((values - mean).square() * mask).sum(dim=(-2, -1), keepdim=True) / area
+            return mean, variance.add(1e-6).sqrt()
+
+        target_ab_mean, target_ab_std = masked_stats(target_ab, target_mask, target_area)
+        reference_ab_mean, reference_ab_std = masked_stats(reference_ab, reference_mask, reference_area)
+        chroma_std_gain = float(kwargs.get(
+            "hair_color_detail_chroma_gain_v8",
+            getattr(self.opts, "hair_color_detail_chroma_gain_v8", 1.0),
+        ))
+        chroma_std_gain = max(0.0, min(1.5, chroma_std_gain))
+        matched_ab = (target_ab - target_ab_mean) * (
+            1.0 + chroma_std_gain * (reference_ab_std / target_ab_std.clamp(min=1e-4) - 1.0)
+        ) + reference_ab_mean
+
+        radius = max(0, int(kwargs.get(
+            "hair_color_low_frequency_radius_v8",
+            getattr(self.opts, "hair_color_low_frequency_radius_v8", 15),
+        )))
+        sigma = kwargs.get(
+            "hair_color_low_frequency_sigma_v8",
+            getattr(self.opts, "hair_color_low_frequency_sigma_v8", None),
+        )
+        target_low_l = gaussian_blur2d(target_l, radius=radius, sigma=sigma)
+        reference_low_l = gaussian_blur2d(reference_l, radius=radius, sigma=sigma)
+        target_low_ab = gaussian_blur2d(target_ab, radius=radius, sigma=sigma)
+        reference_low_ab = gaussian_blur2d(reference_ab, radius=radius, sigma=sigma)
+        target_l_mean, target_l_std = masked_stats(target_low_l, target_mask, target_area)
+        reference_l_mean, reference_l_std = masked_stats(reference_low_l, reference_mask, reference_area)
+        luma_strength = max(0.0, min(1.0, float(kwargs.get(
+            "hair_color_luma_reference_strength_v8",
+            getattr(self.opts, "hair_color_luma_reference_strength_v8", 0.30),
+        ))))
+        mean_limit = max(0.0, float(kwargs.get(
+            "hair_color_luma_mean_limit_v8",
+            getattr(self.opts, "hair_color_luma_mean_limit_v8", 6.0),
+        )))
+        std_limit = max(1.0, float(kwargs.get(
+            "hair_color_luma_std_ratio_limit_v8",
+            getattr(self.opts, "hair_color_luma_std_ratio_limit_v8", 1.25),
+        )))
+        mean_delta = (reference_l_mean - target_l_mean).clamp(-mean_limit, mean_limit)
+        std_ratio = (reference_l_std / target_l_std.clamp(min=1e-4)).clamp(
+            1.0 / std_limit,
+            std_limit,
+        )
+        matched_low_l = (target_low_l - target_l_mean) * std_ratio + target_l_mean + mean_delta
+        matched_l = target_l + luma_strength * (matched_low_l - target_low_l)
+
+        matched_rgb = lab_to_rgb(torch.cat((matched_l, matched_ab), dim=1))
+        feather = max(0, int(kwargs.get(
+            "hair_color_feather_radius_v8",
+            getattr(self.opts, "hair_color_feather_radius_v8", 5),
+        )))
+        alpha = gaussian_blur2d(target_mask, radius=feather) if feather > 0 else target_mask
+        alpha = (alpha * strength).clamp(0, 1)
+        output_01 = (matched_rgb * alpha + image_01 * (1.0 - alpha)).clamp(0, 1)
+        output = output_01 * 2.0 - 1.0 if image_is_normalized else output_01
+        debug = None
+        if return_debug:
+            debug = {
+                "target_low_ab": target_low_ab.detach(),
+                "reference_low_ab": reference_low_ab.detach(),
+            }
+        return output, debug
+
+    @torch.inference_mode()
+    def _restore_authoritative_color_after_pp(
+        self,
+        image: torch.Tensor,
+        color_before_pp: torch.Tensor,
+        target_hair_mask: torch.Tensor,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lift the 256px colour decision to the high-res generated hair.
+
+        The correction is low-frequency only.  This preserves the original
+        high-resolution strand texture and highlight layout while preventing PP
+        from pulling the transferred hair back toward the source colour.
+        """
+        low = self.downsample_256(image)
+        if low.shape[-2:] != color_before_pp.shape[-2:]:
+            low = F.interpolate(low, size=color_before_pp.shape[-2:], mode="bicubic", align_corners=False)
+        desired = color_before_pp.to(device=image.device, dtype=image.dtype)
+        low_delta = desired - low
+        delta = F.interpolate(low_delta, size=image.shape[-2:], mode="bicubic", align_corners=False)
+        mask = self._as_mask(target_hair_mask, image.shape[-2:], image.dtype)
+        feather = max(0, int(kwargs.get(
+            "hair_color_feather_radius_v8",
+            getattr(self.opts, "hair_color_feather_radius_v8", 5),
+        )))
+        if feather > 0:
+            scale = max(1, round(image.shape[-1] / max(1, desired.shape[-1])))
+            mask = gaussian_blur2d(mask, radius=feather * scale)
+        mask = mask.clamp(0, 1)
+        return (image + delta * mask).clamp(-1, 1), mask
+
     @torch.inference_mode()
     def blend_images(self, align_shape, align_color, name_to_embed, **kwargs):
         # Reuse the v8 color-transfer state verbatim so the target-generation
@@ -192,7 +406,7 @@ class BlendingV5(Blending_v8):
         # ``_prepare_color_transfer`` canonicalises both aliases, but use the
         # explicit repaired field at this hand-off so PP cannot regress to a
         # stale/raw crown topology.
-        HM_X = align_shape["HM_X_repaired"]
+        HM_X = align_shape.get("HM_X_repaired", align_shape["HM_X"])
         save_all = bool(getattr(self.opts, "save_all", False))
         save_color_debug = save_all and bool(kwargs.get(
             "debug_save_intermediate_color",
