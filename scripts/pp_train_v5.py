@@ -1317,6 +1317,22 @@ class TrainerV5:
                     break
 
             preview_files.extend(train_preview_files)
+            preview_dataset = self.train_preview_dataloader.dataset
+            missing_reference_paths = getattr(
+                preview_dataset,
+                "_missing_preview_reference_paths",
+                set(),
+            )
+            if missing_reference_paths and not getattr(
+                preview_dataset,
+                "_reported_missing_preview_references",
+                False,
+            ):
+                print(
+                    f"Preview references unavailable for {len(missing_reference_paths)} path(s); "
+                    "used the dataset target image as the preview fallback."
+                )
+                preview_dataset._reported_missing_preview_references = True
 
         if preview_files and len(preview_files) < preview_count:
             repeat_pool = train_preview_files if train_preview_files else list(preview_files)
@@ -1403,6 +1419,8 @@ class PPDatasetV5(Dataset):
         self.include_preview_references = include_preview_references
         self._cached_part_path = None
         self._cached_part_items = None
+        self._missing_preview_reference_paths = set()
+        self._reported_missing_preview_references = False
 
     def __len__(self):
         return len(self.sample_indices)
@@ -1414,7 +1432,15 @@ class PPDatasetV5(Dataset):
     def load_preview_reference(self, path, fallback):
         if not path:
             return fallback.clone()
-        image = self.load_image(path)
+        path = Path(path)
+        if not path.is_file():
+            self._missing_preview_reference_paths.add(str(path))
+            return fallback.clone()
+        try:
+            image = self.load_image(path)
+        except (OSError, ValueError):
+            self._missing_preview_reference_paths.add(str(path))
+            return fallback.clone()
         if tuple(image.shape[-2:]) != tuple(fallback.shape[-2:]):
             image = T.functional.resize(
                 image,
