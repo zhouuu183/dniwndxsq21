@@ -770,6 +770,85 @@ def refine_earring_instances_highres(
                 accepted |= component
         return accepted
 
+    def strict_visual_seed(
+        image: np.ndarray,
+        local_window: np.ndarray,
+        hair_mask: np.ndarray,
+        ear_mask: np.ndarray,
+        anchor_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Find a compact, lobe-adjacent seed when label 9 is absent.
+
+        This is deliberately a seed generator rather than a write mask.  It
+        accepts only structured source pixels outside known hair/ear interiors;
+        a later component and GrabCut pass must still confirm an object.  That
+        lets an unlabelled stud or pendant start recovery without turning a
+        generic exposed ear into an accessory.
+        """
+
+        anchor_points = np.argwhere(anchor_mask)
+        if anchor_points.size == 0:
+            return np.zeros_like(local_window, dtype=bool)
+        hair_interior = cv2.erode(
+            hair_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(7), odd(7))),
+        ).astype(bool)
+        ear_interior = cv2.erode(
+            ear_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(7), odd(7))),
+        ).astype(bool)
+        anchor_guard = cv2.dilate(
+            anchor_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(11), odd(11))),
+        ).astype(bool)
+        valid = (local_window & ~(hair_interior | ear_interior)) | anchor_guard
+        if int(valid.sum()) < max(24, int(round(8.0 * scale))):
+            return np.zeros_like(local_window, dtype=bool)
+
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        local_values = gray[valid]
+        low = max(12, int(np.percentile(local_values, 35)))
+        high = max(low + 18, int(np.percentile(local_values, 82)))
+        edges = cv2.Canny(gray, low, min(255, high)) > 0
+        blurred = cv2.GaussianBlur(image, (odd(9), odd(9)), 0)
+        local_delta = np.abs(image.astype(np.int16) - blurred.astype(np.int16)).mean(axis=2)
+        chroma = image.max(axis=2).astype(np.int16) - image.min(axis=2).astype(np.int16)
+        delta_floor = max(5.0, float(np.percentile(local_delta[valid], 78)))
+        chroma_floor = max(10.0, float(np.percentile(chroma[valid], 86)))
+        edge_band = cv2.dilate(
+            edges.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+        ).astype(bool)
+        candidate = (
+            edge_band
+            & ((local_delta >= delta_floor) | (chroma >= chroma_floor))
+            & valid
+        )
+        if not candidate.any():
+            return np.zeros_like(local_window, dtype=bool)
+
+        proxy = cv2.morphologyEx(
+            candidate.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+        )
+        count, labels = cv2.connectedComponents(proxy)
+        allowed = np.zeros_like(candidate, dtype=bool)
+        anchor_y, anchor_x = anchor_points.mean(axis=0)
+        max_distance = 68.0 * scale
+        for label in range(1, count):
+            component = labels == label
+            component_area = int(component.sum())
+            if component_area < max(3, int(round(0.75 * scale))):
+                continue
+            points = np.argwhere(component)
+            distance = np.sqrt(
+                (points[:, 0] - anchor_y) ** 2 + (points[:, 1] - anchor_x) ** 2
+            ).min()
+            if distance <= max_distance:
+                allowed |= component
+        return candidate & allowed
+
     def trace_side(
         active: np.ndarray,
         anchor: np.ndarray,
@@ -799,9 +878,18 @@ def refine_earring_instances_highres(
             & (x_grid >= anchor_x - 96.0 * scale)
             & (x_grid <= anchor_x + 96.0 * scale)
         )
-        # Parser/strong evidence is mandatory.  A visible ear alone must not
-        # invent an accessory or reopen the old ear-background hole.
+        # When the parser misses an ordinary earring, bootstrap from compact
+        # image evidence near the lobe.  This is still a source-instance seed,
+        # never permission to copy the lobe neighbourhood itself.
         seed &= local_window
+        if int(seed.sum()) < max(3, int(round(0.75 * scale))):
+            seed = strict_visual_seed(
+                image,
+                local_window,
+                side_hair,
+                side_ear,
+                anchor,
+            )
         if int(seed.sum()) < max(3, int(round(0.75 * scale))):
             return empty, empty
 
@@ -831,7 +919,11 @@ def refine_earring_instances_highres(
         init[crop_seed] = cv2.GC_FGD
         # Known source hair is a background constraint, except exactly where
         # parser/visual evidence confirms an earring in front of hair.
-        init[crop_hair & ~near_seed] = cv2.GC_BGD
+        crop_hair_interior = cv2.erode(
+            crop_hair.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(7), odd(7))),
+        ).astype(bool)
+        init[crop_hair_interior & ~near_seed] = cv2.GC_BGD
         ear_interior = cv2.erode(
             crop_ear.astype(np.uint8),
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(7), odd(7))),
@@ -855,18 +947,31 @@ def refine_earring_instances_highres(
                 candidate = ((init == cv2.GC_FGD) | (init == cv2.GC_PR_FGD)) & crop_local
             except cv2.error:
                 candidate = crop_seed.copy()
+        # GrabCut's probable foreground includes a local colour region, not
+        # necessarily an object.  Admit only real source structure outside the
+        # confirmed seed, so a flat source background cannot survive as a
+        # rectangular earring patch.
+        gray = cv2.cvtColor(crop_image, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 24, 96) > 0
+        edge_band = cv2.dilate(
+            edges.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+        ).astype(bool)
+        blurred = cv2.GaussianBlur(crop_image, (odd(9), odd(9)), 0)
+        local_delta = np.abs(crop_image.astype(np.int16) - blurred.astype(np.int16)).mean(axis=2)
+        delta_floor = max(5.0, float(np.percentile(local_delta[crop_local], 78)))
+        visual_support = edge_band | (local_delta >= delta_floor)
+        candidate &= (visual_support | crop_seed)
         candidate |= crop_seed
-        candidate &= ~crop_hair | near_seed
+        candidate &= (~crop_hair_interior | near_seed)
         candidate = component_mask_connected_to_seed(candidate, crop_seed)
 
         # GraphCut can occasionally absorb a flat background region when a
         # source parser label is tiny.  Fall back to genuine source edges plus
         # the confirmed seed rather than pasting that region over target hair.
         seed_area = max(1, int(crop_seed.sum()))
-        max_area = max(96, int(round(seed_area * 12.0)))
+        max_area = max(int(round(96.0 * scale * scale)), int(round(seed_area * 6.0)))
         if int(candidate.sum()) > max_area:
-            gray = cv2.cvtColor(crop_image, cv2.COLOR_RGB2GRAY)
-            edges = cv2.Canny(gray, 24, 96) > 0
             edge_band = cv2.dilate(
                 edges.astype(np.uint8),
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(5), odd(5))),
