@@ -921,7 +921,16 @@ def build_strong_earring_candidate(
     # the broken-metal artefact while retaining label-9 studs and pendants.
     parser_neighbourhood = dilate_mask(parser_earring, 13)
     object_evidence = object_evidence * parser_neighbourhood
-    object_evidence = torch.maximum(object_evidence, elliptical_candidate)
+    # Once a lobe-connected hoop has passed its multi-arc geometry check, use
+    # neighbouring *observed* source wire to follow the real object rather
+    # than rendering the ideal fitted ellipse.  This keeps an imperfectly
+    # circular source hoop's own thickness and shape, while the edge/contrast
+    # gate prevents the surrounding source hair or background from joining it.
+    observed_hoop_wire = visual_wire * dilate_mask(elliptical_candidate, 9) * ear_roi
+    object_evidence = torch.maximum(
+        object_evidence,
+        torch.maximum(elliptical_candidate, observed_hoop_wire),
+    )
 
     # A hoop wire frequently has one-pixel gaps after 256px downsampling.  Use
     # a small proxy solely to assign all arcs to the same ear side, then return
@@ -2018,6 +2027,7 @@ class EarAnchoredQueryBuilder(nn.Module):
             visible_side_roi: torch.Tensor,
             target_ear_mask: torch.Tensor,
             source_side_ring: torch.Tensor,
+            source_lobe_anchor: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             side_area = side_roi.flatten(1).sum(dim=1).clamp_min(1.0)
             visible_ratio = (visible_side_roi * side_roi).flatten(1).sum(dim=1) / side_area
@@ -2041,17 +2051,42 @@ class EarAnchoredQueryBuilder(nn.Module):
                 & (hair_ratio <= min(float(self.max_target_hair_overlap), 0.35))
                 & (fallback_area >= float(self.min_target_ear_area) * area_scale)
             )
-            side_visible = (parser_visible | fallback_visible).float().view(-1, 1, 1, 1)
+            # A source label-9 earring is already trusted object evidence.  The
+            # transferred target may render the earlobe as generic skin or omit
+            # its ear label completely, so do not discard that side solely for
+            # a parser disagreement.  It must still be target-open and cannot
+            # pass through a hair-covered/hat-covered ear.
+            source_ring_area = (source_side_ring * side_roi).flatten(1).sum(dim=1)
+            source_ring_visible = (
+                (source_ring_area >= 2.0 * area_scale)
+                & (visible_ratio >= 0.03)
+                & (hair_ratio <= 0.55)
+            )
+            side_visible = (
+                parser_visible | fallback_visible | source_ring_visible
+            ).float().view(-1, 1, 1, 1)
 
             # Parser lower lobe first; semantic lower-half skin is only a
-            # fallback when parser ear pixels are sparse.
-            lobe_anchor = build_earlobe_anchor(
+            # fallback when parser ear pixels are sparse.  The source lobe is
+            # aligned to the target frame and is a safe last resort for a
+            # parser-missed target ear when an explicit source earring exists.
+            target_lobe_anchor = build_earlobe_anchor(
                 target_ear_mask,
                 fallback_skin_mask=semantic_fallback,
                 ear_roi=side_roi,
                 lower_ratio=0.62,
                 dilate=3,
             ) * (1.0 - target_ear_hair_context).clamp(0, 1)
+            source_lobe_anchor = (
+                ensure_mask_4d(source_lobe_anchor).float()
+                * side_roi
+                * (1.0 - target_ear_hair_context).clamp(0, 1)
+                * (1.0 - hat_mask).clamp(0, 1)
+            )
+            target_lobe_present = (
+                target_lobe_anchor.flatten(1).sum(dim=1) >= 2.0 * area_scale
+            ).view(-1, 1, 1, 1)
+            lobe_anchor = torch.where(target_lobe_present, target_lobe_anchor, source_lobe_anchor)
 
             # Earring-guided downward channel.  A blind geometric box below the
             # lobe opens background/neck when there is no earring (holes) and is
@@ -2125,6 +2160,7 @@ class EarAnchoredQueryBuilder(nn.Module):
             left_visible_roi,
             target_masks["left_ear"],
             source_left_ring,
+            source_left_lobe,
         )
         (
             right_side_visible,
@@ -2139,6 +2175,7 @@ class EarAnchoredQueryBuilder(nn.Module):
             right_visible_roi,
             target_masks["right_ear"],
             source_right_ring,
+            source_right_lobe,
         )
         left_earring_valid_roi = torch.clamp(
             left_visible_roi * left_side_visible + left_earring_channel,

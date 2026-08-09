@@ -1565,11 +1565,6 @@ class PostProcessModelV5(nn.Module):
         hoop_hole = aux.get("hoop_hole_mask")
         if hoop_hole is not None:
             earring_keep = earring_keep * (1.0 - resize_mask(hoop_hole, size)).clamp(0, 1)
-        ear_boundary = aux.get("target_ear_boundary_protect_mask")
-        if ear_boundary is not None:
-            # Earring pixels may start at the lobe, but the target's ear outer
-            # contour itself is never a source-detail write region.
-            earring_keep = earring_keep * (1.0 - resize_mask(ear_boundary, size)).clamp(0, 1)
         keep_dilate = int(getattr(self.args, "output_earring_keep_dilate", 0))
         if keep_dilate > 0 and earring_write is not None:
             # A cosmetic dilation may smooth values *inside* the write gate, but
@@ -1583,8 +1578,6 @@ class PostProcessModelV5(nn.Module):
         # Its own soft edge supplies the earring transition; globally blurring
         # ``preserve`` would also weaken unrelated crown/outer-contour pixels.
         preserve = preserve * (1.0 - earring_keep).clamp(0, 1)
-        if ear_boundary is not None:
-            preserve = torch.maximum(preserve, resize_mask(ear_boundary, size)).clamp(0, 1)
         if hoop_hole is not None:
             # A topology hole is target-owned even outside target hair.  This
             # final RGB authority is the second independent safeguard after the
@@ -1977,9 +1970,13 @@ class PostProcessModelV5(nn.Module):
         hoop_hole = aux.get("hoop_hole_mask")
         if hoop_hole is not None:
             earring_edit = earring_edit * (1.0 - resize_earring_mask(hoop_hole)).clamp(0, 1)
-        ear_boundary = aux.get("target_ear_boundary_protect_mask")
-        if ear_boundary is not None:
-            earring_edit = earring_edit * (1.0 - resize_earring_mask(ear_boundary)).clamp(0, 1)
+        # A verified source earring often touches the lobe.  The former broad
+        # ear-boundary subtraction erased small studs and one side of hoops
+        # before RGB compositing.  The source object mask already excludes the
+        # semantic ear; preserve only a conservative target-ear *interior*.
+        ear_interior = aux.get("target_ear_interior_mask")
+        if ear_interior is not None:
+            earring_edit = earring_edit * (1.0 - resize_earring_mask(ear_interior)).clamp(0, 1)
 
         protected = target_authority
         hair_authority = resize_rgb(aux.get("authoritative_hair_highres_01"), mode="bicubic")
