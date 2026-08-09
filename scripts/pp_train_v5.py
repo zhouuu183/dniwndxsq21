@@ -168,16 +168,12 @@ USER_BASE_SOURCE_HAIR_EXCLUDE_DILATE = 15
 USER_BASE_SOURCE_HAIR_EXCLUDE_STRENGTH = 1.0
 USER_BASE_SOURCE_HAIR_EXCLUDE_MAX_Y = 0.55
 USER_BASE_SOURCE_HAIR_EXCLUDE_EAR_DILATE = 9
-# v58 alignment: the output-space RGB paste of target hair is disabled.  When it
-# was ON, gen_im_F == target inside the hair region, so target_hair_preserve loss
-# was ~0 there and the generator never learned to synthesize matching hair; the
-# earring hole then exposed that un-learned, drifted hair (the "hole" that
-# changed hairstyle/color).  With it OFF the loss supervises the raw generator
-# output directly (like v58), forcing correct hair everywhere so the
-# feature-injected earring can show through cleanly without any paste or hole.
+# Final V5 composition keeps target hair and target ear geometry authoritative.
+# A source earring can open this preserve gate only through the connected,
+# object-supported write mask; its hoop hole remains target-owned.
 # NOTE: retrain after this change — an old paste-trained checkpoint has
 # unsupervised raw hair.
-USER_ENABLE_OUTPUT_TARGET_PRESERVE = False
+USER_ENABLE_OUTPUT_TARGET_PRESERVE = True
 USER_OUTPUT_TARGET_HAIR_PRESERVE_DILATE = 5
 USER_OUTPUT_FACE_HAIR_SEAM_PRESERVE_DILATE = 7
 USER_OUTPUT_REVEALED_SKIN_PRESERVE_DILATE = 3
@@ -275,18 +271,11 @@ USER_LAMBDA_CLEANUP_HIGH = 0.0
 USER_LAMBDA_CLEANUP_TEXTURE_STAT = 0.0
 USER_LAMBDA_DETAIL_HIGH = 0.0
 USER_LAMBDA_DETAIL_LOW_ANCHOR = 1.5
-# Problem 4B: revealed-forehead repair losses.  DISABLED (back to 0.0).  When
-# enabled at moderate weights (texture_stat 4.0, tone 5.0), the revealed region
-# gets texture (no longer fully smooth) but produces a three-segment face:
-# hairline keeps the SATD smoothness from target, mid-forehead shows half-
-# transparent brush strokes / grey borders / black thread artifacts (texture_stat
-# matches high-freq mean/std but not spatial phase -> random-noise texture, not
-# real pores), and lower face keeps real source skin.  The seam and grey halo
-# come from tone_continuity blending low-freq bands.  Disabling them accepts a
-# uniformly smooth forehead (the generator's default when this region has near-
-# zero supervision) but eliminates the three-tone face and artefact boundaries.
-USER_LAMBDA_REVEALED_SKIN_TEXTURE = 0.0
-USER_LAMBDA_REVEALED_SKIN_TONE = 0.0
+# Revealed skin is constrained only against neighbouring target/PP skin; the
+# loss implementation no longer copies source bang-hidden RGB/texture.
+USER_LAMBDA_REVEALED_SKIN_TEXTURE = 1.0
+USER_LAMBDA_REVEALED_SKIN_TONE = 2.0
+USER_LAMBDA_NORMAL_FACE_PRESERVE = 2.0
 USER_LAMBDA_FACE_SOURCE_DARK_REJECT = 2.0
 USER_FACE_SOURCE_DARK_REJECT_MARGIN = 0.006
 USER_FACE_SOURCE_DARK_REJECT_SOURCE_THRESHOLD = 0.018
@@ -305,6 +294,10 @@ USER_LAMBDA_BASE_CLEANUP_EXCLUDE = 1.0
 USER_EARRING_SUPERVISION_DILATE = 5
 USER_LAMBDA_TARGET_EARRING_SUPPRESS_LOW = 1.5
 USER_LAMBDA_TARGET_EARRING_SUPPRESS_HIGH = 0.8
+USER_LAMBDA_TARGET_EAR_GEOMETRY = 5.0
+USER_LAMBDA_NO_EARRING_NOOP = 6.0
+USER_LAMBDA_HOOP_HOLE_PRESERVE = 8.0
+USER_LAMBDA_EARRING_OBJECT_RESTORE = 3.0
 USER_USE_DATASET_QUERY_MASK = False
 USER_USE_DATASET_SOURCE_EARRING_MASK = True
 USER_POSITIVE_ONLY_WARMUP_EPOCHS = 20
@@ -512,6 +505,7 @@ RESOLVED_USER_CONFIG = {
     "detail_low_anchor": USER_LAMBDA_DETAIL_LOW_ANCHOR,
     "revealed_skin_texture": USER_LAMBDA_REVEALED_SKIN_TEXTURE,
     "revealed_skin_tone": USER_LAMBDA_REVEALED_SKIN_TONE,
+    "normal_face_preserve": USER_LAMBDA_NORMAL_FACE_PRESERVE,
     "face_source_dark_reject": USER_LAMBDA_FACE_SOURCE_DARK_REJECT,
     "face_source_dark_reject_margin": USER_FACE_SOURCE_DARK_REJECT_MARGIN,
     "face_source_dark_reject_source_threshold": USER_FACE_SOURCE_DARK_REJECT_SOURCE_THRESHOLD,
@@ -530,6 +524,10 @@ RESOLVED_USER_CONFIG = {
     "earring_supervision_dilate": USER_EARRING_SUPERVISION_DILATE,
     "target_earring_suppress_low": USER_LAMBDA_TARGET_EARRING_SUPPRESS_LOW,
     "target_earring_suppress_high": USER_LAMBDA_TARGET_EARRING_SUPPRESS_HIGH,
+    "target_ear_geometry": USER_LAMBDA_TARGET_EAR_GEOMETRY,
+    "no_earring_noop": USER_LAMBDA_NO_EARRING_NOOP,
+    "hoop_hole_preserve": USER_LAMBDA_HOOP_HOLE_PRESERVE,
+    "earring_object_restore": USER_LAMBDA_EARRING_OBJECT_RESTORE,
     "use_dataset_query_mask": USER_USE_DATASET_QUERY_MASK,
     "use_dataset_source_earring_mask": USER_USE_DATASET_SOURCE_EARRING_MASK,
     "positive_only_warmup_epochs": USER_POSITIVE_ONLY_WARMUP_EPOCHS,
@@ -735,6 +733,7 @@ def build_parser(defaults):
     parser.add_argument("--detail_low_anchor", type=float, default=defaults["detail_low_anchor"])
     parser.add_argument("--revealed_skin_texture", type=float, default=defaults["revealed_skin_texture"])
     parser.add_argument("--revealed_skin_tone", type=float, default=defaults["revealed_skin_tone"])
+    parser.add_argument("--normal_face_preserve", type=float, default=defaults["normal_face_preserve"])
     parser.add_argument("--face_source_dark_reject", type=float, default=defaults["face_source_dark_reject"])
     parser.add_argument("--face_source_dark_reject_margin", type=float, default=defaults["face_source_dark_reject_margin"])
     parser.add_argument("--face_source_dark_reject_source_threshold", type=float, default=defaults["face_source_dark_reject_source_threshold"])
@@ -753,6 +752,10 @@ def build_parser(defaults):
     parser.add_argument("--earring_supervision_dilate", type=int, default=defaults["earring_supervision_dilate"])
     parser.add_argument("--target_earring_suppress_low", type=float, default=defaults["target_earring_suppress_low"])
     parser.add_argument("--target_earring_suppress_high", type=float, default=defaults["target_earring_suppress_high"])
+    parser.add_argument("--target_ear_geometry", type=float, default=defaults["target_ear_geometry"])
+    parser.add_argument("--no_earring_noop", type=float, default=defaults["no_earring_noop"])
+    parser.add_argument("--hoop_hole_preserve", type=float, default=defaults["hoop_hole_preserve"])
+    parser.add_argument("--earring_object_restore", type=float, default=defaults["earring_object_restore"])
     parser.add_argument("--use_dataset_query_mask", type=str2bool, default=defaults["use_dataset_query_mask"])
     parser.add_argument(
         "--use_dataset_source_earring_mask",
@@ -905,6 +908,7 @@ class TrainerV5:
                 "detail_low_anchor": args.detail_low_anchor,
                 "revealed_skin_texture": args.revealed_skin_texture,
                 "revealed_skin_tone": args.revealed_skin_tone,
+                "normal_face_preserve": args.normal_face_preserve,
                 "face_source_dark_reject": args.face_source_dark_reject,
                 "face_source_dark_reject_margin": args.face_source_dark_reject_margin,
                 "face_source_dark_reject_source_threshold": args.face_source_dark_reject_source_threshold,
@@ -931,6 +935,10 @@ class TrainerV5:
                 "earring_supervision_dilate": args.earring_supervision_dilate,
                 "target_earring_suppress_low": args.target_earring_suppress_low,
                 "target_earring_suppress_high": args.target_earring_suppress_high,
+                "target_ear_geometry": args.target_ear_geometry,
+                "no_earring_noop": args.no_earring_noop,
+                "hoop_hole_preserve": args.hoop_hole_preserve,
+                "earring_object_restore": args.earring_object_restore,
             }
             self.loss_builder = EarAwareLossBuilder(loss_weights, device=self.device)
             if args.compute_fid:

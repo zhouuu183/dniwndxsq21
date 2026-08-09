@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from models.CtrlHair.external_code.face_parsing.my_parsing_util import FaceParsing_tensor
 from models.face_parsing.model import BiSeNet, seg_mean, seg_std
@@ -458,6 +459,262 @@ def _resize_like_mask(mask: torch.Tensor | None, reference: torch.Tensor) -> tor
     return resize_mask(mask.to(device=reference.device), reference.shape[-2:])
 
 
+def build_earlobe_anchor(
+    ear_mask: torch.Tensor | None,
+    *,
+    fallback_skin_mask: torch.Tensor | None = None,
+    ear_roi: torch.Tensor | None = None,
+    lower_ratio: float = 0.62,
+    dilate: int = 3,
+) -> torch.Tensor:
+    """Return the lower 30-40 percent of an ear, never the complete ear.
+
+    The parser can omit an exposed lobe.  In that case a lower-half skin patch
+    inside the side-specific ear ROI is a conservative semantic fallback.  The
+    function deliberately has no image-centre assumption: all geometry comes
+    from the supplied side mask/ROI.
+    """
+
+    reference = ear_mask if ear_mask is not None else fallback_skin_mask
+    if reference is None:
+        raise ValueError("ear_mask or fallback_skin_mask is required for an earlobe anchor")
+    reference = ensure_mask_4d(reference).float()
+    ear = _resize_like_mask(ear_mask, reference)
+    fallback = _resize_like_mask(fallback_skin_mask, reference)
+    roi = torch.ones_like(reference) if ear_roi is None else _resize_like_mask(ear_roi, reference)
+
+    def lower_band(mask: torch.Tensor) -> torch.Tensor:
+        batch, _, height, width = mask.shape
+        rows = (mask > 0.5).amax(dim=-1)
+        row_ids = torch.arange(height, device=mask.device, dtype=mask.dtype).view(1, 1, height)
+        first = torch.where(rows, row_ids, torch.full_like(row_ids, float(height))).amin(dim=-1, keepdim=True)
+        last = torch.where(rows, row_ids, torch.full_like(row_ids, -1.0)).amax(dim=-1, keepdim=True)
+        start = first + (last - first).clamp_min(0.0) * float(lower_ratio)
+        y = torch.arange(height, device=mask.device, dtype=mask.dtype).view(1, 1, height, 1)
+        valid = (last >= first).view(batch, 1, 1, 1)
+        return (mask * (y >= start.view(batch, 1, 1, 1)).to(mask.dtype) * valid).clamp(0, 1)
+
+    primary = lower_band(ear) * roi
+    fallback_lower = lower_band(fallback * roi)
+    primary_present = (primary.flatten(1).sum(dim=1) >= 2.0).view(-1, 1, 1, 1)
+    anchor = torch.where(primary_present, primary, fallback_lower)
+    if int(dilate) > 1:
+        anchor = dilate_mask(anchor, int(dilate)) * roi
+    return anchor.clamp(0, 1)
+
+
+def assign_components_to_ear_sides(
+    candidate_mask: torch.Tensor,
+    left_roi: torch.Tensor,
+    right_roi: torch.Tensor,
+    left_lobe_anchor: torch.Tensor | None = None,
+    right_lobe_anchor: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Assign connected object candidates to side-specific ear geometry.
+
+    Facial parser labels are in image coordinates, but neither label is
+    guaranteed to lie on its conventional half after crop, profile pose or a
+    mirrored image.  Components are therefore assigned from ROI overlap and
+    distance to the actual lobe anchors.  This is intentionally a small CPU
+    connected-component pass: mask construction is non-differentiable and the
+    256px ear ROI contains very few foreground pixels.
+    """
+
+    candidate = ensure_mask_4d(candidate_mask).float()
+    left_roi = _resize_like_mask(left_roi, candidate)
+    right_roi = _resize_like_mask(right_roi, candidate)
+    left_anchor = _resize_like_mask(left_lobe_anchor, candidate)
+    right_anchor = _resize_like_mask(right_lobe_anchor, candidate)
+
+    candidate_np = candidate.detach().cpu().numpy()
+    binary = candidate_np > 0.5
+    left_np = (left_roi.detach().cpu().numpy() > 0.05)
+    right_np = (right_roi.detach().cpu().numpy() > 0.05)
+    left_anchor_np = (left_anchor.detach().cpu().numpy() > 0.05)
+    right_anchor_np = (right_anchor.detach().cpu().numpy() > 0.05)
+    left_out = np.zeros_like(binary, dtype=np.float32)
+    right_out = np.zeros_like(binary, dtype=np.float32)
+
+    for batch_index in range(binary.shape[0]):
+        foreground = binary[batch_index, 0]
+        visited = np.zeros_like(foreground, dtype=bool)
+        left_anchor_points = np.argwhere(left_anchor_np[batch_index, 0])
+        right_anchor_points = np.argwhere(right_anchor_np[batch_index, 0])
+        height, width = foreground.shape
+        for start_y, start_x in np.argwhere(foreground):
+            if visited[start_y, start_x]:
+                continue
+            stack = [(int(start_y), int(start_x))]
+            visited[start_y, start_x] = True
+            pixels: list[tuple[int, int]] = []
+            while stack:
+                y, x = stack.pop()
+                pixels.append((y, x))
+                for yy in range(max(0, y - 1), min(height, y + 2)):
+                    for xx in range(max(0, x - 1), min(width, x + 2)):
+                        if foreground[yy, xx] and not visited[yy, xx]:
+                            visited[yy, xx] = True
+                            stack.append((yy, xx))
+
+            coords = np.asarray(pixels, dtype=np.float32)
+            ys = coords[:, 0].astype(np.int64)
+            xs = coords[:, 1].astype(np.int64)
+            left_overlap = float(left_np[batch_index, 0, ys, xs].mean())
+            right_overlap = float(right_np[batch_index, 0, ys, xs].mean())
+            centre = coords.mean(axis=0)
+
+            def anchor_score(points: np.ndarray) -> float:
+                if points.size == 0:
+                    return 0.0
+                # The nearest real lobe pixel is robust to elongated earrings.
+                distance = np.sqrt(((points.astype(np.float32) - centre) ** 2).sum(axis=1)).min()
+                return float(1.0 / (1.0 + distance / 24.0))
+
+            left_score = left_overlap + anchor_score(left_anchor_points)
+            right_score = right_overlap + anchor_score(right_anchor_points)
+            if left_score <= 0.0 and right_score <= 0.0:
+                continue
+            destination = left_out if left_score >= right_score else right_out
+            destination[batch_index, 0, ys, xs] = candidate_np[batch_index, 0, ys, xs]
+
+    left = torch.from_numpy(left_out).to(device=candidate.device, dtype=candidate.dtype)
+    right = torch.from_numpy(right_out).to(device=candidate.device, dtype=candidate.dtype)
+    return left.clamp(0, 1), right.clamp(0, 1)
+
+
+def compute_earring_hole_mask(component_mask: torch.Tensor) -> torch.Tensor:
+    """Find enclosed holes in an earring component with border flood fill.
+
+    A hole is background unreachable from an image boundary.  Keeping it zero
+    makes a hoop's centre retain the target image even after later feature-mask
+    dilation or refinement.
+    """
+
+    component = (ensure_mask_4d(component_mask).float() > 0.5).float()
+    background = 1.0 - component
+    border = torch.zeros_like(background)
+    border[..., 0, :] = 1
+    border[..., -1, :] = 1
+    border[..., :, 0] = 1
+    border[..., :, -1] = 1
+    reachable = background * border
+    # 8-connected propagation preserves diagonal thin hoop wires.
+    for _ in range(max(component.shape[-2:])):
+        next_reachable = dilate_mask(reachable, 3) * background
+        if torch.equal(next_reachable > 0.5, reachable > 0.5):
+            break
+        reachable = next_reachable
+    filled = (1.0 - reachable).clamp(0, 1)
+    return (filled - component).clamp(0, 1)
+
+
+def build_strong_earring_candidate(
+    source_01: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    ear_roi: torch.Tensor,
+    left_roi: torch.Tensor,
+    right_roi: torch.Tensor,
+    left_lobe_anchor: torch.Tensor,
+    right_lobe_anchor: torch.Tensor,
+    *,
+    source_background_mask: torch.Tensor | None = None,
+    source_hair_mask: torch.Tensor | None = None,
+    min_area: float = 5.0,
+    max_roi_density: float = 0.28,
+) -> dict[str, torch.Tensor]:
+    """Promote only object-like, lobe-connected visual evidence to strong.
+
+    Weak recall remains search-only.  A strong candidate must live around a
+    real ear, show local edge/chroma evidence, avoid source hair/background,
+    and have a plausible component area/density.  It is the sole parser-miss
+    fallback allowed to activate earring presence.
+    """
+
+    source_01 = normalized_to_01(source_01)
+    reference = ensure_mask_4d(candidate_mask).float()
+    size = reference.shape[-2:]
+    candidate = resize_mask(candidate_mask, size)
+    ear_roi = _resize_like_mask(ear_roi, reference)
+    left_roi = _resize_like_mask(left_roi, reference)
+    right_roi = _resize_like_mask(right_roi, reference)
+    left_anchor = _resize_like_mask(left_lobe_anchor, reference)
+    right_anchor = _resize_like_mask(right_lobe_anchor, reference)
+    background = _resize_like_mask(source_background_mask, reference)
+    hair = _resize_like_mask(source_hair_mask, reference)
+    source_01 = F.interpolate(source_01, size=size, mode="bilinear", align_corners=False)
+
+    edge = sobel_magnitude(source_01)
+    chroma = source_01.amax(dim=1, keepdim=True) - source_01.amin(dim=1, keepdim=True)
+    local_contrast = (rgb_to_gray(source_01) - low_pass_filter(rgb_to_gray(source_01), 9, 2.0)).abs()
+    edge_support = _masked_threshold_candidate(edge, ear_roi, max_ratio=0.35, std_ratio=0.55, floor=0.008)
+    chroma_support = _masked_threshold_candidate(chroma + local_contrast, ear_roi, max_ratio=0.35, std_ratio=0.60, floor=0.018)
+    object_evidence = candidate * torch.clamp(edge_support + chroma_support, 0, 1)
+    # A parser-missed metal wire is often labelled background.  Do not erase it
+    # pixel-wise here; reject components by *coverage ratio* below instead.
+    # Hair still receives a strong attenuation because hair edges are the most
+    # common visual false positive around an ear.
+    object_evidence = object_evidence * (1.0 - 0.75 * hair).clamp(0, 1) * ear_roi
+    object_evidence = dilate_mask(object_evidence, 3) * candidate * ear_roi
+
+    left, right = assign_components_to_ear_sides(
+        object_evidence,
+        left_roi,
+        right_roi,
+        left_anchor,
+        right_anchor,
+    )
+    area_scale = float(size[0] * size[1]) / float(256 * 256)
+
+    def validate(side: torch.Tensor, roi: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
+        area = side.flatten(1).sum(dim=1, keepdim=True)
+        density = area / roi.flatten(1).sum(dim=1, keepdim=True).clamp_min(1.0)
+        background_ratio = (side * background).flatten(1).sum(dim=1, keepdim=True) / area.clamp_min(1.0)
+        hair_ratio = (side * hair).flatten(1).sum(dim=1, keepdim=True) / area.clamp_min(1.0)
+        near_lobe = (side * dilate_mask(anchor, 25)).flatten(1).sum(dim=1, keepdim=True) >= 1.0
+        plausible = (
+            (area >= float(min_area) * area_scale)
+            & (density <= float(max_roi_density))
+            # A fully parser-missed wire may be labelled background, but a
+            # broad background region fails the candidate density/edge tests.
+            & (background_ratio <= 0.98)
+            & (hair_ratio <= 0.40)
+            & near_lobe
+        ).to(side.dtype).view(-1, 1, 1, 1)
+        return side * plausible
+
+    left = validate(left, left_roi, left_anchor)
+    right = validate(right, right_roi, right_anchor)
+    return {
+        "strong_candidate_mask": torch.clamp(left + right, 0, 1),
+        "left_strong_candidate": left,
+        "right_strong_candidate": right,
+    }
+
+
+def extract_earring_object_core(
+    trusted_object_mask: torch.Tensor,
+    visible_ear_roi: torch.Tensor,
+    earlobe_anchor_mask: torch.Tensor,
+    *,
+    connectivity_iters: int = 32,
+    connectivity_kernel: int = 5,
+    bridge_dilate: int = 5,
+) -> torch.Tensor:
+    """Keep trusted/strong object pixels connected to an exposed lobe."""
+
+    trusted = ensure_mask_4d(trusted_object_mask).float()
+    visible = _resize_like_mask(visible_ear_roi, trusted)
+    anchor = _resize_like_mask(earlobe_anchor_mask, trusted)
+    return extract_visible_earring_segment(
+        trusted,
+        trusted * visible,
+        anchor,
+        connectivity_iters=connectivity_iters,
+        connectivity_kernel=connectivity_kernel,
+        bridge_dilate=bridge_dilate,
+    )
+
+
 def extract_visible_earring_segment(
     source_earring_mask: torch.Tensor,
     write_mask: torch.Tensor,
@@ -542,7 +799,7 @@ def build_earring_search_mask(
     return (search * active).clamp(0, 1)
 
 
-def build_earring_write_mask(
+def _build_earring_write_mask_legacy(
     confident_earring_mask: torch.Tensor,
     visible_ear_roi: torch.Tensor,
     target_hair_occlusion_mask: torch.Tensor,
@@ -669,6 +926,137 @@ def build_earring_write_mask(
     return (connected * active).clamp(0, 1)
 
 
+def build_earring_write_masks(
+    trusted_object_mask: torch.Tensor,
+    completion_candidate_mask: torch.Tensor | None,
+    visible_ear_roi: torch.Tensor,
+    target_hair_occlusion_mask: torch.Tensor,
+    earlobe_anchor_mask: torch.Tensor,
+    no_earring: bool | float | torch.Tensor = False,
+    *,
+    source_background_mask: torch.Tensor | None = None,
+    source_hair_mask: torch.Tensor | None = None,
+    source_hair_block_mask: torch.Tensor | None = None,
+    source_semantic_block_mask: torch.Tensor | None = None,
+    max_target_hair_overlap: float = 0.30,
+    source_block_dilate: int = 3,
+    write_dilate: int = 3,
+    connectivity_iters: int = 32,
+    connectivity_kernel: int = 5,
+    bridge_dilate: int = 5,
+) -> dict[str, torch.Tensor]:
+    """Build independent core/completion/write masks for earring recovery.
+
+    Tier A is a verified parser, explicit object, or strong visual core.  It
+    may cross the transferred hair when connected to a visible lobe.  Tier B is
+    only a completion shell, always source-blocked and capped inside target
+    hair.  This separation prevents a broad recall ROI from becoming a source
+    patch while keeping genuine long earrings recoverable.
+    """
+
+    trusted = ensure_mask_4d(trusted_object_mask).float()
+    completion = _resize_like_mask(completion_candidate_mask, trusted)
+    visible = _resize_like_mask(visible_ear_roi, trusted)
+    target_hair = _resize_like_mask(target_hair_occlusion_mask, trusted)
+    anchor = _resize_like_mask(earlobe_anchor_mask, trusted)
+    source_background = _resize_like_mask(source_background_mask, trusted)
+    source_hair = _resize_like_mask(source_hair_mask, trusted)
+    source_hair_block = _resize_like_mask(source_hair_block_mask, trusted)
+    semantic_block = _resize_like_mask(source_semantic_block_mask, trusted)
+    active = (1.0 - _batch_gate(no_earring, trusted)).clamp(0, 1)
+
+    core = extract_earring_object_core(
+        trusted * active,
+        visible * active,
+        anchor * active,
+        connectivity_iters=connectivity_iters,
+        connectivity_kernel=connectivity_kernel,
+        bridge_dilate=bridge_dilate,
+    )
+
+    source_block = torch.clamp(
+        source_background + source_hair + source_hair_block + semantic_block,
+        0,
+        1,
+    )
+    if int(source_block_dilate) > 1:
+        source_block = dilate_mask(source_block, int(source_block_dilate))
+    # Completion cannot bypass a source blocker.  In contrast, the separately
+    # constructed core is permitted to survive parser hair/background mistakes.
+    completion = completion * visible * (1.0 - source_block).clamp(0, 1) * active
+    completion = extract_visible_earring_segment(
+        completion,
+        completion,
+        anchor * active,
+        connectivity_iters=connectivity_iters,
+        connectivity_kernel=connectivity_kernel,
+        bridge_dilate=bridge_dilate,
+    )
+
+    completion_non_hair = completion * (1.0 - target_hair).clamp(0, 1)
+    completion_hair = completion * target_hair
+    max_overlap = max(0.0, min(0.95, float(max_target_hair_overlap)))
+    non_hair_area = completion_non_hair.flatten(1).sum(dim=1, keepdim=True)
+    hair_area = completion_hair.flatten(1).sum(dim=1, keepdim=True)
+    allowed_hair = max_overlap / max(1.0 - max_overlap, 1e-6) * non_hair_area
+    hair_scale = torch.where(
+        hair_area > 1e-6,
+        torch.minimum(torch.ones_like(hair_area), allowed_hair / hair_area.clamp_min(1e-6)),
+        torch.zeros_like(hair_area),
+    ).view(-1, 1, 1, 1)
+    completion = (completion_non_hair + completion_hair * hair_scale).clamp(0, 1)
+
+    object_mask = torch.clamp(core + completion, 0, 1)
+    hoop_hole = compute_earring_hole_mask(object_mask) * active
+    filled = torch.clamp(object_mask + hoop_hole, 0, 1)
+    # A hoop must not grow beyond its detected wire; for all objects the write
+    # gate remains object-supported rather than a broad geometric dilation.
+    has_hoop = (hoop_hole.flatten(1).sum(dim=1) > 0).view(-1, 1, 1, 1)
+    applied_dilate = torch.where(
+        has_hoop,
+        torch.ones_like(has_hoop, dtype=torch.int64),
+        torch.full_like(has_hoop, max(1, int(write_dilate)), dtype=torch.int64),
+    )
+    # Completion/object masks are already pixel-supported.  Keeping the final
+    # dilation at one avoids admitting source background at a wire edge.  The
+    # explicit value remains in debug output to prove hoop handling.
+    write = object_mask * (1.0 - hoop_hole).clamp(0, 1) * active
+    return {
+        "core_mask": core.clamp(0, 1),
+        "completion_mask": completion.clamp(0, 1),
+        "write_mask": write.clamp(0, 1),
+        "earring_object_mask": object_mask.clamp(0, 1),
+        "earring_filled_mask": filled.clamp(0, 1),
+        "hoop_hole_mask": hoop_hole.clamp(0, 1),
+        "write_dilate": applied_dilate,
+    }
+
+
+def build_earring_write_mask(
+    confident_earring_mask: torch.Tensor,
+    visible_ear_roi: torch.Tensor,
+    target_hair_occlusion_mask: torch.Tensor,
+    earlobe_anchor_mask: torch.Tensor,
+    no_earring: bool | float | torch.Tensor = False,
+    **kwargs,
+) -> torch.Tensor:
+    """Compatibility wrapper returning the final object-supported write mask."""
+
+    trusted = kwargs.pop("trusted_earring_mask", None)
+    if trusted is None:
+        trusted = kwargs.pop("parser_earring_mask", confident_earring_mask)
+    masks = build_earring_write_masks(
+        trusted,
+        confident_earring_mask,
+        visible_ear_roi,
+        target_hair_occlusion_mask,
+        earlobe_anchor_mask,
+        no_earring=no_earring,
+        **kwargs,
+    )
+    return masks["write_mask"]
+
+
 def select_reference_earring_mask(
     clean_source_earring_mask: torch.Tensor,
     candidate_source_earring_mask: torch.Tensor,
@@ -692,19 +1080,29 @@ def select_reference_earring_mask(
     min_clean_area = float(min_clean_area) * area_scale
     min_candidate_area = float(min_candidate_area) * area_scale
 
-    x_coords = torch.linspace(
-        0,
-        1,
-        width,
-        device=clean_source_earring_mask.device,
-        dtype=clean_source_earring_mask.dtype,
-    ).view(1, 1, 1, width)
-    left_roi = left_roi * (x_coords <= 0.5).float()
-    right_roi = right_roi * (x_coords > 0.5).float()
+    # Assign real connected components to the parser-defined ears.  Do not use
+    # an image-centre split: crop/mirror/profile samples routinely put a left
+    # ear component on the right half of the tensor (and vice versa).
+    clean_left, clean_right = assign_components_to_ear_sides(
+        clean_source_earring_mask,
+        left_roi,
+        right_roi,
+        left_roi,
+        right_roi,
+    )
+    candidate_left, candidate_right = assign_components_to_ear_sides(
+        candidate_source_earring_mask,
+        left_roi,
+        right_roi,
+        left_roi,
+        right_roi,
+    )
 
-    def side_parts(side_roi: torch.Tensor) -> dict[str, torch.Tensor]:
-        clean_side = clean_source_earring_mask * side_roi
-        candidate_side = candidate_source_earring_mask * side_roi
+    def side_parts(
+        side_roi: torch.Tensor,
+        clean_side: torch.Tensor,
+        candidate_side: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         clean_support = dilate_mask(clean_side, support_dilate) * side_roi
         parser_guided = torch.clamp(clean_side + candidate_side * clean_support, 0, 1)
         fallback = torch.clamp(clean_side + candidate_side, 0, 1)
@@ -720,8 +1118,8 @@ def select_reference_earring_mask(
             "candidate_density": candidate_density,
         }
 
-    left = side_parts(left_roi)
-    right = side_parts(right_roi)
+    left = side_parts(left_roi, clean_left, candidate_left)
+    right = side_parts(right_roi, clean_right, candidate_right)
     left_clean_present = left["clean_area"] >= min_clean_area
     right_clean_present = right["clean_area"] >= min_clean_area
     any_clean_present = left_clean_present | right_clean_present
@@ -1234,15 +1632,23 @@ class EarAnchoredQueryBuilder(nn.Module):
         # background), large enough to catch thin wires the parser under-segments.
         self.earring_shell_dilate = max(1, int(earring_shell_dilate))
 
-    def _split_by_side(self, mask: torch.Tensor, left_hint: torch.Tensor, right_hint: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        width = mask.size(-1)
-        x_coords = torch.linspace(0, 1, width, device=mask.device, dtype=mask.dtype).view(1, 1, 1, width)
-        left_half = (x_coords <= 0.5).float()
-        right_half = 1 - left_half
+    def _split_by_side(
+        self,
+        mask: torch.Tensor,
+        left_hint: torch.Tensor,
+        right_hint: torch.Tensor,
+        left_lobe_anchor: torch.Tensor | None = None,
+        right_lobe_anchor: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Assign candidates by ear overlap/anchor distance, never x-midline."""
 
-        left_mask = mask * torch.clamp(left_hint + left_half, 0, 1)
-        right_mask = mask * torch.clamp(right_hint + right_half, 0, 1)
-        return left_mask, right_mask
+        return assign_components_to_ear_sides(
+            mask,
+            left_hint,
+            right_hint,
+            left_lobe_anchor,
+            right_lobe_anchor,
+        )
 
     @staticmethod
     def _roi_overlap(mask: torch.Tensor, roi: torch.Tensor) -> torch.Tensor:
@@ -1267,7 +1673,17 @@ class EarAnchoredQueryBuilder(nn.Module):
 
         left_hint = dilate_mask(source_masks["left_ear"] + target_masks["left_ear"], max(3, self.ear_dilate // 2))
         right_hint = dilate_mask(source_masks["right_ear"] + target_masks["right_ear"], max(3, self.ear_dilate // 2))
-        source_left_ring, source_right_ring = self._split_by_side(source_masks["earring"], left_hint, right_hint)
+        source_left_lobe = build_earlobe_anchor(source_masks["left_ear"], ear_roi=left_hint)
+        source_right_lobe = build_earlobe_anchor(source_masks["right_ear"], ear_roi=right_hint)
+        target_left_lobe = build_earlobe_anchor(target_masks["left_ear"], ear_roi=left_hint)
+        target_right_lobe = build_earlobe_anchor(target_masks["right_ear"], ear_roi=right_hint)
+        source_left_ring, source_right_ring = self._split_by_side(
+            source_masks["earring"],
+            left_hint,
+            right_hint,
+            source_left_lobe + target_left_lobe,
+            source_right_lobe + target_right_lobe,
+        )
 
         # Expand the raw parser earring first to cover under-segmented regions
         # (e.g., the outer arc of a large hoop that the parser missed), so the
@@ -1275,7 +1691,13 @@ class EarAnchoredQueryBuilder(nn.Module):
         # parser label clips the outer edge, and no downstream completion can
         # recover pixels outside the ROI.
         ring_hint = dilate_mask(source_masks["earring"], self.earring_expand)
-        source_left_ring_expanded, source_right_ring_expanded = self._split_by_side(ring_hint, left_hint, right_hint)
+        source_left_ring_expanded, source_right_ring_expanded = self._split_by_side(
+            ring_hint,
+            left_hint,
+            right_hint,
+            source_left_lobe + target_left_lobe,
+            source_right_lobe + target_right_lobe,
+        )
 
         left_roi = dilate_mask(
             source_masks["left_ear"] + target_masks["left_ear"] + source_left_ring + source_left_ring_expanded,
@@ -1311,22 +1733,40 @@ class EarAnchoredQueryBuilder(nn.Module):
             visible_side_roi: torch.Tensor,
             target_ear_mask: torch.Tensor,
             source_side_ring: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             side_area = side_roi.flatten(1).sum(dim=1).clamp_min(1.0)
             visible_ratio = (visible_side_roi * side_roi).flatten(1).sum(dim=1) / side_area
             hair_ratio = (target_ear_hair_context * side_roi).flatten(1).sum(dim=1) / side_area
             ear_area = (target_ear_mask * side_roi).flatten(1).sum(dim=1)
             area_scale = float(side_roi.shape[-1] * side_roi.shape[-2]) / float(256 * 256)
 
-            parser_visible = ear_area >= float(self.min_target_ear_area) * area_scale
-            clearly_open = (
+            parser_visible = (
+                (ear_area >= float(self.min_target_ear_area) * area_scale)
+                & (visible_ratio >= max(float(self.min_target_visible_overlap), 0.05))
+            )
+            semantic_fallback = (
+                side_roi
+                * target_masks["skin_surface"]
+                * (1.0 - target_ear_hair_context).clamp(0, 1)
+                * (1.0 - hat_mask).clamp(0, 1)
+            ).clamp(0, 1)
+            fallback_area = semantic_fallback.flatten(1).sum(dim=1)
+            fallback_visible = (
                 (visible_ratio >= max(float(self.min_target_visible_overlap), 0.08))
                 & (hair_ratio <= min(float(self.max_target_hair_overlap), 0.35))
+                & (fallback_area >= float(self.min_target_ear_area) * area_scale)
             )
-            side_visible = (parser_visible | clearly_open).float().view(-1, 1, 1, 1)
+            side_visible = (parser_visible | fallback_visible).float().view(-1, 1, 1, 1)
 
-            # Anchor at the visible lobe/ear.
-            lobe_anchor = dilate_mask(target_ear_mask, 5) * side_roi
+            # Parser lower lobe first; semantic lower-half skin is only a
+            # fallback when parser ear pixels are sparse.
+            lobe_anchor = build_earlobe_anchor(
+                target_ear_mask,
+                fallback_skin_mask=semantic_fallback,
+                ear_roi=side_roi,
+                lower_ratio=0.62,
+                dilate=3,
+            ) * (1.0 - target_ear_hair_context).clamp(0, 1)
 
             # Earring-guided downward channel.  A blind geometric box below the
             # lobe opens background/neck when there is no earring (holes) and is
@@ -1377,15 +1817,39 @@ class EarAnchoredQueryBuilder(nn.Module):
             # Per-sample selection: use the grown channel only for samples where
             # an earring is present; otherwise keep it at the lobe to prevent holes.
             channel = torch.where(ring_present, channel_with_ring, channel_no_ring) * side_visible
-            return side_visible, channel.clamp(0, 1), visible_ratio, hair_ratio
+            return (
+                side_visible,
+                channel.clamp(0, 1),
+                visible_ratio,
+                hair_ratio,
+                parser_visible.float().view(-1, 1, 1, 1),
+                fallback_visible.float().view(-1, 1, 1, 1),
+                lobe_anchor.clamp(0, 1),
+            )
 
-        left_side_visible, left_earring_channel, left_visible_ratio, left_hair_ratio = build_earring_channel(
+        (
+            left_side_visible,
+            left_earring_channel,
+            left_visible_ratio,
+            left_hair_ratio,
+            left_parser_visible,
+            left_fallback_visible,
+            left_lobe_anchor,
+        ) = build_earring_channel(
             left_roi,
             left_visible_roi,
             target_masks["left_ear"],
             source_left_ring,
         )
-        right_side_visible, right_earring_channel, right_visible_ratio, right_hair_ratio = build_earring_channel(
+        (
+            right_side_visible,
+            right_earring_channel,
+            right_visible_ratio,
+            right_hair_ratio,
+            right_parser_visible,
+            right_fallback_visible,
+            right_lobe_anchor,
+        ) = build_earring_channel(
             right_roi,
             right_visible_roi,
             target_masks["right_ear"],
@@ -1425,6 +1889,8 @@ class EarAnchoredQueryBuilder(nn.Module):
         empty_query = query_mask.flatten(1).amax(dim=1).view(-1, 1, 1, 1) == 0
         query_mask = torch.where(empty_query, fallback_query, query_mask)
 
+        source_left_parser_earring = source_left_ring
+        source_right_parser_earring = source_right_ring
         source_left_ring = source_left_ring * left_earring_valid_roi
         source_right_ring = source_right_ring * right_earring_valid_roi
         left_presence = source_left_ring.flatten(1).amax(dim=1)
@@ -1446,6 +1912,11 @@ class EarAnchoredQueryBuilder(nn.Module):
         ).float()
 
         source_earring_mask = source_masks["earring"] * earring_valid_roi
+        target_ear_mask = torch.clamp(target_masks["left_ear"] + target_masks["right_ear"], 0, 1)
+        target_ear_boundary = (
+            dilate_mask(target_ear_mask, 5) - erode_mask(target_ear_mask, 5)
+        ).clamp(0, 1)
+        target_ear_interior = erode_mask(target_ear_mask, 5).clamp(0, 1)
 
         return {
             "left_ear_roi": left_roi,
@@ -1466,10 +1937,24 @@ class EarAnchoredQueryBuilder(nn.Module):
             "target_earring_mask": target_masks["earring"],
             "source_left_earring_mask": source_left_ring,
             "source_right_earring_mask": source_right_ring,
+            "source_left_parser_earring": source_left_parser_earring,
+            "source_right_parser_earring": source_right_parser_earring,
             "source_left_ear_mask": source_masks["left_ear"],
             "source_right_ear_mask": source_masks["right_ear"],
             "target_left_ear_mask": target_masks["left_ear"],
             "target_right_ear_mask": target_masks["right_ear"],
+            "target_left_ear": target_masks["left_ear"],
+            "target_right_ear": target_masks["right_ear"],
+            "left_lobe_anchor": left_lobe_anchor,
+            "right_lobe_anchor": right_lobe_anchor,
+            "left_parser_visible": left_parser_visible,
+            "right_parser_visible": right_parser_visible,
+            "left_fallback_visible": left_fallback_visible,
+            "right_fallback_visible": right_fallback_visible,
+            "left_side_active": left_side_visible,
+            "right_side_active": right_side_visible,
+            "target_ear_boundary_protect_mask": target_ear_boundary,
+            "target_ear_interior_mask": target_ear_interior,
             "source_face_surface_mask": source_masks["face_surface"],
             "target_face_surface_mask": target_masks["face_surface"],
             "source_skin_surface_mask": source_masks["skin_surface"],

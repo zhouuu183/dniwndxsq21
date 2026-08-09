@@ -343,10 +343,10 @@ def build_revealed_skin_reference_masks(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor] | None:
     """Masks for the revealed-forehead repair loss.
 
-    Returns (revealed_mask, source_texture_reference_mask, recovered_skin_mask):
+    Returns (revealed_mask, legacy_source_reference_mask, recovered_skin_mask):
     - revealed_mask: newly exposed forehead (source had bangs, reference does not).
-    - source_texture_reference_mask: real source visible skin (pores/texture donor,
-      statistics only, no alignment needed).
+    - legacy_source_reference_mask: retained only for cache compatibility; it is
+      not used as a texture/tone target by V5 losses.
     - recovered_skin_mask: target face skin the network has already recovered
       correctly (adjacent, non-revealed), used as the tone-continuity anchor so
       no band/seam forms between revealed and recovered skin.
@@ -401,7 +401,18 @@ def revealed_skin_tone_continuity_loss(
     pred_low = low_pass_filter(pred)
     revealed_mean = masked_channel_mean(pred_low, revealed_mask)
     recovered_mean = masked_channel_mean(pred_low, recovered_mask).detach()
-    return (revealed_mean - recovered_mean).abs().mean()
+    # Tone alone can still leave a transparent-looking band.  Match local
+    # gradient statistics across the narrow revealed boundary without treating
+    # the source's bang-covered pixels as a texture target.
+    seam = (dilate_mask(revealed_mask, 5) - revealed_mask).clamp(0, 1) * recovered_mask
+    seam = torch.where(
+        (seam.flatten(1).sum(dim=1, keepdim=True) > 1.0).view(-1, 1, 1, 1),
+        seam,
+        recovered_mask,
+    )
+    revealed_grad = masked_channel_mean(sobel_edges(pred_low), revealed_mask)
+    seam_grad = masked_channel_mean(sobel_edges(pred_low), seam).detach()
+    return (revealed_mean - recovered_mean).abs().mean() + 0.5 * (revealed_grad - seam_grad).abs().mean()
 
 
 def build_weak_ear_pseudo_mask(
@@ -415,21 +426,16 @@ def build_weak_ear_pseudo_mask(
 
 def build_weak_presence_target(pseudo_mask: torch.Tensor, parser_mask: torch.Tensor | None = None) -> torch.Tensor:
     pseudo_mask = ensure_mask_4d(pseudo_mask).float()
-    width = pseudo_mask.size(-1)
-    x_coords = torch.linspace(0, 1, width, device=pseudo_mask.device, dtype=pseudo_mask.dtype).view(1, 1, 1, width)
-    left_half = (x_coords <= 0.5).float()
-    right_half = 1 - left_half
-
-    left_presence = (pseudo_mask * left_half).flatten(1).amax(dim=1)
-    right_presence = (pseudo_mask * right_half).flatten(1).amax(dim=1)
+    # Side identity is supplied by EarAnchoredQueryBuilder's parser/anchor
+    # targets.  A generic weak pseudo-mask has no reliable side geometry, so it
+    # may only provide an any-earring fallback rather than split at image centre.
+    any_presence = pseudo_mask.flatten(1).amax(dim=1)
 
     if parser_mask is not None:
         parser_mask = resize_mask(parser_mask, pseudo_mask.shape[-2:])
-        left_presence = torch.maximum(left_presence, (parser_mask * left_half).flatten(1).amax(dim=1))
-        right_presence = torch.maximum(right_presence, (parser_mask * right_half).flatten(1).amax(dim=1))
+        any_presence = torch.maximum(any_presence, parser_mask.flatten(1).amax(dim=1))
 
-    any_presence = torch.maximum(left_presence, right_presence)
-    return torch.stack([left_presence, right_presence, any_presence], dim=1).float()
+    return torch.stack([any_presence, any_presence, any_presence], dim=1).float()
 
 
 class EarAwareLossBuilder(LossBuilderMulti):
@@ -772,16 +778,18 @@ class EarAwareLossBuilder(LossBuilderMulti):
                 gen_F_256_01,
             )
             if revealed_refs is not None:
-                revealed_mask, source_texture_ref, recovered_mask = revealed_refs
+                revealed_mask, _source_texture_ref, recovered_mask = revealed_refs
                 aux["revealed_skin_texture_loss_mask"] = revealed_mask
                 aux["revealed_skin_recovered_ref_mask"] = recovered_mask
                 revealed_loss = gen_F_256_01.sum() * 0.0
-                if revealed_skin_weight > 0 and source_texture_ref is not None:
-                    revealed_loss = revealed_loss + revealed_skin_weight * texture_stat_loss(
+                if revealed_skin_weight > 0:
+                    # The source fringe-hidden area is not skin GT.  This term
+                    # is intentionally a local target/PP boundary continuity
+                    # constraint, not a source texture-copy objective.
+                    revealed_loss = revealed_loss + revealed_skin_weight * revealed_skin_tone_continuity_loss(
                         gen_F_256_01,
-                        source,
                         revealed_mask,
-                        source_texture_ref,
+                        recovered_mask,
                     )
                 if revealed_tone_weight > 0:
                     revealed_loss = revealed_loss + revealed_tone_weight * (
@@ -798,8 +806,84 @@ class EarAwareLossBuilder(LossBuilderMulti):
                     )
                 losses["revealed_skin_texture"] = revealed_loss
 
+        normal_face_weight = self.losses_dict.get("normal_face_preserve", 0.0)
+        if normal_face_weight > 0:
+            normal_face = aux.get("target_face_surface_mask")
+            if normal_face is None:
+                normal_face = parsing_label_mask(aux.get("target_parsing"), RAW_FACE_SURFACE_LABELS)
+            if normal_face is not None:
+                normal_face = resize_mask(normal_face, gen_F_256_01.shape[-2:])
+                if revealed_skin_mask is not None:
+                    normal_face = normal_face * (
+                        1.0 - dilate_mask(resize_mask(revealed_skin_mask, gen_F_256_01.shape[-2:]), 5)
+                    ).clamp(0, 1)
+                target_hair = aux.get("target_hair_mask")
+                if target_hair is not None:
+                    normal_face = normal_face * (
+                        1.0 - resize_mask(target_hair, gen_F_256_01.shape[-2:])
+                    ).clamp(0, 1)
+                losses["normal_face_preserve"] = normal_face_weight * (
+                    masked_l1(gen_F_256_01, target, normal_face)
+                    + 0.5 * masked_l1(
+                        low_pass_filter(gen_F_256_01), low_pass_filter(target), normal_face
+                    )
+                )
+
         earring_confident_mask = resize_mask(earring_confident_mask, gen_F_256_01.shape[-2:])
         earring_reference = F.interpolate(earring_reference, size=gen_F_256_01.shape[-2:], mode="bilinear", align_corners=False)
+        earring_write_mask = resize_mask(
+            aux.get("earring_write_mask", earring_confident_mask),
+            gen_F_256_01.shape[-2:],
+        )
+        hoop_hole_mask = aux.get("hoop_hole_mask")
+        if hoop_hole_mask is not None:
+            hoop_hole_mask = resize_mask(hoop_hole_mask, gen_F_256_01.shape[-2:])
+        no_earring_case = aux.get("no_earring_case_mask", aux.get("no_earring_case"))
+        if no_earring_case is not None:
+            no_earring_case = resize_mask(no_earring_case, gen_F_256_01.shape[-2:])
+        target_ear_boundary = aux.get("target_ear_boundary_protect_mask")
+        if target_ear_boundary is not None:
+            target_ear_boundary = resize_mask(target_ear_boundary, gen_F_256_01.shape[-2:])
+            ear_geometry_weight = self.losses_dict.get("target_ear_geometry", 0.0)
+            if ear_geometry_weight > 0:
+                losses["target_ear_geometry"] = ear_geometry_weight * (
+                    masked_l1(gen_F_256_01, target, target_ear_boundary)
+                    + 0.5 * masked_l1(
+                        sobel_edges(gen_F_256_01),
+                        sobel_edges(target),
+                        target_ear_boundary,
+                    )
+                )
+
+        ear_roi_for_noop = aux.get("ear_roi", aux.get("visible_ear_roi"))
+        no_earring_weight = self.losses_dict.get("no_earring_noop", 0.0)
+        if no_earring_weight > 0 and no_earring_case is not None and ear_roi_for_noop is not None:
+            noop_mask = resize_mask(ear_roi_for_noop, gen_F_256_01.shape[-2:]) * no_earring_case
+            losses["no_earring_noop"] = no_earring_weight * (
+                masked_l1(gen_F_256_01, target, noop_mask)
+                + 0.5 * masked_l1(
+                    low_pass_filter(gen_F_256_01), low_pass_filter(target), noop_mask
+                )
+            )
+
+        hoop_hole_weight = self.losses_dict.get("hoop_hole_preserve", 0.0)
+        if hoop_hole_weight > 0 and hoop_hole_mask is not None:
+            losses["hoop_hole_preserve"] = hoop_hole_weight * masked_l1(
+                gen_F_256_01, target, hoop_hole_mask
+            )
+
+        earring_restore_weight = self.losses_dict.get("earring_object_restore", 0.0)
+        if earring_restore_weight > 0:
+            # Object restoration is strictly confined to the final write mask;
+            # no bounding box, search mask or background patch is supervised.
+            losses["earring_object_restore"] = earring_restore_weight * (
+                masked_l1(gen_F_256_01, earring_reference, earring_write_mask)
+                + 0.5 * masked_l1(
+                    high_pass_filter(gen_F_256_01),
+                    high_pass_filter(earring_reference),
+                    earring_write_mask,
+                )
+            )
         if target_earring_suppress_mask is not None:
             target_earring_suppress_mask = resize_mask(target_earring_suppress_mask, gen_F_256_01.shape[-2:])
             if target_clean_01 is None:
@@ -853,7 +937,6 @@ class EarAwareLossBuilder(LossBuilderMulti):
                 )
             )
 
-        source_ear_for_detail = earring_confident_mask
         detail_mask = parsing_label_mask(aux.get("source_parsing"), RAW_DETAIL_LABELS)
         if detail_mask is not None:
             detail_mask = resize_mask(detail_mask, gen_F_256_01.shape[-2:])
@@ -864,7 +947,11 @@ class EarAwareLossBuilder(LossBuilderMulti):
                 detail_mask = detail_mask * (1 - resize_mask(source_hair_block_mask, gen_F_256_01.shape[-2:])).clamp(0, 1)
             if cleanup_mask is not None:
                 detail_mask = detail_mask * (1 - cleanup_mask).clamp(0, 1)
-            detail_mask = torch.clamp(detail_mask + source_ear_for_detail, 0, 1)
+            if target_ear_boundary is not None:
+                detail_mask = detail_mask * (1.0 - target_ear_boundary).clamp(0, 1)
+            # Earring restoration has its own object-only supervision.  Do not
+            # let the generic face-detail loss rewrite the same ear region.
+            detail_mask = detail_mask * (1.0 - dilate_mask(earring_write_mask, 3)).clamp(0, 1)
             detail_high_weight = self.losses_dict.get("detail_high", 0.0)
             if detail_high_weight > 0:
                 losses["detail_high"] = detail_high_weight * masked_l1(
@@ -890,11 +977,15 @@ class EarAwareLossBuilder(LossBuilderMulti):
                 query_mask,
                 earring_confident_mask,
             )
+        if no_earring_case is not None:
+            weak_pseudo_mask = weak_pseudo_mask * (1.0 - no_earring_case).clamp(0, 1)
         mask_target = torch.clamp(
             weak_pseudo_mask + earring_supervision + earring_confident_mask,
             0,
             1,
         )
+        if hoop_hole_mask is not None:
+            mask_target = mask_target * (1.0 - hoop_hole_mask).clamp(0, 1)
         query_expand = float(self.losses_dict.get("ear_query_expand", 0.02))
         supervision_mask = torch.clamp(mask_target + query_expand * query_mask, 0, 1)
         if fine_mask is not None:

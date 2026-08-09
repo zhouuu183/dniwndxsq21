@@ -145,7 +145,11 @@ class BlendingV5(Blending_v8):
                 "source_hair_face_suppress_ear_exclude_dilate",
                 9,
             ),
-            enable_output_target_preserve=pp_policy_value("enable_output_target_preserve", True),
+            # V5 always gives the final ear boundary, hoop hole and repaired
+            # hairstyle geometry back to the target/blending image.  Older PP
+            # checkpoint args may contain ``False`` from the broad-paste path;
+            # honoring that flag would reopen ear holes at inference.
+            enable_output_target_preserve=True,
             output_target_hair_preserve_dilate=pp_policy_value(
                 "output_target_hair_preserve_dilate", 5
             ),
@@ -549,8 +553,36 @@ class BlendingV5(Blending_v8):
                 )
             for mask_name in (
                 "source_earring_mask",
+                "source_left_parser_earring",
+                "source_right_parser_earring",
                 "earring_search_mask",
                 "earring_write_mask",
+                "earring_core_mask",
+                "earring_completion_mask",
+                "earring_object_mask",
+                "earring_filled_mask",
+                "hoop_hole_mask",
+                "earring_final_alpha",
+                "left_strong_candidate",
+                "right_strong_candidate",
+                "target_left_ear",
+                "target_right_ear",
+                "left_lobe_anchor",
+                "right_lobe_anchor",
+                "left_parser_visible",
+                "right_parser_visible",
+                "left_fallback_visible",
+                "right_fallback_visible",
+                "left_side_active",
+                "right_side_active",
+                "left_search_mask",
+                "right_search_mask",
+                "left_core_mask",
+                "right_core_mask",
+                "left_completion_mask",
+                "right_completion_mask",
+                "left_write_mask",
+                "right_write_mask",
                 "earring_visible_segment_mask",
                 "no_earring_case_mask",
                 "no_earring_case",
@@ -573,6 +605,10 @@ class BlendingV5(Blending_v8):
                 "prior_mask",
                 "source_hair_face_feature_suppress_mask",
                 "source_face_feature_scale",
+                "target_ear_boundary_protect_mask",
+                "ear_detail_restore_mask_before",
+                "ear_detail_restore_mask_after",
+                "ear_detail_suppress_mask",
                 "output_target_hair_preserve_mask",
                 "output_target_hair_face_seam_mask",
                 "output_target_hair_earring_keep_mask",
@@ -582,9 +618,14 @@ class BlendingV5(Blending_v8):
                 "revealed_skin_blend_band",
                 "source_visible_skin_reference_mask",
                 "lower_face_skin_reference_mask",
+                "local_skin_anchor_mask",
+                "lower_face_anchor_mask",
                 "revealed_skin_harmonize_mask",
+                "face_harmonize_write_mask",
                 "revealed_skin_detail_mask",
                 "revealed_skin_tone_reference",
+                "skin_field_L",
+                "skin_field_ab",
             ):
                 if aux.get(mask_name) is not None:
                     save_vis_mask(output_dir, "PostProcessV5Masks", f"{mask_name}.png", aux[mask_name])
