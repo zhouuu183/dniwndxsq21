@@ -64,9 +64,9 @@ VAL_COLUMNS = (
 )
 
 # ========================= User Config: edit here only =========================
-USER_DATASET_PROFILE = "full_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
+USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.6")
+USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.9")
 USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long")
 USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_mix"
 
