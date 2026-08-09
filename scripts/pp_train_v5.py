@@ -107,12 +107,12 @@ USER_HAIR_CHANGE_DILATE = 25
 USER_EARRING_EXPAND = 15
 USER_EAR_DOWNWARD_SHIFT = 10
 USER_TARGET_HAIR_DILATE = 11
-USER_SOURCE_HAIR_BLOCK_DILATE = 5
-USER_SOURCE_HAIR_BLOCK_STRENGTH = 0.6
+USER_SOURCE_HAIR_BLOCK_DILATE = 8
+USER_SOURCE_HAIR_BLOCK_STRENGTH = 0.95
 USER_TARGET_VISIBILITY_EXPAND = 5
-USER_MAX_TARGET_HAIR_OVERLAP = 0.55
+USER_MAX_TARGET_HAIR_OVERLAP = 0.30
 USER_TARGET_EAR_COVER_OVERLAP = 0.55
-USER_MIN_TARGET_VISIBLE_OVERLAP = 0.02
+USER_MIN_TARGET_VISIBLE_OVERLAP = 0.10
 USER_MIN_TARGET_EAR_AREA = 8.0
 USER_EARRING_CHANNEL_DOWN = 32
 USER_SOURCE_EARRING_OPEN_OVERLAP = 0.35
@@ -125,10 +125,21 @@ USER_EARRING_QUERY_DILATE = 3
 USER_EARRING_QUERY_BOOST = 1.0
 USER_ENABLE_EARRING_QUERY_RECALL = True
 USER_EARRING_QUERY_RECALL_DILATE = 7
-USER_EARRING_QUERY_DOWNWARD_SHIFT = 18
+USER_EARRING_QUERY_DOWNWARD_SHIFT = 10
 USER_EARRING_QUERY_LOWER_LOBE_WEIGHT = 0.20
 USER_EARRING_QUERY_CANDIDATE_BOOST = 0.90
-USER_EARRING_QUERY_BLOCK_PROTECT = 0.85
+USER_EARRING_QUERY_BLOCK_PROTECT = 0.95
+USER_DISABLE_EARRING_PATH_IF_LOW_CONFIDENCE = True
+USER_EARRING_SOURCE_PRESENCE_MIN_AREA = 4.0
+USER_EARRING_SEARCH_DOWNWARD_SHIFT = 10
+USER_EARRING_SEARCH_DILATE = 7
+USER_EARRING_WRITE_MAX_TARGET_HAIR_OVERLAP = 0.30
+USER_EARRING_WRITE_SOURCE_BLOCK_DILATE = 3
+USER_EARRING_WRITE_DILATE = 3
+USER_EARRING_WRITE_CONNECTIVITY_ITERS = 32
+USER_EARRING_WRITE_CONNECTIVITY_KERNEL = 5
+USER_EARRING_WRITE_BRIDGE_DILATE = 5
+USER_EARRING_ANCHOR_VISIBLE_DILATE = 3
 USER_EARRING_ALIGN_MAX_SHIFT = 12
 USER_EAR_FINE_SUPPORT_DILATE = 3
 USER_EARRING_FINE_MASK_FLOOR = 0.18
@@ -181,6 +192,7 @@ USER_OUTPUT_HAIRLINE_FEATHER = 9
 # earring label-9 is explicitly protected from hair subtraction so fine hair
 # strands covering the earring edge cannot remove confirmed earring pixels.
 USER_ENABLE_SOURCE_CONTENT_GATE = True
+USER_SOURCE_CONTENT_GATE_DILATE = 3
 # Problem 4A: inference-time revealed-forehead skin harmonization.
 # v58 alignment: v58 has NO revealed-skin harmonize and produces a natural
 # forehead purely from the generator + general reconstruction losses.  The
@@ -188,13 +200,15 @@ USER_ENABLE_SOURCE_CONTENT_GATE = True
 # runs at INFERENCE, so it degrades even the current checkpoint and is the source
 # of the airbrushed look and the seam against the real skin.  Disabled so the
 # revealed forehead keeps the generator's source-like texture like v58.
-USER_ENABLE_REVEALED_SKIN_HARMONIZE = False
+USER_ENABLE_REVEALED_SKIN_HARMONIZE = True
 USER_REVEALED_SKIN_HARMONIZE_STRENGTH = 0.9
-USER_REVEALED_SKIN_TONE_KERNEL = 21
+USER_REVEALED_SKIN_TONE_KERNEL = 15
 USER_REVEALED_SKIN_TONE_SIGMA = 7.0
 USER_REVEALED_SKIN_DIFFUSE_ITERS = 24
-USER_REVEALED_SKIN_TONE_LIMIT = 0.35
-USER_REVEALED_SKIN_DETAIL_GAIN = 1.15
+USER_REVEALED_SKIN_TONE_LIMIT = 0.28
+USER_REVEALED_SKIN_DETAIL_GAIN = 1.0
+USER_REVEALED_SKIN_SEAM_BAND = 7
+USER_REVEALED_SKIN_MIN_REFERENCE_AREA = 96.0
 USER_ENABLE_OUTPUT_SOURCE_EARRING_COMPOSITE = False
 USER_OUTPUT_SOURCE_EARRING_ALPHA = 1.0
 USER_OUTPUT_SOURCE_EARRING_MASK_DILATE = 0
@@ -384,6 +398,17 @@ RESOLVED_USER_CONFIG = {
     "earring_query_lower_lobe_weight": USER_EARRING_QUERY_LOWER_LOBE_WEIGHT,
     "earring_query_candidate_boost": USER_EARRING_QUERY_CANDIDATE_BOOST,
     "earring_query_block_protect": USER_EARRING_QUERY_BLOCK_PROTECT,
+    "disable_earring_path_if_low_confidence": USER_DISABLE_EARRING_PATH_IF_LOW_CONFIDENCE,
+    "earring_source_presence_min_area": USER_EARRING_SOURCE_PRESENCE_MIN_AREA,
+    "earring_search_downward_shift": USER_EARRING_SEARCH_DOWNWARD_SHIFT,
+    "earring_search_dilate": USER_EARRING_SEARCH_DILATE,
+    "earring_write_max_target_hair_overlap": USER_EARRING_WRITE_MAX_TARGET_HAIR_OVERLAP,
+    "earring_write_source_block_dilate": USER_EARRING_WRITE_SOURCE_BLOCK_DILATE,
+    "earring_write_dilate": USER_EARRING_WRITE_DILATE,
+    "earring_write_connectivity_iters": USER_EARRING_WRITE_CONNECTIVITY_ITERS,
+    "earring_write_connectivity_kernel": USER_EARRING_WRITE_CONNECTIVITY_KERNEL,
+    "earring_write_bridge_dilate": USER_EARRING_WRITE_BRIDGE_DILATE,
+    "earring_anchor_visible_dilate": USER_EARRING_ANCHOR_VISIBLE_DILATE,
     "earring_align_max_shift": USER_EARRING_ALIGN_MAX_SHIFT,
     "ear_fine_support_dilate": USER_EAR_FINE_SUPPORT_DILATE,
     "earring_fine_mask_floor": USER_EARRING_FINE_MASK_FLOOR,
@@ -403,6 +428,7 @@ RESOLVED_USER_CONFIG = {
     "base_source_hair_exclude_max_y": USER_BASE_SOURCE_HAIR_EXCLUDE_MAX_Y,
     "base_source_hair_exclude_ear_dilate": USER_BASE_SOURCE_HAIR_EXCLUDE_EAR_DILATE,
     "enable_source_content_gate": USER_ENABLE_SOURCE_CONTENT_GATE,
+    "source_content_gate_dilate": USER_SOURCE_CONTENT_GATE_DILATE,
     "enable_output_target_preserve": USER_ENABLE_OUTPUT_TARGET_PRESERVE,
     "output_target_hair_preserve_dilate": USER_OUTPUT_TARGET_HAIR_PRESERVE_DILATE,
     "output_face_hair_seam_preserve_dilate": USER_OUTPUT_FACE_HAIR_SEAM_PRESERVE_DILATE,
@@ -417,6 +443,8 @@ RESOLVED_USER_CONFIG = {
     "revealed_skin_diffuse_iters": USER_REVEALED_SKIN_DIFFUSE_ITERS,
     "revealed_skin_tone_limit": USER_REVEALED_SKIN_TONE_LIMIT,
     "revealed_skin_detail_gain": USER_REVEALED_SKIN_DETAIL_GAIN,
+    "revealed_skin_seam_band": USER_REVEALED_SKIN_SEAM_BAND,
+    "revealed_skin_min_reference_area": USER_REVEALED_SKIN_MIN_REFERENCE_AREA,
     "enable_output_source_earring_composite": USER_ENABLE_OUTPUT_SOURCE_EARRING_COMPOSITE,
     "output_source_earring_alpha": USER_OUTPUT_SOURCE_EARRING_ALPHA,
     "output_source_earring_mask_dilate": USER_OUTPUT_SOURCE_EARRING_MASK_DILATE,
@@ -585,6 +613,17 @@ def build_parser(defaults):
     parser.add_argument("--earring_query_lower_lobe_weight", type=float, default=defaults["earring_query_lower_lobe_weight"])
     parser.add_argument("--earring_query_candidate_boost", type=float, default=defaults["earring_query_candidate_boost"])
     parser.add_argument("--earring_query_block_protect", type=float, default=defaults["earring_query_block_protect"])
+    parser.add_argument("--disable_earring_path_if_low_confidence", type=str2bool, default=defaults["disable_earring_path_if_low_confidence"])
+    parser.add_argument("--earring_source_presence_min_area", type=float, default=defaults["earring_source_presence_min_area"])
+    parser.add_argument("--earring_search_downward_shift", type=int, default=defaults["earring_search_downward_shift"])
+    parser.add_argument("--earring_search_dilate", type=int, default=defaults["earring_search_dilate"])
+    parser.add_argument("--earring_write_max_target_hair_overlap", type=float, default=defaults["earring_write_max_target_hair_overlap"])
+    parser.add_argument("--earring_write_source_block_dilate", type=int, default=defaults["earring_write_source_block_dilate"])
+    parser.add_argument("--earring_write_dilate", type=int, default=defaults["earring_write_dilate"])
+    parser.add_argument("--earring_write_connectivity_iters", type=int, default=defaults["earring_write_connectivity_iters"])
+    parser.add_argument("--earring_write_connectivity_kernel", type=int, default=defaults["earring_write_connectivity_kernel"])
+    parser.add_argument("--earring_write_bridge_dilate", type=int, default=defaults["earring_write_bridge_dilate"])
+    parser.add_argument("--earring_anchor_visible_dilate", type=int, default=defaults["earring_anchor_visible_dilate"])
     parser.add_argument("--earring_align_max_shift", type=int, default=defaults["earring_align_max_shift"])
     parser.add_argument("--ear_fine_support_dilate", type=int, default=defaults["ear_fine_support_dilate"])
     parser.add_argument("--earring_fine_mask_floor", type=float, default=defaults["earring_fine_mask_floor"])
@@ -608,6 +647,7 @@ def build_parser(defaults):
     parser.add_argument("--base_source_hair_exclude_max_y", type=float, default=defaults["base_source_hair_exclude_max_y"])
     parser.add_argument("--base_source_hair_exclude_ear_dilate", type=int, default=defaults["base_source_hair_exclude_ear_dilate"])
     parser.add_argument("--enable_source_content_gate", type=str2bool, default=defaults["enable_source_content_gate"])
+    parser.add_argument("--source_content_gate_dilate", type=int, default=defaults["source_content_gate_dilate"])
     parser.add_argument("--enable_output_target_preserve", type=str2bool, default=defaults["enable_output_target_preserve"])
     parser.add_argument("--output_target_hair_preserve_dilate", type=int, default=defaults["output_target_hair_preserve_dilate"])
     parser.add_argument("--output_face_hair_seam_preserve_dilate", type=int, default=defaults["output_face_hair_seam_preserve_dilate"])
@@ -622,6 +662,8 @@ def build_parser(defaults):
     parser.add_argument("--revealed_skin_diffuse_iters", type=int, default=defaults["revealed_skin_diffuse_iters"])
     parser.add_argument("--revealed_skin_tone_limit", type=float, default=defaults["revealed_skin_tone_limit"])
     parser.add_argument("--revealed_skin_detail_gain", type=float, default=defaults["revealed_skin_detail_gain"])
+    parser.add_argument("--revealed_skin_seam_band", type=int, default=defaults["revealed_skin_seam_band"])
+    parser.add_argument("--revealed_skin_min_reference_area", type=float, default=defaults["revealed_skin_min_reference_area"])
     parser.add_argument("--enable_output_source_earring_composite", type=str2bool, default=defaults["enable_output_source_earring_composite"])
     parser.add_argument("--output_source_earring_alpha", type=float, default=defaults["output_source_earring_alpha"])
     parser.add_argument("--output_source_earring_mask_dilate", type=int, default=defaults["output_source_earring_mask_dilate"])

@@ -321,71 +321,6 @@ class Alignment_v8(Alignment):
         reference_anchor = latent_F_shape_inpaint + 0.40 * ref_overlap_32 * (latent_F_ref - latent_F_shape_inpaint)
         return latent_F_eq8 + blend * target_region * (reference_anchor - latent_F_eq8)
 
-    @staticmethod
-    def _preserve_hair_color_statistics(
-        latent_F_satd: torch.Tensor,
-        latent_F_base: torch.Tensor,
-        hair_mask: torch.Tensor,
-        strength: float = 0.7,
-    ) -> torch.Tensor:
-        """Restore per-channel F statistics in the hair region after SATD.
-
-        SATD shifts the per-channel mean/std of latent_F_align inside the
-        cleanup (hair-change) region.  Because the generator renders colour
-        from the interaction of S_blend and F, this statistical drift causes
-        the blended image to have both wrong hue (A symptom) and wrong
-        brightness (C symptom) even when S_blend correctly encodes the
-        reference colour.
-
-        This function applies an AdaIN-style per-channel statistics match:
-        inside the hair mask, it normalises F_satd and re-scales to match
-        F_base's per-channel mean and std.  The local spatial structure
-        produced by SATD is preserved (only mean/std are corrected, not the
-        spatial pattern), so SATD's shadow-removal benefit is kept while the
-        colour drift is removed.
-
-        strength=0.0 : no correction (F_satd unchanged, same as before).
-        strength=1.0 : full per-channel statistics restoration to F_base.
-        strength=0.7 : default — fixes most colour drift while preserving
-                       some of SATD's structural modification.
-        """
-        if strength <= 0.0:
-            return latent_F_satd
-
-        hw = latent_F_satd.shape[-2:]
-        m = hair_mask.float()
-        # Normalise to 4-D [B, 1, H, W]
-        while m.dim() < 4:
-            m = m.unsqueeze(0)
-        if m.shape[1] != 1:
-            m = m[:, :1]
-        m = F.interpolate(m, size=hw, mode="bilinear", align_corners=False).clamp(0, 1)
-        if m.size(0) == 1 and latent_F_satd.size(0) > 1:
-            m = m.expand(latent_F_satd.size(0), -1, -1, -1)
-
-        area = m.sum(dim=(-2, -1), keepdim=True).clamp(min=4.0)
-        if m.max().item() < 1e-3:
-            return latent_F_satd
-
-        # Expand mask over all channels
-        m_ch = m.expand_as(latent_F_satd)
-
-        # Per-channel masked statistics in hair region
-        base_mean = (latent_F_base * m_ch).sum(dim=(-2, -1), keepdim=True) / area
-        base_var = ((latent_F_base - base_mean).pow(2) * m_ch).sum(dim=(-2, -1), keepdim=True) / area
-        base_std = (base_var + 1e-6).sqrt()
-
-        satd_mean = (latent_F_satd * m_ch).sum(dim=(-2, -1), keepdim=True) / area
-        satd_var = ((latent_F_satd - satd_mean).pow(2) * m_ch).sum(dim=(-2, -1), keepdim=True) / area
-        satd_std = (satd_var + 1e-6).sqrt()
-
-        # AdaIN: normalise F_satd then rescale to F_base distribution
-        F_corrected = (latent_F_satd - satd_mean) / satd_std * base_std + base_mean
-
-        # Apply only inside the hair region, blended by strength
-        correction = (F_corrected - latent_F_satd) * m_ch
-        return latent_F_satd + float(strength) * correction
-
     @torch.inference_mode()
     def prepare_satd_features(self, im_name1: str, im_name2: str, name_to_embed, **kwargs):
         img1_in = name_to_embed[im_name1]["image_256"]
@@ -514,33 +449,6 @@ class Alignment_v8(Alignment):
                 satd_features["delta_masks"],
                 out_hw=latent_F_base.shape[-2:],
             )
-
-            # Exclude the target hair region from SATD's cleanup support.  SATD's
-            # purpose is to de-shadow SKIN (remove shadows the old hairstyle cast
-            # on the face/forehead).  It must NOT modify the F features of the new
-            # hairstyle's hair, because doing so corrupts the hair colour rendering
-            # (both hue and brightness) that the blending encoder cannot recover.
-            # By zeroing cleanup_support inside the target hair mask, SATD only
-            # touches non-hair (skin) regions; the hair F stays exactly F_base, so
-            # hair colour is rendered at baseline quality.
-            hair_exclude_strength = float(kwargs.get(
-                "satd_hair_exclude_strength",
-                getattr(self.opts, "satd_hair_exclude_strength", 1.0),
-            ))
-            if hair_exclude_strength > 0.0:
-                hm = satd_features["HM_X"].float()
-                while hm.dim() < 4:
-                    hm = hm.unsqueeze(0)
-                if hm.shape[1] != 1:
-                    hm = hm[:, :1]
-                hm = F.interpolate(
-                    hm, size=cleanup_support.shape[-2:], mode="bilinear", align_corners=False
-                ).clamp(0, 1)
-                if hm.size(0) == 1 and cleanup_support.size(0) > 1:
-                    hm = hm.expand(cleanup_support.size(0), -1, -1, -1)
-                # Reduce cleanup_support inside the hair region by the exclude strength.
-                cleanup_support = cleanup_support * (1.0 - hair_exclude_strength * hm).clamp(0, 1)
-
             satd_blend = kwargs.get("satd_blend_v8", getattr(self.opts, "satd_blend_v8", 0.28))
             latent_F_align = latent_F_base + satd_blend * cleanup_support * (satd_out - latent_F_base)
 

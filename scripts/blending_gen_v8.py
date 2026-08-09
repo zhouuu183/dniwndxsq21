@@ -22,9 +22,9 @@ USER_COLOR_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FF
 USER_OUTPUT_DIR_FFHQ = Path("input/blending_dataset_v8")
 USER_DATASET_SIZE_FFHQ = 3000
 
-USER_FACE_ROOT_SMALL = Path("/root/shared-nvme/HairFastGAN/images/mix_ear/")
-USER_SHAPE_ROOT_SMALL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ_color/")
-USER_COLOR_ROOT_SMALL = Path("/root/shared-nvme/HairFastGAN/images/ear/")
+USER_FACE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_long")
+USER_SHAPE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short")
+USER_COLOR_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_color")
 USER_OUTPUT_DIR_SMALL = Path("input/blending_dataset_v8_small")
 USER_DATASET_SIZE_SMALL = 300
 
@@ -33,14 +33,10 @@ USER_RANDOM_SEED = 3407
 USER_ALLOW_REUSE_ACROSS_TRIPLETS = True
 
 USER_USE_SATD_V8 = True
-USER_SATD_CHECKPOINT_V8 = "/root/shared-nvme/HairFastGAN/checkpoints/satd_3000_best.pth"
+USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/best.pth"
 USER_SATD_BLEND_V8 = 0.34
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
-# Keep SATD skin-only: 1.0 = never modify target hair F (hair colour stays at
-# baseline quality), 0 = allow SATD to modify hair F (old behaviour that caused
-# the A+C hair-colour drift).
-USER_SATD_HAIR_EXCLUDE_STRENGTH = 1.0
 # ============================================================================
 
 
@@ -91,47 +87,6 @@ def fs_cache_name(role: str, stem: str) -> str:
 
 def align_cache_name(face_name: str, ref_role: str, ref_name: str) -> str:
     return f"{role_key('face', face_name)}_{role_key(ref_role, ref_name)}.npz"
-
-
-def triplet_outputs_complete(output_dir: Path, face_name: str, shape_name: str, color_name: str) -> bool:
-    """All 7 cache files for this triplet already exist -> can be skipped on resume."""
-    required = [
-        output_dir / "FS" / fs_cache_name("face", face_name),
-        output_dir / "FS" / fs_cache_name("shape", shape_name),
-        output_dir / "FS" / fs_cache_name("color", color_name),
-        output_dir / "Align" / align_cache_name(face_name, "shape", shape_name),
-        output_dir / "Align" / align_cache_name(face_name, "color", color_name),
-        output_dir / "Masks" / align_cache_name(face_name, "shape", shape_name),
-        output_dir / "Masks" / align_cache_name(face_name, "color", color_name),
-    ]
-    return all(path.exists() for path in required)
-
-
-def load_corrupted_set(output_dir: Path) -> set[str]:
-    """Image stems previously found corrupted; skipped without retrying."""
-    path = output_dir / "corrupted_images.txt"
-    if not path.exists():
-        return set()
-    with open(path, "r", encoding="utf-8") as handle:
-        return {line.strip() for line in handle if line.strip()}
-
-
-def record_corrupted(output_dir: Path, stems: set[str]) -> None:
-    path = output_dir / "corrupted_images.txt"
-    with open(path, "w", encoding="utf-8") as handle:
-        for stem in sorted(stems):
-            handle.write(f"{stem}\n")
-
-
-def is_corrupt_image_error(error: Exception) -> bool:
-    text = str(error).lower()
-    return (
-        "decode" in text
-        or "corrupt" in text
-        or "out of bound" in text
-        or "truncated" in text
-        or isinstance(error, (OSError, ValueError))
-    )
 
 
 def build_remove_protect_mask(align_info: dict[str, object]) -> torch.Tensor:
@@ -277,10 +232,6 @@ def build_model() -> HairFast_v8:
     model_args.satd_blend_v8 = USER_SATD_BLEND_V8
     model_args.satd_boundary_v8 = USER_SATD_BOUNDARY_V8
     model_args.eq8_reference_blend_v8 = USER_EQ8_REFERENCE_BLEND_V8
-    # Keep SATD skin-only: never let it modify the target hair's F features, so
-    # hair colour is rendered at baseline quality (fixes the A+C colour drift the
-    # blending encoder could not recover).
-    model_args.satd_hair_exclude_strength = USER_SATD_HAIR_EXCLUDE_STRENGTH
 
     hair_fast = HairFast_v8(model_args)
     hair_fast.blend.blend_images = identity_func
@@ -309,49 +260,20 @@ def main():
         USER_RANDOM_SEED,
     )
 
-    corrupted = load_corrupted_set(ACTIVE_OUTPUT_DIR)
-    done_count = 0
-    skipped_done = 0
-    skipped_corrupt = 0
-
-    # dataset.exps is rebuilt each run and only lists successfully-generated
-    # triplets, so a corrupted/skipped triplet never enters the training list.
     with open(ACTIVE_OUTPUT_DIR / "dataset.exps", "w", encoding="utf-8") as f_exps:
         for face_name, shape_name, color_name in triplets:
-            # Resume: a triplet whose 7 cache files already exist is complete.
-            if triplet_outputs_complete(ACTIVE_OUTPUT_DIR, face_name, shape_name, color_name):
-                print(face_name, shape_name, color_name, file=f_exps, flush=True)
-                skipped_done += 1
-                done_count += 1
-                continue
+            print(face_name, shape_name, color_name, file=f_exps, flush=True)
 
-            # Skip triplets that reference a known-corrupted image without retry.
-            triplet_stems = {face_name, shape_name, color_name}
-            if triplet_stems & corrupted:
-                skipped_corrupt += 1
-                continue
+            face_path = find_image_path(ACTIVE_FACE_ROOT, face_name)
+            shape_path = find_image_path(ACTIVE_SHAPE_ROOT, shape_name)
+            color_path = find_image_path(ACTIVE_COLOR_ROOT, color_name)
 
-            try:
-                face_path = find_image_path(ACTIVE_FACE_ROOT, face_name)
-                shape_path = find_image_path(ACTIVE_SHAPE_ROOT, shape_name)
-                color_path = find_image_path(ACTIVE_COLOR_ROOT, color_name)
-
-                align_shape, align_color, name_to_embed = hair_fast(
-                    face_path,
-                    shape_path,
-                    color_path,
-                    align_flag=True,
-                )
-            except Exception as error:  # noqa: BLE001 - skip bad images, keep going
-                if is_corrupt_image_error(error):
-                    # Record every stem in this triplet so the whole triplet is
-                    # skipped next run; the actually-bad image is among them.
-                    corrupted |= triplet_stems
-                    record_corrupted(ACTIVE_OUTPUT_DIR, corrupted)
-                    skipped_corrupt += 1
-                    print(f"[skip] corrupted image in triplet ({face_name}, {shape_name}, {color_name}): {error}")
-                    continue
-                raise
+            align_shape, align_color, name_to_embed = hair_fast(
+                face_path,
+                shape_path,
+                color_path,
+                align_flag=True,
+            )
 
             save_latents(ACTIVE_OUTPUT_DIR, "FS", fs_cache_name("face", face_name), latent_in=name_to_embed["face"]["S"])
             save_latents(ACTIVE_OUTPUT_DIR, "FS", fs_cache_name("shape", shape_name), latent_in=name_to_embed["shape"]["S"])
@@ -361,15 +283,8 @@ def main():
             save_latents(ACTIVE_OUTPUT_DIR, "Masks", align_cache_name(face_name, "shape", shape_name), remove_mask=build_remove_protect_mask(align_shape))
             save_latents(ACTIVE_OUTPUT_DIR, "Masks", align_cache_name(face_name, "color", color_name), remove_mask=build_remove_protect_mask(align_color))
 
-            # Only record to dataset.exps AFTER all files are on disk, so an
-            # interrupted triplet is re-run (not half-listed) next time.
-            print(face_name, shape_name, color_name, file=f_exps, flush=True)
-            done_count += 1
-
     print(f"dataset profile: {USER_DATASET_PROFILE}")
-    print(f"generated/kept {done_count} triplets "
-          f"(resumed {skipped_done} already-done, skipped {skipped_corrupt} corrupted) "
-          f"to {ACTIVE_OUTPUT_DIR / 'dataset.exps'}")
+    print(f"saved {len(triplets)} blending triplets to {ACTIVE_OUTPUT_DIR / 'dataset.exps'}")
     print(f"face root: {ACTIVE_FACE_ROOT}")
     print(f"shape root: {ACTIVE_SHAPE_ROOT}")
     print(f"color root: {ACTIVE_COLOR_ROOT}")

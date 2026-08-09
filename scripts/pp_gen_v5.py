@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import inspect
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
@@ -22,11 +23,16 @@ from models.ear_modules_v5 import (
     EarAnchoredQueryBuilder,
     FaceParsingHelperV5,
     HairMaskExtractorV5,
+    RAW_EARRING,
     align_earring_reference_to_target,
     build_earring_highlight_mask,
+    build_earring_search_mask,
+    build_earring_write_mask,
     build_revealed_skin_mask,
     build_weak_earring_masks,
+    dilate_mask,
     enhance_query_with_earring_recall,
+    extract_visible_earring_segment,
     resize_mask,
     select_reference_earring_mask,
 )
@@ -35,6 +41,16 @@ from utils.image_utils import list_image_files
 from utils.train import seed_everything
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
+DATASET_CONFIG_SCHEMA_VERSION = 2
+DATASET_POLICY_FILES = (
+    "scripts/pp_gen_v5.py",
+    "hair_swap_v5.py",
+    "models/Alignment_v8.py",
+    "models/Blending_v5.py",
+    "models/Blending_v8.py",
+    "models/ear_modules_v5.py",
+    "models/postprocess_v5.py",
+)
 PP_EXTRA_MASK_KEYS = (
     "cleanup_inner_edge",
     "revealed_skin_mask",
@@ -71,6 +87,23 @@ USER_SATD_CHECKPOINT_V8 = "/root/shared-nvme/HairFastGAN/checkpoints/satd_3000_b
 USER_SATD_BLEND_V8 = 0.28
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
+USER_SATD_HAIR_EXCLUDE_STRENGTH = 1.0
+
+# These values define the authoritative v8 target distribution consumed by PP.
+# Changing any of them requires a fresh dataset; the resume fingerprint below
+# prevents parts from two colour/mask policies being mixed.
+USER_TARGET_HAIR_CLOSE_KERNEL = 9
+USER_TARGET_HAIR_HOLE_MAX_AREA_RATIO = 0.003
+USER_TARGET_HAIR_TOP_FILL_ONLY = True
+USER_TARGET_HAIR_EAR_BRIDGE_RADIUS = 3
+USER_HAIR_COLOR_REFERENCE_STRENGTH_V8 = 0.90
+USER_HAIR_COLOR_LOW_FREQUENCY_RADIUS_V8 = 15
+USER_HAIR_COLOR_LOW_FREQUENCY_SIGMA_V8 = None
+USER_HAIR_COLOR_FEATHER_RADIUS_V8 = 5
+USER_HAIR_COLOR_SPATIAL_REFERENCE_WEIGHT_V8 = 0.75
+USER_HAIR_COLOR_DETAIL_CHROMA_GAIN_V8 = 1.0
+USER_DISABLE_REFERENCE_DOMINANT_HAIR_COLOR_V8 = False
+USER_BLEND_CHROMA_CORRECT_STRENGTH = 0.0
 
 USER_IO_NUM_WORKERS = 0
 USER_PREFETCH_FACTOR = 1
@@ -84,19 +117,31 @@ USER_EARRING_EXPAND = 15
 USER_EAR_DOWNWARD_SHIFT = 10
 USER_TARGET_HAIR_DILATE = 11
 USER_EARRING_OCCLUSION_DILATE = 3
-USER_SOURCE_HAIR_BLOCK_DILATE = 5
-USER_SOURCE_HAIR_BLOCK_STRENGTH = 0.6
+USER_SOURCE_HAIR_BLOCK_DILATE = 8
+USER_SOURCE_HAIR_BLOCK_STRENGTH = 0.95
 USER_TARGET_VISIBILITY_EXPAND = 5
-USER_MAX_TARGET_HAIR_OVERLAP = 0.55
-USER_MIN_TARGET_VISIBLE_OVERLAP = 0.02
+USER_MAX_TARGET_HAIR_OVERLAP = 0.30
+USER_MIN_TARGET_VISIBLE_OVERLAP = 0.10
 USER_MIN_TARGET_EAR_AREA = 8.0
 USER_EARRING_CHANNEL_DOWN = 32
 USER_ENABLE_EARRING_QUERY_RECALL = True
 USER_EARRING_QUERY_RECALL_DILATE = 7
-USER_EARRING_QUERY_DOWNWARD_SHIFT = 18
+USER_EARRING_QUERY_DOWNWARD_SHIFT = 10
 USER_EARRING_QUERY_LOWER_LOBE_WEIGHT = 0.20
 USER_EARRING_QUERY_CANDIDATE_BOOST = 0.90
-USER_EARRING_QUERY_BLOCK_PROTECT = 0.85
+USER_EARRING_QUERY_BLOCK_PROTECT = 0.95
+USER_EARRING_QUERY_BOOST = 1.0
+USER_DISABLE_EARRING_PATH_IF_LOW_CONFIDENCE = True
+USER_EARRING_SOURCE_PRESENCE_MIN_AREA = 4.0
+USER_EARRING_SEARCH_DOWNWARD_SHIFT = 10
+USER_EARRING_SEARCH_DILATE = 7
+USER_EARRING_WRITE_MAX_TARGET_HAIR_OVERLAP = 0.30
+USER_EARRING_WRITE_SOURCE_BLOCK_DILATE = 3
+USER_EARRING_WRITE_DILATE = 3
+USER_EARRING_WRITE_CONNECTIVITY_ITERS = 32
+USER_EARRING_WRITE_CONNECTIVITY_KERNEL = 5
+USER_EARRING_WRITE_BRIDGE_DILATE = 5
+USER_EARRING_ANCHOR_VISIBLE_DILATE = 3
 USER_EARRING_ALIGN_MAX_SHIFT = 12
 USER_EARRING_FINE_MASK_FLOOR = 0.18
 USER_EARRING_FINE_MASK_DILATE = 5
@@ -151,6 +196,19 @@ RESOLVED_USER_CONFIG = {
     "satd_blend_v8": USER_SATD_BLEND_V8,
     "satd_boundary_v8": USER_SATD_BOUNDARY_V8,
     "eq8_reference_blend_v8": USER_EQ8_REFERENCE_BLEND_V8,
+    "satd_hair_exclude_strength": USER_SATD_HAIR_EXCLUDE_STRENGTH,
+    "target_hair_close_kernel": USER_TARGET_HAIR_CLOSE_KERNEL,
+    "target_hair_hole_max_area_ratio": USER_TARGET_HAIR_HOLE_MAX_AREA_RATIO,
+    "target_hair_top_fill_only": USER_TARGET_HAIR_TOP_FILL_ONLY,
+    "target_hair_ear_bridge_radius": USER_TARGET_HAIR_EAR_BRIDGE_RADIUS,
+    "hair_color_reference_strength_v8": USER_HAIR_COLOR_REFERENCE_STRENGTH_V8,
+    "hair_color_low_frequency_radius_v8": USER_HAIR_COLOR_LOW_FREQUENCY_RADIUS_V8,
+    "hair_color_low_frequency_sigma_v8": USER_HAIR_COLOR_LOW_FREQUENCY_SIGMA_V8,
+    "hair_color_feather_radius_v8": USER_HAIR_COLOR_FEATHER_RADIUS_V8,
+    "hair_color_spatial_reference_weight_v8": USER_HAIR_COLOR_SPATIAL_REFERENCE_WEIGHT_V8,
+    "hair_color_detail_chroma_gain_v8": USER_HAIR_COLOR_DETAIL_CHROMA_GAIN_V8,
+    "disable_reference_dominant_hair_color_v8": USER_DISABLE_REFERENCE_DOMINANT_HAIR_COLOR_V8,
+    "blend_chroma_correct_strength": USER_BLEND_CHROMA_CORRECT_STRENGTH,
     "chunk_size": ACTIVE_CHUNK_SIZE,
     "mask_batch_size": ACTIVE_MASK_BATCH_SIZE,
     "io_num_workers": USER_IO_NUM_WORKERS,
@@ -177,17 +235,22 @@ RESOLVED_USER_CONFIG = {
     "earring_query_lower_lobe_weight": USER_EARRING_QUERY_LOWER_LOBE_WEIGHT,
     "earring_query_candidate_boost": USER_EARRING_QUERY_CANDIDATE_BOOST,
     "earring_query_block_protect": USER_EARRING_QUERY_BLOCK_PROTECT,
+    "earring_query_boost": USER_EARRING_QUERY_BOOST,
+    "disable_earring_path_if_low_confidence": USER_DISABLE_EARRING_PATH_IF_LOW_CONFIDENCE,
+    "earring_source_presence_min_area": USER_EARRING_SOURCE_PRESENCE_MIN_AREA,
+    "earring_search_downward_shift": USER_EARRING_SEARCH_DOWNWARD_SHIFT,
+    "earring_search_dilate": USER_EARRING_SEARCH_DILATE,
+    "earring_write_max_target_hair_overlap": USER_EARRING_WRITE_MAX_TARGET_HAIR_OVERLAP,
+    "earring_write_source_block_dilate": USER_EARRING_WRITE_SOURCE_BLOCK_DILATE,
+    "earring_write_dilate": USER_EARRING_WRITE_DILATE,
+    "earring_write_connectivity_iters": USER_EARRING_WRITE_CONNECTIVITY_ITERS,
+    "earring_write_connectivity_kernel": USER_EARRING_WRITE_CONNECTIVITY_KERNEL,
+    "earring_write_bridge_dilate": USER_EARRING_WRITE_BRIDGE_DILATE,
+    "earring_anchor_visible_dilate": USER_EARRING_ANCHOR_VISIBLE_DILATE,
     "earring_align_max_shift": USER_EARRING_ALIGN_MAX_SHIFT,
     "earring_fine_mask_floor": USER_EARRING_FINE_MASK_FLOOR,
     "earring_fine_mask_dilate": USER_EARRING_FINE_MASK_DILATE,
 }
-
-
-class ImageException(Exception):
-    def __init__(self, image, message="Return image before PP"):
-        self.image = image
-        self.message = message
-        super().__init__(self.message)
 
 
 def to_single_mask(mask):
@@ -201,26 +264,59 @@ def to_single_mask(mask):
     return mask.clamp(0, 1)
 
 
-def extract_cleanup_masks(align_shape):
-    if not isinstance(align_shape, dict):
-        return {}
-    delta_masks = align_shape.get("delta_masks")
-    if not isinstance(delta_masks, dict):
-        return {}
+def unpack_color_before_pp_stage(result):
+    """Validate and unpack BlendingV5's formal pre-PP stage result."""
 
-    fallback = None
-    for key in CLEANUP_MASK_KEYS:
-        value = delta_masks.get(key)
-        if torch.is_tensor(value):
-            fallback = torch.zeros_like(value)
-            break
-    if fallback is None:
-        return {}
+    if not isinstance(result, dict) or result.get("stage") != "color_before_pp":
+        raise RuntimeError(
+            "HairFastV5 did not return the requested color_before_pp stage. "
+            "Use the matching BlendingV5 implementation before generating PP data."
+        )
+    image = result.get("color_before_pp", result.get("image"))
+    if not torch.is_tensor(image):
+        raise RuntimeError("color_before_pp stage is missing its image tensor.")
+    if image.ndim == 4:
+        if image.size(0) != 1:
+            raise RuntimeError("PP generation expects one rendered sample per call.")
+        image = image[0]
+    if image.ndim != 3 or image.size(0) != 3:
+        raise RuntimeError(
+            f"Expected color_before_pp RGB [3,H,W], got {tuple(image.shape)}."
+        )
 
-    return {
-        key: to_single_mask(delta_masks.get(key, fallback))
-        for key in CLEANUP_MASK_KEYS
-    }
+    raw_cleanup = result.get("cleanup_masks", {})
+    if not isinstance(raw_cleanup, dict):
+        raise RuntimeError("color_before_pp cleanup_masks must be a dictionary.")
+    fallback = next(
+        (
+            torch.zeros_like(value)
+            for value in raw_cleanup.values()
+            if torch.is_tensor(value)
+        ),
+        None,
+    )
+    cleanup_masks = {}
+    if fallback is not None:
+        cleanup_masks = {
+            key: to_single_mask(raw_cleanup.get(key, fallback))
+            for key in CLEANUP_MASK_KEYS
+        }
+
+    pre_reference_color = result.get("pre_reference_color")
+    if torch.is_tensor(pre_reference_color) and pre_reference_color.ndim == 4:
+        if pre_reference_color.size(0) != 1:
+            raise RuntimeError("pre_reference_color must contain one sample.")
+        pre_reference_color = pre_reference_color[0]
+    target_hair_mask = result.get("target_hair_mask")
+    if target_hair_mask is not None:
+        target_hair_mask = to_single_mask(target_hair_mask)
+        if tuple(target_hair_mask.shape[-2:]) != tuple(image.shape[-2:]):
+            target_hair_mask = F.interpolate(
+                target_hair_mask.unsqueeze(0),
+                size=image.shape[-2:],
+                mode="nearest",
+            )[0]
+    return image.clamp(0, 1), cleanup_masks, pre_reference_color, target_hair_mask
 
 
 def str2path(value):
@@ -252,6 +348,19 @@ def build_parser(defaults):
     parser.add_argument("--satd_blend_v8", type=float, default=defaults["satd_blend_v8"])
     parser.add_argument("--satd_boundary_v8", type=int, default=defaults["satd_boundary_v8"])
     parser.add_argument("--eq8_reference_blend_v8", type=float, default=defaults["eq8_reference_blend_v8"])
+    parser.add_argument("--satd_hair_exclude_strength", type=float, default=defaults["satd_hair_exclude_strength"])
+    parser.add_argument("--target_hair_close_kernel", type=int, default=defaults["target_hair_close_kernel"])
+    parser.add_argument("--target_hair_hole_max_area_ratio", type=float, default=defaults["target_hair_hole_max_area_ratio"])
+    parser.add_argument("--target_hair_top_fill_only", type=str2bool, default=defaults["target_hair_top_fill_only"])
+    parser.add_argument("--target_hair_ear_bridge_radius", type=int, default=defaults["target_hair_ear_bridge_radius"])
+    parser.add_argument("--hair_color_reference_strength_v8", type=float, default=defaults["hair_color_reference_strength_v8"])
+    parser.add_argument("--hair_color_low_frequency_radius_v8", type=int, default=defaults["hair_color_low_frequency_radius_v8"])
+    parser.add_argument("--hair_color_low_frequency_sigma_v8", type=float, default=defaults["hair_color_low_frequency_sigma_v8"])
+    parser.add_argument("--hair_color_feather_radius_v8", type=int, default=defaults["hair_color_feather_radius_v8"])
+    parser.add_argument("--hair_color_spatial_reference_weight_v8", type=float, default=defaults["hair_color_spatial_reference_weight_v8"])
+    parser.add_argument("--hair_color_detail_chroma_gain_v8", type=float, default=defaults["hair_color_detail_chroma_gain_v8"])
+    parser.add_argument("--disable_reference_dominant_hair_color_v8", type=str2bool, default=defaults["disable_reference_dominant_hair_color_v8"])
+    parser.add_argument("--blend_chroma_correct_strength", type=float, default=defaults["blend_chroma_correct_strength"])
     parser.add_argument("--chunk_size", type=int, default=defaults["chunk_size"])
     parser.add_argument("--mask_batch_size", type=int, default=defaults["mask_batch_size"])
     parser.add_argument("--io_num_workers", type=int, default=defaults["io_num_workers"])
@@ -278,30 +387,58 @@ def build_parser(defaults):
     parser.add_argument("--earring_query_lower_lobe_weight", type=float, default=defaults["earring_query_lower_lobe_weight"])
     parser.add_argument("--earring_query_candidate_boost", type=float, default=defaults["earring_query_candidate_boost"])
     parser.add_argument("--earring_query_block_protect", type=float, default=defaults["earring_query_block_protect"])
+    parser.add_argument("--earring_query_boost", type=float, default=defaults["earring_query_boost"])
+    parser.add_argument(
+        "--disable_earring_path_if_low_confidence",
+        type=str2bool,
+        default=defaults["disable_earring_path_if_low_confidence"],
+    )
+    parser.add_argument(
+        "--earring_source_presence_min_area",
+        type=float,
+        default=defaults["earring_source_presence_min_area"],
+    )
+    parser.add_argument(
+        "--earring_search_downward_shift",
+        type=int,
+        default=defaults["earring_search_downward_shift"],
+    )
+    parser.add_argument("--earring_search_dilate", type=int, default=defaults["earring_search_dilate"])
+    parser.add_argument(
+        "--earring_write_max_target_hair_overlap",
+        type=float,
+        default=defaults["earring_write_max_target_hair_overlap"],
+    )
+    parser.add_argument(
+        "--earring_write_source_block_dilate",
+        type=int,
+        default=defaults["earring_write_source_block_dilate"],
+    )
+    parser.add_argument("--earring_write_dilate", type=int, default=defaults["earring_write_dilate"])
+    parser.add_argument(
+        "--earring_write_connectivity_iters",
+        type=int,
+        default=defaults["earring_write_connectivity_iters"],
+    )
+    parser.add_argument(
+        "--earring_write_connectivity_kernel",
+        type=int,
+        default=defaults["earring_write_connectivity_kernel"],
+    )
+    parser.add_argument(
+        "--earring_write_bridge_dilate",
+        type=int,
+        default=defaults["earring_write_bridge_dilate"],
+    )
+    parser.add_argument(
+        "--earring_anchor_visible_dilate",
+        type=int,
+        default=defaults["earring_anchor_visible_dilate"],
+    )
     parser.add_argument("--earring_align_max_shift", type=int, default=defaults["earring_align_max_shift"])
     parser.add_argument("--earring_fine_mask_floor", type=float, default=defaults["earring_fine_mask_floor"])
     parser.add_argument("--earring_fine_mask_dilate", type=int, default=defaults["earring_fine_mask_dilate"])
     return parser
-
-
-def hairfast_wo_pp(hair_fast):
-    class RaiseDownsample(nn.Module):
-        def forward(self, image):
-            image = ((image[0] + 1) / 2).clip(0, 1)
-            raise ImageException(image)
-
-    def blend_images(func):
-        def wrapper(*args, **kwargs):
-            try:
-                func(*args, **kwargs)
-            except ImageException as error:
-                align_shape = args[0] if args else {}
-                return error.image, extract_cleanup_masks(align_shape)
-
-        return wrapper
-
-    hair_fast.blend.downsample_256 = RaiseDownsample()
-    hair_fast.blend.blend_images = blend_images(hair_fast.blend.blend_images)
 
 
 def load_image(path):
@@ -320,6 +457,194 @@ def count_dataset_parts(total_items, chunk_size, batch_size):
     return total_parts
 
 
+def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing, args):
+    """Apply the inference-time broad-search/narrow-write policy to PP data.
+
+    Parser evidence is the presence authority.  Weak image candidates can
+    extend a parser-confirmed long earring, but cannot activate a no-earring
+    sample.  The returned ``write_mask`` is the only mask allowed to supervise
+    source-content restoration; ``search_mask`` remains detection-only.
+    """
+
+    reference = query_info["query_mask"].float()
+    parsing = source_parsing
+    if tuple(parsing.shape[-2:]) != tuple(reference.shape[-2:]):
+        parsing = F.interpolate(parsing.float(), size=reference.shape[-2:], mode="nearest")
+    parser_earring = (parsing.long() == RAW_EARRING).to(dtype=reference.dtype)
+
+    height, width = reference.shape[-2:]
+    area_scale = float(height * width) / float(256 * 256)
+    min_area = max(0.0, float(args.earring_source_presence_min_area) * area_scale)
+    if args.disable_earring_path_if_low_confidence:
+        present = parser_earring.flatten(1).sum(dim=1) >= min_area
+    else:
+        present = parser_earring.flatten(1).amax(dim=1) > 0
+    active = present.to(dtype=reference.dtype).view(-1, 1, 1, 1)
+    no_earring = (1.0 - active).expand_as(reference)
+    earring_roi = query_info.get(
+        "earring_valid_roi",
+        query_info.get("visible_ear_roi", query_info["ear_roi"]),
+    )
+
+    # Weak evidence is useful only after parser-confirmed presence.  This hard
+    # gate prevents ear edges/background texture from creating a synthetic
+    # accessory branch on no-earring sources.
+    gated_weak = {
+        key: value * active if torch.is_tensor(value) else value
+        for key, value in weak_earring.items()
+    }
+    if args.enable_earring_query_recall:
+        recall_info = enhance_query_with_earring_recall(
+            query_info["query_mask"],
+            parser_earring * active,
+            query_info.get("source_hair_block_mask"),
+            gated_weak,
+            visibility_mask=earring_roi,
+            recall_dilate=args.earring_query_recall_dilate,
+            downward_shift=args.earring_query_downward_shift,
+            lower_lobe_weight=args.earring_query_lower_lobe_weight,
+            candidate_boost=args.earring_query_candidate_boost,
+            block_protect=args.earring_query_block_protect,
+        )
+        query_info.update(recall_info)
+
+    clean_mask = gated_weak.get("source_earring_clean_mask", torch.zeros_like(reference))
+    candidate_mask = gated_weak.get("earring_candidate_mask", torch.zeros_like(reference))
+    selected_object = torch.clamp(
+        parser_earring
+        + select_reference_earring_mask(
+            clean_mask,
+            candidate_mask,
+            query_info["left_ear_roi"],
+            query_info["right_ear_roi"],
+        ),
+        0,
+        1,
+    ) * active
+
+    search_mask = build_earring_search_mask(
+        parser_earring,
+        earring_roi,
+        online_candidate_mask=candidate_mask,
+        weak_recall_mask=query_info.get("earring_query_recall_mask"),
+        lobe_search_mask=gated_weak.get("source_lobe_search_mask"),
+        downward_shift=args.earring_search_downward_shift,
+        search_dilate=args.earring_search_dilate,
+        no_earring=no_earring,
+    )
+    confident_object = (selected_object * search_mask * active).clamp(0, 1)
+
+    target_hair_occlusion = query_info.get("target_ear_hair_occlusion_mask")
+    if target_hair_occlusion is None:
+        target_hair_occlusion = query_info["target_hair_mask"] * query_info["ear_roi"]
+    target_hair_occlusion = resize_mask(target_hair_occlusion, reference.shape[-2:])
+
+    # Mirror inference-time side visibility gating during dataset creation.
+    # Otherwise PP would be trained on earring labels that are invalid for a
+    # target ear already covered by the donor hairstyle, reintroducing the hole
+    # at deployment even though the runtime mask is narrower.
+    min_visible_overlap = float(getattr(args, "min_target_visible_overlap", 0.10))
+    min_visible_area = float(getattr(args, "min_target_ear_area", 8.0))
+    def resize_or_zero(value):
+        if value is None:
+            return torch.zeros_like(reference)
+        return resize_mask(value, reference.shape[-2:])
+
+    left_roi = resize_or_zero(query_info.get("left_ear_roi"))
+    right_roi = resize_or_zero(query_info.get("right_ear_roi"))
+    left_ear = resize_or_zero(query_info.get("target_left_ear_mask")) * left_roi
+    right_ear = resize_or_zero(query_info.get("target_right_ear_mask")) * right_roi
+
+    def side_gate(side_ear, side_roi):
+        exposed = side_ear * (1.0 - target_hair_occlusion).clamp(0, 1)
+        ear_area = side_ear.flatten(1).sum(dim=1)
+        exposed_area = exposed.flatten(1).sum(dim=1)
+        roi_area = side_roi.flatten(1).sum(dim=1)
+        ratio = exposed_area / ear_area.clamp_min(1e-6)
+        enabled = (
+            (ear_area >= min_visible_area)
+            & (exposed_area >= min_visible_area)
+            & (ratio >= min_visible_overlap)
+            & (roi_area > 0)
+        ).to(reference.dtype)
+        return enabled.view(-1, 1, 1, 1)
+
+    visible_side_gate = torch.clamp(
+        side_gate(left_ear, left_roi) * left_roi
+        + side_gate(right_ear, right_roi) * right_roi,
+        0,
+        1,
+    )
+    earring_roi = earring_roi * visible_side_gate
+
+    target_ear = torch.clamp(
+        query_info["target_left_ear_mask"] + query_info["target_right_ear_mask"],
+        0,
+        1,
+    )
+    truly_visible = resize_mask(query_info.get("visible_ear_roi", earring_roi), reference.shape[-2:])
+    if args.earring_anchor_visible_dilate > 1:
+        truly_visible = dilate_mask(truly_visible, args.earring_anchor_visible_dilate)
+    earlobe_anchor = (
+        target_ear
+        * truly_visible
+        * (1.0 - target_hair_occlusion).clamp(0, 1)
+        * active
+    ).clamp(0, 1)
+
+    source_background = (parsing.long() == 0).to(dtype=reference.dtype)
+    source_non_earring = (parsing.long() != RAW_EARRING).to(dtype=reference.dtype)
+    write_mask = build_earring_write_mask(
+        confident_object,
+        earring_roi,
+        target_hair_occlusion,
+        earlobe_anchor,
+        no_earring=no_earring,
+        source_background_mask=source_background,
+        source_hair_mask=query_info.get("source_hair_mask"),
+        source_hair_block_mask=query_info.get("source_hair_block_mask"),
+        source_semantic_block_mask=source_non_earring,
+        parser_earring_mask=parser_earring,
+        trusted_earring_mask=selected_object,
+        max_target_hair_overlap=args.earring_write_max_target_hair_overlap,
+        source_block_dilate=args.earring_write_source_block_dilate,
+        write_dilate=args.earring_write_dilate,
+        connectivity_iters=args.earring_write_connectivity_iters,
+        connectivity_kernel=args.earring_write_connectivity_kernel,
+        bridge_dilate=args.earring_write_bridge_dilate,
+    )
+    visible_segment = extract_visible_earring_segment(
+        confident_object,
+        write_mask,
+        earlobe_anchor,
+        connectivity_iters=args.earring_write_connectivity_iters,
+        connectivity_kernel=args.earring_write_connectivity_kernel,
+        bridge_dilate=args.earring_write_bridge_dilate,
+    )
+    write_mask = (torch.minimum(write_mask, visible_segment) * active).clamp(0, 1)
+    query_info["query_mask"] = torch.clamp(
+        query_info["query_mask"] + max(0.0, float(args.earring_query_boost)) * search_mask,
+        0,
+        1,
+    )
+
+    return {
+        "active": active,
+        "no_earring_case_mask": no_earring,
+        "source_parser_earring_mask": parser_earring * active,
+        "earring_candidate_mask": candidate_mask * search_mask * active,
+        "selected_object_mask": selected_object,
+        "earring_search_mask": search_mask,
+        "earring_write_mask": write_mask,
+        "earring_visible_segment_mask": visible_segment * active,
+        "earlobe_anchor_mask": earlobe_anchor,
+        "target_hair_ear_bridge_mask": (
+            target_hair_occlusion * (1.0 - write_mask).clamp(0, 1)
+        ).clamp(0, 1),
+        "gated_weak": gated_weak,
+    }
+
+
 class RenderedPairDataset(Dataset):
     def __init__(self, experiments, dataset_path, face_gallery_root, donor_gallery_root):
         self.experiments = experiments
@@ -334,6 +659,12 @@ class RenderedPairDataset(Dataset):
         item = self.experiments[idx]
         source_path = self.face_gallery_root / item["source_name"]
         target_path = self.dataset_path / item["target_name"]
+        pre_reference_name = item.get("pre_reference_color_name")
+        pre_reference_path = (
+            self.dataset_path / pre_reference_name
+            if pre_reference_name is not None
+            else target_path
+        )
         _, shape_name, color_name = item["triplet"]
         return {
             "source_path": str(source_path),
@@ -341,7 +672,9 @@ class RenderedPairDataset(Dataset):
             "color_reference_path": str(self.donor_gallery_root / color_name),
             "source_full": load_image(source_path),
             "target_full": load_image(target_path),
+            "pre_reference_color_full": load_image(pre_reference_path),
             "cleanup_masks": item.get("cleanup_masks", {}),
+            "target_hair_mask_override": item.get("target_hair_mask"),
         }
 
 
@@ -374,6 +707,33 @@ class DatasetItemBatchBuilder:
         }
         self.query_builder = EarAnchoredQueryBuilder(**query_builder_kwargs)
 
+    def _resize_to_256(self, images):
+        """Return exact PP-resolution RGB for both old and new dataset parts."""
+        if tuple(images.shape[-2:]) == (256, 256):
+            return images
+        if tuple(images.shape[-2:]) == (1024, 1024):
+            return self.downsample_256(images)
+        return F.interpolate(
+            images,
+            size=(256, 256),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+
+    @staticmethod
+    def _resize_for_hair_parser(images):
+        """HairMaskExtractorV5 expects 1024 input before its fixed 2x shrink."""
+        if tuple(images.shape[-2:]) == (1024, 1024):
+            return images
+        return F.interpolate(
+            images,
+            size=(1024, 1024),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+
     def _iter_single_process_batches(self, dataset):
         batch_size = self.args.mask_batch_size
         total_batches = ceil_div(len(dataset), batch_size)
@@ -386,6 +746,20 @@ class DatasetItemBatchBuilder:
                 "color_reference_path": [item["color_reference_path"] for item in batch_items],
                 "source_full": torch.stack([item["source_full"] for item in batch_items], dim=0),
                 "target_full": torch.stack([item["target_full"] for item in batch_items], dim=0),
+                "pre_reference_color_full": torch.stack(
+                    [item["pre_reference_color_full"] for item in batch_items],
+                    dim=0,
+                ),
+                "target_hair_mask_override": torch.stack(
+                    [
+                        item.get(
+                            "target_hair_mask",
+                            torch.zeros(1, 256, 256),
+                        )
+                        for item in batch_items
+                    ],
+                    dim=0,
+                ),
                 "cleanup_masks": {
                     key: torch.stack(
                         [
@@ -425,12 +799,36 @@ class DatasetItemBatchBuilder:
             color_reference_paths = batch["color_reference_path"]
             source_full = batch["source_full"].to(self.device, non_blocking=False)
             target_full = batch["target_full"].to(self.device, non_blocking=False)
+            pre_reference_color_full = batch["pre_reference_color_full"].to(
+                self.device,
+                non_blocking=False,
+            )
             batch_cleanup_masks = batch.get("cleanup_masks", {})
 
-            source_256 = self.downsample_256(source_full).clip(0, 1)
-            target_256 = self.downsample_256(target_full).clip(0, 1)
-            source_hair_d, _ = self.hair_mask_extractor.generate_mask(source_full)
-            target_hair_d, target_hair_e = self.hair_mask_extractor.generate_mask(target_full)
+            source_256 = self._resize_to_256(source_full).clip(0, 1)
+            target_256 = self._resize_to_256(target_full).clip(0, 1)
+            pre_reference_color_256 = self._resize_to_256(pre_reference_color_full).clip(0, 1)
+            source_hair_input = self._resize_for_hair_parser(source_full)
+            target_hair_input = self._resize_for_hair_parser(target_full)
+            source_hair_d, _ = self.hair_mask_extractor.generate_mask(source_hair_input)
+            target_hair_d, target_hair_e = self.hair_mask_extractor.generate_mask(target_hair_input)
+            target_hair_override = batch.get("target_hair_mask_override")
+            if target_hair_override is not None:
+                target_hair_override = resize_mask(
+                    target_hair_override.to(self.device, non_blocking=False).float(),
+                    target_hair_d.shape[-2:],
+                )
+                # A missing override is represented by an all-zero tensor for
+                # compatibility with old parts; only replace the parser mask
+                # when the stage supplied a non-empty repaired topology.
+                has_override = (
+                    target_hair_override.flatten(1).amax(dim=1, keepdim=True) > 0
+                ).view(-1, 1, 1, 1)
+                target_hair_d = torch.where(
+                    has_override,
+                    target_hair_override,
+                    target_hair_d,
+                ).clamp(0, 1)
             target_mask = (1 - source_hair_d) * (1 - target_hair_d)
 
             source_parsing = self.parsing_helper.parse(source_256, out_size=(256, 256))
@@ -462,36 +860,20 @@ class DatasetItemBatchBuilder:
                 source_hair_block_mask,
                 source_parsing,
             )
-            if self.args.enable_earring_query_recall:
-                recall_info = enhance_query_with_earring_recall(
-                    query_info["query_mask"],
-                    source_earring_detection_mask,
-                    source_hair_block_mask,
-                    weak_earring,
-                    visibility_mask=earring_valid_roi,
-                    recall_dilate=self.args.earring_query_recall_dilate,
-                    downward_shift=self.args.earring_query_downward_shift,
-                    lower_lobe_weight=self.args.earring_query_lower_lobe_weight,
-                    candidate_boost=self.args.earring_query_candidate_boost,
-                    block_protect=self.args.earring_query_block_protect,
-                )
-                query_info.update(recall_info)
-                source_hair_block_mask = recall_info["source_hair_block_mask"]
-            earring_search_mask = weak_earring["earring_search_mask"]
-            clean_source_earring_mask = weak_earring.get(
-                "source_earring_clean_mask",
-                torch.zeros_like(query_info["source_earring_mask"]),
+            earring_policy = build_dataset_earring_policy_masks(
+                query_info,
+                weak_earring,
+                source_parsing,
+                self.args,
             )
-            candidate_source_earring_mask = weak_earring.get(
-                "earring_candidate_mask",
-                torch.zeros_like(query_info["source_earring_mask"]),
+            source_hair_block_mask = query_info.get(
+                "source_hair_block_mask",
+                source_hair_block_mask,
             )
-            source_earring_mask = select_reference_earring_mask(
-                clean_source_earring_mask,
-                candidate_source_earring_mask,
-                query_info["left_ear_roi"],
-                query_info["right_ear_roi"],
-            )
+            earring_search_mask = earring_policy["earring_search_mask"]
+            source_earring_mask = earring_policy["earring_write_mask"]
+            active_earring_case = earring_policy["active"]
+            earring_valid_roi = earring_valid_roi * active_earring_case
 
             # Per-side visibility gating: replace pixel-wise multiply (which clips
             # the completed earring back to the thin shell) with a per-side scalar
@@ -535,7 +917,36 @@ class DatasetItemBatchBuilder:
                 max_horizontal_shift=max(1, self.args.earring_align_max_shift // 2),
                 reference_base=target_256,
             )
-            earring_confident_mask = align_info["earring_confident_mask"]
+            # Alignment can move a valid source object onto target hair. Re-run
+            # the narrow target gate after the shift so aligned supervision also
+            # obeys the target-hair overlap bound.
+            aligned_candidate = align_info["earring_confident_mask"] * active_earring_case
+            aligned_write = build_earring_write_mask(
+                aligned_candidate,
+                earring_valid_roi,
+                query_info["target_ear_hair_occlusion_mask"],
+                earring_policy["earlobe_anchor_mask"],
+                no_earring=earring_policy["no_earring_case_mask"],
+                parser_earring_mask=aligned_candidate,
+                trusted_earring_mask=aligned_candidate,
+                max_target_hair_overlap=self.args.earring_write_max_target_hair_overlap,
+                source_block_dilate=1,
+                write_dilate=1,
+                connectivity_iters=self.args.earring_write_connectivity_iters,
+                connectivity_kernel=self.args.earring_write_connectivity_kernel,
+                bridge_dilate=self.args.earring_write_bridge_dilate,
+            )
+            aligned_visible_segment = extract_visible_earring_segment(
+                aligned_candidate,
+                aligned_write,
+                earring_policy["earlobe_anchor_mask"],
+                connectivity_iters=self.args.earring_write_connectivity_iters,
+                connectivity_kernel=self.args.earring_write_connectivity_kernel,
+                bridge_dilate=self.args.earring_write_bridge_dilate,
+            )
+            earring_confident_mask = (
+                torch.minimum(aligned_write, aligned_visible_segment) * active_earring_case
+            ).clamp(0, 1)
             if earring_valid_roi is not None:
                 earring_valid_mask = resize_mask(earring_valid_roi, earring_confident_mask.shape[-2:])
                 earring_confident_mask = earring_confident_mask * earring_valid_mask
@@ -567,6 +978,10 @@ class DatasetItemBatchBuilder:
                     "shape_reference_path": shape_reference_paths[idx],
                     "color_reference_path": color_reference_paths[idx],
                     "target": target_256[idx].cpu(),
+                    # Keep both stages for reproducible validation previews.  The
+                    # training target is always the authoritative color stage.
+                    "color_before_pp": target_256[idx].cpu(),
+                    "target_deshadow": pre_reference_color_256[idx].cpu(),
                     "target_mask": target_mask[idx].cpu(),
                     "HT_E": target_hair_e[idx].cpu(),
                     "source_parsing": source_parsing[idx].cpu(),
@@ -575,9 +990,16 @@ class DatasetItemBatchBuilder:
                     "target_hair_mask": query_info["target_hair_mask"][idx].cpu(),
                     "source_hair_block_mask": source_hair_block_mask[idx].cpu(),
                     "source_earring_mask": source_earring_mask[idx].cpu(),
+                    "source_earring_object_mask": source_earring_mask[idx].cpu(),
+                    "source_earring_seed_mask": earring_policy["source_parser_earring_mask"][idx].cpu(),
                     "target_earring_mask": query_info["target_earring_mask"][idx].cpu(),
+                    "earring_reference": align_info["earring_reference"][idx].cpu(),
                     "query_mask": query_info["query_mask"][idx].cpu(),
                     "earring_search_mask": earring_search_mask[idx].cpu(),
+                    "earring_write_mask": source_earring_mask[idx].cpu(),
+                    "earring_visible_segment_mask": earring_policy["earring_visible_segment_mask"][idx].cpu(),
+                    "no_earring_case_mask": earring_policy["no_earring_case_mask"][idx].cpu(),
+                    "target_hair_ear_bridge_mask": earring_policy["target_hair_ear_bridge_mask"][idx].cpu(),
                     "ear_roi": query_info["ear_roi"][idx].cpu(),
                     "visible_ear_roi": visible_ear_roi[idx].cpu(),
                     "earring_valid_roi": earring_valid_roi[idx].cpu(),
@@ -593,7 +1015,7 @@ class DatasetItemBatchBuilder:
                     elif key == "earring_highlight_mask":
                         item[key] = earring_highlight_mask[idx].cpu()
                     elif key == "earring_candidate_mask":
-                        item[key] = weak_earring["earring_candidate_mask"][idx].cpu()
+                        item[key] = earring_policy["earring_candidate_mask"][idx].cpu()
                     else:
                         item[key] = revealed_info[key][idx].cpu()
                 dataset_items.append(item)
@@ -602,10 +1024,12 @@ class DatasetItemBatchBuilder:
 
             del batch
             del dataset_items
-            del source_full, target_full, source_256, target_256
+            del source_full, target_full, pre_reference_color_full
+            del source_256, target_256, pre_reference_color_256
             del source_hair_d, target_hair_d, target_hair_e, target_mask
             del source_parsing, target_parsing, query_info, cleanup_masks
-            del weak_earring, earring_search_mask, source_earring_mask, align_info, earring_confident_mask, earring_highlight_mask, revealed_info
+            del weak_earring, earring_policy, earring_search_mask, source_earring_mask
+            del align_info, earring_confident_mask, earring_highlight_mask, revealed_info
             if self.device == "cuda":
                 torch.cuda.empty_cache()
 
@@ -636,6 +1060,121 @@ def save_progress(output_dir, progress):
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(progress, handle, indent=2)
     os.replace(tmp, path)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _jsonable_config(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable_config(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_config(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def build_dataset_identity(args, model_args) -> dict[str, object]:
+    """Fingerprint the exact target distribution used by resumable PP data."""
+
+    repo_root = Path(__file__).resolve().parents[1]
+    code_hashes = {}
+    for relative in DATASET_POLICY_FILES:
+        path = repo_root / relative
+        if not path.exists():
+            raise FileNotFoundError(f"Cannot fingerprint PP policy file: {path}")
+        code_hashes[relative] = _sha256_file(path)
+
+    checkpoint_values = {
+        "stylegan": getattr(model_args, "ckpt", None),
+        "rotate": getattr(model_args, "rotate_checkpoint", None),
+        "blending": getattr(model_args, "blending_checkpoint", None),
+        "pp_v5": getattr(model_args, "pp_v5_checkpoint", None),
+        "satd_v8": (
+            getattr(model_args, "satd_checkpoint_v8", None)
+            if bool(getattr(model_args, "use_satd_v8", False))
+            else None
+        ),
+        "e4e": repo_root / "pretrained_models/encoder4editing/e4e_ffhq_encode.pt",
+    }
+    checkpoints = {}
+    for name, value in checkpoint_values.items():
+        if value in {None, ""}:
+            checkpoints[name] = None
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            path = repo_root / path
+        resolved = path.resolve()
+        checkpoints[name] = {
+            "path": str(resolved),
+            "sha256": _sha256_file(resolved) if resolved.exists() else None,
+        }
+
+    identity = {
+        "schema_version": DATASET_CONFIG_SCHEMA_VERSION,
+        "generator_args": _jsonable_config(vars(args)),
+        "model_policy": {
+            key: _jsonable_config(value)
+            for key, value in vars(model_args).items()
+            if key not in {
+                "save_all",
+                "save_all_dir",
+                "device",
+            }
+        },
+        "code_sha256": code_hashes,
+        "checkpoints": checkpoints,
+    }
+    encoded = json.dumps(identity, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    identity["identity_sha256"] = hashlib.sha256(encoded).hexdigest()
+    return identity
+
+
+def validate_pp_dataset_resume(args, model_args) -> None:
+    """Refuse to mix old PP parts with the new colour/mask distribution."""
+
+    output = Path(args.output)
+    config_path = output / "dataset_config.json"
+    identity = build_dataset_identity(args, model_args)
+    artifacts_exist = _progress_path(output).exists() or any(output.glob("pp_part_*.dataset"))
+
+    previous = None
+    if config_path.exists():
+        try:
+            with config_path.open("r", encoding="utf-8") as handle:
+                previous = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            if artifacts_exist:
+                raise RuntimeError(
+                    f"Cannot safely resume {output}: dataset_config.json is unreadable. "
+                    "Use a fresh output directory for the new PP distribution."
+                ) from error
+    elif artifacts_exist:
+        raise RuntimeError(
+            f"Cannot safely resume legacy PP data in {output}: dataset_config.json is missing. "
+            "The new color_before_pp distribution must be generated into a fresh directory."
+        )
+
+    if previous is not None and artifacts_exist:
+        if previous.get("identity_sha256") != identity["identity_sha256"]:
+            raise RuntimeError(
+                f"Cannot mix PP dataset policies in {output}: code, checkpoint, or generation "
+                "settings changed. Use a fresh output directory and regenerate all parts."
+            )
+
+    temporary = config_path.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(identity, handle, ensure_ascii=True, indent=2, sort_keys=True)
+    temporary.replace(config_path)
 
 
 def is_corrupt_image_error(error):
@@ -675,6 +1214,19 @@ def main(args):
     model_args.satd_blend_v8 = args.satd_blend_v8
     model_args.satd_boundary_v8 = args.satd_boundary_v8
     model_args.eq8_reference_blend_v8 = args.eq8_reference_blend_v8
+    model_args.satd_hair_exclude_strength = args.satd_hair_exclude_strength
+    model_args.target_hair_close_kernel = args.target_hair_close_kernel
+    model_args.target_hair_hole_max_area_ratio = args.target_hair_hole_max_area_ratio
+    model_args.target_hair_top_fill_only = args.target_hair_top_fill_only
+    model_args.target_hair_ear_bridge_radius = args.target_hair_ear_bridge_radius
+    model_args.hair_color_reference_strength_v8 = args.hair_color_reference_strength_v8
+    model_args.hair_color_low_frequency_radius_v8 = args.hair_color_low_frequency_radius_v8
+    model_args.hair_color_low_frequency_sigma_v8 = args.hair_color_low_frequency_sigma_v8
+    model_args.hair_color_feather_radius_v8 = args.hair_color_feather_radius_v8
+    model_args.hair_color_spatial_reference_weight_v8 = args.hair_color_spatial_reference_weight_v8
+    model_args.hair_color_detail_chroma_gain_v8 = args.hair_color_detail_chroma_gain_v8
+    model_args.disable_reference_dominant_hair_color_v8 = args.disable_reference_dominant_hair_color_v8
+    model_args.blend_chroma_correct_strength = args.blend_chroma_correct_strength
     model_args.ear_low_alpha = args.ear_low_alpha
     model_args.ear_dilate = args.ear_dilate
     model_args.hair_change_dilate = args.hair_change_dilate
@@ -692,16 +1244,27 @@ def main(args):
     model_args.earring_align_max_shift = args.earring_align_max_shift
     model_args.earring_fine_mask_floor = args.earring_fine_mask_floor
     model_args.earring_fine_mask_dilate = args.earring_fine_mask_dilate
-    model_args.earring_query_boost = 1.0
+    model_args.earring_query_boost = args.earring_query_boost
     model_args.enable_earring_query_recall = args.enable_earring_query_recall
     model_args.earring_query_recall_dilate = args.earring_query_recall_dilate
     model_args.earring_query_downward_shift = args.earring_query_downward_shift
     model_args.earring_query_lower_lobe_weight = args.earring_query_lower_lobe_weight
     model_args.earring_query_candidate_boost = args.earring_query_candidate_boost
     model_args.earring_query_block_protect = args.earring_query_block_protect
+    model_args.disable_earring_path_if_low_confidence = args.disable_earring_path_if_low_confidence
+    model_args.earring_source_presence_min_area = args.earring_source_presence_min_area
+    model_args.earring_search_downward_shift = args.earring_search_downward_shift
+    model_args.earring_search_dilate = args.earring_search_dilate
+    model_args.earring_write_max_target_hair_overlap = args.earring_write_max_target_hair_overlap
+    model_args.earring_write_source_block_dilate = args.earring_write_source_block_dilate
+    model_args.earring_write_dilate = args.earring_write_dilate
+    model_args.earring_write_connectivity_iters = args.earring_write_connectivity_iters
+    model_args.earring_write_connectivity_kernel = args.earring_write_connectivity_kernel
+    model_args.earring_write_bridge_dilate = args.earring_write_bridge_dilate
+    model_args.earring_anchor_visible_dilate = args.earring_anchor_visible_dilate
     model_args.ear_fine_support_dilate = 3
+    validate_pp_dataset_resume(args, model_args)
     hair_fast = HairFast(model_args)
-    hairfast_wo_pp(hair_fast)
     item_batch_builder = DatasetItemBatchBuilder(args)
 
     face_images = list_image_files(args.face_gallery_dir)
@@ -780,6 +1343,8 @@ def main(args):
                         args.face_gallery_dir / im1,
                         args.donor_gallery_dir / im2,
                         args.donor_gallery_dir / im3,
+                        return_stage="color_before_pp",
+                        stop_before_pp=True,
                     )
                 except Exception as error:  # noqa: BLE001 - skip bad images, keep going
                     if is_corrupt_image_error(error):
@@ -788,12 +1353,22 @@ def main(args):
                         print(f"[skip] corrupted image in triplet {im1}, {im2}, {im3}: {error}")
                         continue
                     raise
-                if isinstance(result, tuple):
-                    image, cleanup_masks = result
-                else:
-                    image, cleanup_masks = result, {}
+                (
+                    image,
+                    cleanup_masks,
+                    pre_reference_color,
+                    target_hair_mask,
+                ) = unpack_color_before_pp_stage(result)
                 item["cleanup_masks"] = cleanup_masks
+                if target_hair_mask is not None:
+                    item["target_hair_mask"] = target_hair_mask
                 save_image(image, os.path.join(temp_dir, item["target_name"]))
+                if torch.is_tensor(pre_reference_color):
+                    item["pre_reference_color_name"] = f"pre_{item['target_name']}"
+                    save_image(
+                        pre_reference_color,
+                        os.path.join(temp_dir, item["pre_reference_color_name"]),
+                    )
                 # Only successfully-rendered triplets go to the mask builder, so it
                 # never tries to load a target that was skipped.
                 rendered_experiments.append(item)

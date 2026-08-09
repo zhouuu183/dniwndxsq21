@@ -1,4 +1,4 @@
-import atexit
+﻿import atexit
 import gc
 import multiprocessing
 import os
@@ -24,7 +24,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from hair_swap_v8 import HairFast_v8, get_parser_v8
 from models.Encoders import ClipBlendingModel as BlendingModel
 from models.Net import Net
-from utils.hair_color_match_v8 import rgb_to_lab
+from models.SG_IDCT_v16 import rgb_to_lab
 from models.face_parsing.model import BiSeNet, seg_mean, seg_std
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import DilateErosion
@@ -54,16 +54,16 @@ def clean_zombies():
 USER_DATASET_PROFILE = "small"
 
 USER_DATASET_DIR_FFHQ = Path("input/blending_dataset_v8")
-USER_FACE_ROOT_FFHQ = Path("/root/shared-nvme/HairFastGAN/images/FFHQ/")
-USER_SHAPE_ROOT_FFHQ = Path("/root/shared-nvme/HairFastGAN/images/FFHQ/")
-USER_COLOR_ROOT_FFHQ = Path("/root/shared-nvme/HairFastGAN/images/FFHQ/")
-USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8")
+USER_FACE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_SHAPE_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_COLOR_ROOT_FFHQ = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ")
+USER_OUTPUT_DIR_FFHQ = Path("output/blending_train_v8_v2")
 USER_VAL_SIZE_FFHQ = 512
 
 USER_DATASET_DIR_SMALL = Path("input/blending_dataset_v8_small")
-USER_FACE_ROOT_SMALL = Path("/root/shared-nvme/HairFastGAN/images/mix_ear/")
-USER_SHAPE_ROOT_SMALL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ_color/")
-USER_COLOR_ROOT_SMALL = Path("/root/shared-nvme/HairFastGAN/images/ear/")
+USER_FACE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_long")
+USER_SHAPE_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short")
+USER_COLOR_ROOT_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_color")
 USER_OUTPUT_DIR_SMALL = Path("output/blending_train_v8_small_v2")
 USER_VAL_SIZE_SMALL = 64
 
@@ -99,7 +99,7 @@ USER_INIT_BLENDING_CKPT = "pretrained_models/Blending/checkpoint.pth"
 USER_FALLBACK_BLENDING_CKPT = "pretrained_models/Blending/checkpoint.pth"
 USER_CLIP_MODEL = "ViT-B/32"
 USER_USE_SATD_V8 = True
-USER_SATD_CHECKPOINT_V8 = "checkpoints/satd_3000_best.pth"
+USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/best.pth"
 USER_SATD_BLEND_V8 = 0.34
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
@@ -524,23 +524,6 @@ class MaskPrepHelper:
         return hair_mask_dilate, hair_mask_erode
 
 
-def exp_cache_files_exist(exp, dataset_dir: Path) -> bool:
-    """All npz cache files this exp loads must exist, else it is skipped.
-
-    Handles datasets where some triplets were skipped during generation (a
-    corrupted source image) or generation was interrupted, leaving dataset.exps
-    referencing npz files that were never written.
-    """
-    face_name, shape_name, color_name = exp
-    required = [
-        dataset_dir / "FS" / fs_cache_name("color", color_name),
-        dataset_dir / "FS" / fs_cache_name("face", face_name),
-        dataset_dir / "Align" / align_cache_name(face_name, "shape", shape_name),
-        dataset_dir / "Masks" / align_cache_name(face_name, "shape", shape_name),
-    ]
-    return all(path.exists() for path in required)
-
-
 def prepare_item(exp, dataset_dir: Path, face_root: Path, color_root: Path):
     face_name, shape_name, color_name = exp
 
@@ -575,46 +558,22 @@ class BlendingDatasetV8(Dataset):
         super().__init__()
         base_exps = [(p1, p2, p3) for (p1, p2, p3) in exps]
         if ACTIVE_SHAPE_ROOT.resolve() == ACTIVE_COLOR_ROOT.resolve():
-            all_exps = base_exps + [(p1, p3, p2) for (p1, p2, p3) in exps]
+            self.exps = base_exps + [(p1, p3, p2) for (p1, p2, p3) in exps]
         else:
-            all_exps = base_exps
+            self.exps = base_exps
         self.dataset_dir = dataset_dir
         self.face_root = face_root
         self.color_root = color_root
-
-        # Drop exps whose cache files are missing (triplets skipped during
-        # generation, or an interrupted generation run).  This prevents a hard
-        # crash mid-training on the first missing npz.
-        kept = [exp for exp in all_exps if exp_cache_files_exist(exp, dataset_dir)]
-        dropped = len(all_exps) - len(kept)
-        self.exps = kept
-        if dropped:
-            print(
-                f"dataset pairs: {len(self.exps)} (dropped {dropped} with missing cache files)",
-                file=sys.stderr,
-            )
-        else:
-            print(f"dataset pairs: {len(self.exps)}", file=sys.stderr)
-        if not self.exps:
-            raise RuntimeError(
-                "No blending items with complete cache files. Re-run blending_gen_v8.py "
-                "to (re)generate the dataset."
-            )
+        print(f"dataset pairs: {len(self.exps)}", file=sys.stderr)
 
     def __len__(self):
         return len(self.exps)
 
     def __getitem__(self, idx):
-        # Fallback scan: if an item fails to load at runtime (e.g. a corrupted
-        # source image that slipped past the file-existence pre-filter), skip to
-        # the next valid item instead of crashing the whole training run.
-        count = len(self.exps)
-        for offset in range(count):
-            probe = (idx + offset) % count
-            item = prepare_item(self.exps[probe], self.dataset_dir, self.face_root, self.color_root)
-            if item is not None:
-                return item
-        raise RuntimeError("No valid blending items available in the dataset.")
+        item = prepare_item(self.exps[idx], self.dataset_dir, self.face_root, self.color_root)
+        if item is None:
+            raise RuntimeError(f"Failed to prepare blending item at index {idx}")
+        return item
 
 
 class BlendingTrainerV8:

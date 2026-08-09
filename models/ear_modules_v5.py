@@ -309,7 +309,7 @@ def enhance_query_with_earring_recall(
     *,
     visibility_mask: torch.Tensor | None = None,
     recall_dilate: int = 7,
-    downward_shift: int = 18,
+    downward_shift: int = 10,
     lower_lobe_weight: float = 0.20,
     candidate_boost: float = 0.90,
     block_protect: float = 0.85,
@@ -406,6 +406,267 @@ def build_earring_highlight_mask(
     color_candidate = _masked_threshold_candidate(color_spread, highlight_support, max_ratio=0.50, std_ratio=1.00)
     highlight = bright_candidate * torch.clamp(high_candidate + color_candidate + earring_mask, 0, 1)
     return (dilate_mask(highlight, 3) * highlight_support).clamp(0, 1)
+
+
+def _batch_gate(
+    value: bool | float | torch.Tensor,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Return a ``(B, 1, 1, 1)`` gate for a bool/scalar/batch mask.
+
+    Earring presence is decided independently for the two sides.  A few old
+    call sites pass a scalar while newer debug/training code passes a spatial
+    mask, so keeping this conversion in one place prevents accidental
+    broadcasting across samples or sides.
+    """
+
+    reference = ensure_mask_4d(reference).float()
+    batch = reference.size(0)
+    if not torch.is_tensor(value):
+        return torch.full(
+            (batch, 1, 1, 1),
+            float(value),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+
+    value = value.to(device=reference.device, dtype=reference.dtype)
+    if value.ndim == 0:
+        return value.reshape(1, 1, 1, 1).expand(batch, 1, 1, 1)
+    if value.ndim == 1:
+        if value.numel() == 1:
+            return value.reshape(1, 1, 1, 1).expand(batch, 1, 1, 1)
+        if value.numel() == batch:
+            return value.reshape(batch, 1, 1, 1)
+    if value.ndim == 2 and value.size(0) == batch:
+        return value.flatten(1).amax(dim=1).view(batch, 1, 1, 1)
+    value = ensure_mask_4d(value)
+    if value.size(0) != batch:
+        if value.size(0) == 1:
+            value = value.expand(batch, -1, -1, -1)
+        else:
+            raise ValueError("batch gate and reference batch sizes do not match")
+    return value.flatten(1).amax(dim=1).view(batch, 1, 1, 1)
+
+
+def _resize_like_mask(mask: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor:
+    """Resize an optional mask to ``reference`` while preserving its device."""
+
+    reference = ensure_mask_4d(reference).float()
+    if mask is None:
+        return torch.zeros_like(reference)
+    return resize_mask(mask.to(device=reference.device), reference.shape[-2:])
+
+
+def extract_visible_earring_segment(
+    source_earring_mask: torch.Tensor,
+    write_mask: torch.Tensor,
+    connectivity_anchor: torch.Tensor,
+    *,
+    connectivity_iters: int = 32,
+    connectivity_kernel: int = 5,
+    bridge_dilate: int = 5,
+    threshold: float = 1e-4,
+) -> torch.Tensor:
+    """Keep only the earring pixels connected to a visible ear-lobe anchor.
+
+    ``source_earring_mask`` is the source/object evidence and ``write_mask`` is
+    the (already narrow) target write gate.  The old implementation grew a
+    solid channel below the lobe; a hoop's hollow centre and the background in
+    that channel were consequently copied back as if they were an earring.
+    Here growth is performed *on the candidate pixels only*.  A small bridge
+    dilation handles parser gaps between the lobe and a thin wire, while
+    disconnected background islands are never reached.
+    """
+
+    source_earring_mask = ensure_mask_4d(source_earring_mask).float()
+    write_mask = _resize_like_mask(write_mask, source_earring_mask)
+    connectivity_anchor = _resize_like_mask(connectivity_anchor, source_earring_mask)
+
+    candidate = (source_earring_mask * write_mask).clamp(0, 1)
+    candidate_binary = (candidate > float(threshold)).float()
+    if candidate_binary.numel() == 0:
+        return candidate
+
+    # Bridge only a small parser gap.  The guide remains the candidate itself,
+    # so dilation cannot flood the hoop interior or source background.
+    guide = dilate_mask(candidate_binary, max(1, int(bridge_dilate)))
+    seed = dilate_mask(connectivity_anchor, max(1, int(bridge_dilate))) * guide
+    reachable = seed.clamp(0, 1)
+    for _ in range(max(0, int(connectivity_iters))):
+        nxt = (dilate_mask(reachable, max(1, int(connectivity_kernel))) * guide).clamp(0, 1)
+        reachable = torch.maximum(reachable, nxt)
+    # Keep the actual candidate values (rather than a binary mask) for smooth
+    # blending, but require a path to the visible lobe.
+    return (candidate * reachable).clamp(0, 1)
+
+
+def build_earring_search_mask(
+    parser_earring_mask: torch.Tensor | None,
+    visible_ear_roi: torch.Tensor,
+    online_candidate_mask: torch.Tensor | None = None,
+    weak_recall_mask: torch.Tensor | None = None,
+    lobe_search_mask: torch.Tensor | None = None,
+    *,
+    downward_shift: int = 10,
+    search_dilate: int = 7,
+    no_earring: bool | float | torch.Tensor = False,
+) -> torch.Tensor:
+    """Build the broad *search* region used to find an earring.
+
+    Search is intentionally permissive (parser evidence, online/weak
+    candidates, the lobe neighbourhood and a downward offset).  It is not a
+    write permission.  The final gate is :func:`build_earring_write_mask`.
+    This separation lets long earrings be detected without copying the
+    background around them.
+    """
+
+    visible_ear_roi = ensure_mask_4d(visible_ear_roi).float()
+    parser_earring_mask = _resize_like_mask(parser_earring_mask, visible_ear_roi)
+    online_candidate_mask = _resize_like_mask(online_candidate_mask, visible_ear_roi)
+    weak_recall_mask = _resize_like_mask(weak_recall_mask, visible_ear_roi)
+    lobe_search_mask = _resize_like_mask(lobe_search_mask, visible_ear_roi)
+
+    object_seed = torch.clamp(
+        parser_earring_mask + online_candidate_mask + weak_recall_mask,
+        0,
+        1,
+    )
+    search = dilate_mask(object_seed, max(1, int(search_dilate)))
+    if int(downward_shift) != 0:
+        search = torch.clamp(search + shift_mask(search, down=int(downward_shift)), 0, 1)
+    # Lobe support is useful for tiny studs and for parser gaps, but remains a
+    # search hint only.  It cannot become a write mask by itself.
+    search = torch.clamp(search + lobe_search_mask, 0, 1) * visible_ear_roi
+    active = (1.0 - _batch_gate(no_earring, visible_ear_roi)).clamp(0, 1)
+    return (search * active).clamp(0, 1)
+
+
+def build_earring_write_mask(
+    confident_earring_mask: torch.Tensor,
+    visible_ear_roi: torch.Tensor,
+    target_hair_occlusion_mask: torch.Tensor,
+    earlobe_anchor_mask: torch.Tensor,
+    no_earring: bool | float | torch.Tensor = False,
+    *,
+    source_background_mask: torch.Tensor | None = None,
+    source_hair_mask: torch.Tensor | None = None,
+    source_hair_block_mask: torch.Tensor | None = None,
+    source_semantic_block_mask: torch.Tensor | None = None,
+    parser_earring_mask: torch.Tensor | None = None,
+    trusted_earring_mask: torch.Tensor | None = None,
+    max_target_hair_overlap: float = 0.30,
+    source_block_dilate: int = 3,
+    write_dilate: int = 3,
+    connectivity_iters: int = 32,
+    connectivity_kernel: int = 5,
+    bridge_dilate: int = 5,
+) -> torch.Tensor:
+    """Build the narrow, final earring write-back mask.
+
+    The mask is the intersection of confident object evidence, a visible ear
+    ROI and a connected lobe-to-earring path.  Source background/hair are hard
+    blockers (parser-confirmed or otherwise trusted object pixels are retained),
+    and target hair can only be crossed by a small, area-capped fraction of the
+    object.  A
+    side with no reliable earring is a hard zero, never a weakly attenuated
+    ear-lobe box.
+    """
+
+    confident_earring_mask = ensure_mask_4d(confident_earring_mask).float()
+    visible_ear_roi = _resize_like_mask(visible_ear_roi, confident_earring_mask)
+    target_hair_occlusion_mask = _resize_like_mask(target_hair_occlusion_mask, confident_earring_mask)
+    earlobe_anchor_mask = _resize_like_mask(earlobe_anchor_mask, confident_earring_mask)
+    source_background_mask = _resize_like_mask(source_background_mask, confident_earring_mask)
+    source_hair_mask = _resize_like_mask(source_hair_mask, confident_earring_mask)
+    source_hair_block_mask = _resize_like_mask(source_hair_block_mask, confident_earring_mask)
+    source_semantic_block_mask = _resize_like_mask(
+        source_semantic_block_mask,
+        confident_earring_mask,
+    )
+    parser_earring_mask = (
+        confident_earring_mask
+        if parser_earring_mask is None
+        else _resize_like_mask(parser_earring_mask, confident_earring_mask)
+    )
+    trusted_earring_mask = _resize_like_mask(trusted_earring_mask, confident_earring_mask)
+
+    # One-pixel-ish margin catches a parser's antialiased earring edge without
+    # recreating the former solid channel.  ``write_dilate=1`` is also valid.
+    if int(write_dilate) > 1:
+        object_evidence = dilate_mask(confident_earring_mask, int(write_dilate))
+    else:
+        object_evidence = confident_earring_mask.clamp(0, 1)
+    candidate = object_evidence * visible_ear_roi
+
+    # Source hair/background are never valid source pixels.  A parser-confirmed
+    # label-9 earring wins over hair under-segmentation, but only at those exact
+    # pixels; surrounding source content remains blocked.
+    source_block = torch.clamp(
+        source_background_mask
+        + source_hair_mask
+        + source_hair_block_mask
+        + source_semantic_block_mask,
+        0,
+        1,
+    )
+    if int(source_block_dilate) > 1:
+        source_block = dilate_mask(source_block, int(source_block_dilate))
+    trusted_keep = (
+        (parser_earring_mask > 0.5).float()
+        + (trusted_earring_mask > 0.5).float()
+    ).clamp(0, 1)
+    source_gate = (1.0 - source_block * (1.0 - trusted_keep)).clamp(0, 1)
+    candidate = candidate * source_gate
+
+    target_hair_occlusion_mask = target_hair_occlusion_mask.clamp(0, 1)
+    non_hair = candidate * (1.0 - target_hair_occlusion_mask)
+    hair_part = candidate * target_hair_occlusion_mask
+    # Hair-overlap pixels must touch a visible object/lobe; this prevents a
+    # broad target hair component from admitting an entire hidden earring.
+    overlap_support = dilate_mask(
+        torch.clamp(non_hair + earlobe_anchor_mask, 0, 1),
+        max(1, int(bridge_dilate)),
+    )
+    hair_part = hair_part * overlap_support
+
+    # Cap the target-hair fraction by area.  Unlike a scalar attenuation this
+    # preserves all visible pixels and only trims the hidden tail.
+    max_overlap = max(0.0, min(0.95, float(max_target_hair_overlap)))
+    non_hair_area = non_hair.flatten(1).sum(dim=1, keepdim=True)
+    hair_area = hair_part.flatten(1).sum(dim=1, keepdim=True)
+    allowed_hair = (max_overlap / max(1.0 - max_overlap, 1e-6)) * non_hair_area
+    hair_scale = torch.where(
+        hair_area > 1e-6,
+        torch.minimum(torch.ones_like(hair_area), allowed_hair / hair_area.clamp_min(1e-6)),
+        torch.zeros_like(hair_area),
+    ).view(-1, 1, 1, 1)
+    candidate = (non_hair + hair_part * hair_scale).clamp(0, 1)
+
+    connected = extract_visible_earring_segment(
+        confident_earring_mask,
+        candidate,
+        earlobe_anchor_mask,
+        connectivity_iters=connectivity_iters,
+        connectivity_kernel=connectivity_kernel,
+        bridge_dilate=bridge_dilate,
+    )
+
+    # Connectivity can remove some visible pixels; re-cap once more so the
+    # final mask always satisfies the advertised target-hair overlap bound.
+    connected_hair = connected * target_hair_occlusion_mask
+    connected_non_hair = connected * (1.0 - target_hair_occlusion_mask)
+    nh_area = connected_non_hair.flatten(1).sum(dim=1, keepdim=True)
+    h_area = connected_hair.flatten(1).sum(dim=1, keepdim=True)
+    allowed = (max_overlap / max(1.0 - max_overlap, 1e-6)) * nh_area
+    scale = torch.where(
+        h_area > 1e-6,
+        torch.minimum(torch.ones_like(h_area), allowed / h_area.clamp_min(1e-6)),
+        torch.zeros_like(h_area),
+    ).view(-1, 1, 1, 1)
+    connected = (connected_non_hair + connected_hair * scale).clamp(0, 1)
+    active = (1.0 - _batch_gate(no_earring, connected)).clamp(0, 1)
+    return (connected * active).clamp(0, 1)
 
 
 def select_reference_earring_mask(
@@ -933,11 +1194,11 @@ class EarAnchoredQueryBuilder(nn.Module):
         downward_shift: int = 10,
         target_hair_dilate: int = 11,
         earring_occlusion_dilate: int = 3,
-        source_hair_block_dilate: int = 5,
+        source_hair_block_dilate: int = 8,
         source_hair_block_strength: float = 0.95,
         target_visibility_expand: int = 5,
-        max_target_hair_overlap: float = 0.55,
-        min_target_visible_overlap: float = 0.02,
+        max_target_hair_overlap: float = 0.30,
+        min_target_visible_overlap: float = 0.10,
         min_target_ear_area: float = 8.0,
         earring_channel_down: int = 32,
         earring_align_max_shift: int = 12,

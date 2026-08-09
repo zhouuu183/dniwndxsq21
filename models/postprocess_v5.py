@@ -24,12 +24,15 @@ from models.ear_modules_v5 import (
     FaceParsingHelperV5,
     HFDAGatedInjectionUnit,
     ShadowSuppressedHFExtractor,
+    build_earring_search_mask,
+    build_earring_write_mask,
     build_revealed_skin_mask,
     build_weak_earring_masks,
     dilate_mask,
     enhance_query_with_earring_recall,
     ensure_mask_4d,
     erode_mask,
+    extract_visible_earring_segment,
     gaussian_blur,
     high_pass_filter,
     low_pass_filter,
@@ -57,6 +60,46 @@ def build_query_builder_compat(**kwargs) -> EarAnchoredQueryBuilder:
     accepted = inspect.signature(EarAnchoredQueryBuilder.__init__).parameters
     filtered_kwargs = {key: value for key, value in kwargs.items() if key in accepted}
     return EarAnchoredQueryBuilder(**filtered_kwargs)
+
+
+def build_lower_face_skin_reference_mask(
+    face_skin_mask: torch.Tensor,
+    revealed_skin_mask: torch.Tensor,
+    *,
+    hair_mask: torch.Tensor | None = None,
+    detail_mask: torch.Tensor | None = None,
+    earring_mask: torch.Tensor | None = None,
+    lower_start_ratio: float = 0.46,
+) -> torch.Tensor:
+    """Select real lower-face skin as the forehead tone fallback.
+
+    The fallback is deliberately geometric only after semantic exclusions: it
+    starts below the revealed-forehead band, removes hair/facial features/ear
+    accessories and erodes the remainder away from parser boundaries.  It is
+    therefore safe when local forehead reference pixels were hidden by bangs.
+    """
+    face = ensure_mask_4d(face_skin_mask).float().clamp(0, 1)
+    revealed = resize_mask(revealed_skin_mask, face.shape[-2:]).clamp(0, 1)
+    height, width = face.shape[-2:]
+    y = torch.arange(height, device=face.device, dtype=face.dtype).view(1, 1, height, 1)
+    base_start = int(round(max(0.0, min(0.85, float(lower_start_ratio))) * height))
+
+    # Move the start below the actual revealed band per sample, but cap it so a
+    # noisy mask cannot discard the entire cheek/chin reference.
+    rows = (revealed > 0.05).amax(dim=3).float()
+    row_ids = torch.arange(height, device=face.device, dtype=face.dtype).view(1, 1, height)
+    last_revealed = (rows * row_ids).amax(dim=2, keepdim=True).view(-1, 1, 1, 1)
+    start = torch.maximum(
+        torch.full_like(last_revealed, float(base_start)),
+        last_revealed + 3.0,
+    ).clamp(max=float(int(0.70 * height)))
+    lower = (y >= start).to(face.dtype).expand(-1, -1, -1, width)
+
+    safe = face * lower * (1.0 - dilate_mask(revealed, 5)).clamp(0, 1)
+    for mask, dilation in ((hair_mask, 5), (detail_mask, 3), (earring_mask, 5)):
+        if mask is not None:
+            safe = safe * (1.0 - dilate_mask(resize_mask(mask, face.shape[-2:]), dilation)).clamp(0, 1)
+    return erode_mask(safe, 3).clamp(0, 1)
 
 
 class PostProcessModelV5(nn.Module):
@@ -102,11 +145,11 @@ class PostProcessModelV5(nn.Module):
             downward_shift=getattr(self.args, "ear_downward_shift", 10),
             target_hair_dilate=getattr(self.args, "target_hair_dilate", 11),
             earring_occlusion_dilate=getattr(self.args, "earring_occlusion_dilate", 3),
-            source_hair_block_dilate=getattr(self.args, "source_hair_block_dilate", 5),
-            source_hair_block_strength=getattr(self.args, "source_hair_block_strength", 0.6),
+            source_hair_block_dilate=getattr(self.args, "source_hair_block_dilate", 8),
+            source_hair_block_strength=getattr(self.args, "source_hair_block_strength", 0.95),
             target_visibility_expand=getattr(self.args, "target_visibility_expand", 5),
-            max_target_hair_overlap=getattr(self.args, "max_target_hair_overlap", 0.55),
-            min_target_visible_overlap=getattr(self.args, "min_target_visible_overlap", 0.02),
+            max_target_hair_overlap=getattr(self.args, "max_target_hair_overlap", 0.30),
+            min_target_visible_overlap=getattr(self.args, "min_target_visible_overlap", 0.10),
             min_target_ear_area=getattr(self.args, "min_target_ear_area", 8.0),
             earring_channel_down=getattr(self.args, "earring_channel_down", 32),
             earring_align_max_shift=getattr(self.args, "earring_align_max_shift", 12),
@@ -159,6 +202,289 @@ class PostProcessModelV5(nn.Module):
             print(result.unexpected_keys[:20])
         return result
 
+    @staticmethod
+    def _mask_like(mask: torch.Tensor | None, reference: torch.Tensor) -> torch.Tensor:
+        reference = ensure_mask_4d(reference).float()
+        if mask is None:
+            return torch.zeros_like(reference)
+        return resize_mask(
+            ensure_mask_4d(mask).to(device=reference.device, dtype=reference.dtype),
+            reference.shape[-2:],
+        )
+
+    def _source_earring_case_masks(
+        self,
+        source_parsing: torch.Tensor,
+        query_info: dict[str, torch.Tensor],
+        reference: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return parser evidence and a spatial no-earring gate per sample.
+
+        Weak image features are deliberately not allowed to create an earring
+        case.  On a source without an earring those features frequently fire on
+        ear edges, hair or the background; treating them as presence is exactly
+        what opened the old empty channel below the ear.  Parser evidence and
+        explicit caller-provided object masks are the only presence authority.
+        """
+
+        reference = ensure_mask_4d(reference).float()
+        parsing = ensure_mask_4d(source_parsing).to(device=reference.device)
+        if parsing.shape[-2:] != reference.shape[-2:]:
+            parsing = F.interpolate(parsing.float(), size=reference.shape[-2:], mode="nearest")
+        parser_earring = (parsing.long() == RAW_EARRING).to(dtype=reference.dtype)
+
+        # Detection/query masks are deliberately excluded from presence
+        # detection.  They are search proposals and often fire on ear edges,
+        # short-hair background, or shadows.  Only parser label-9 and explicit
+        # object masks can enable the earring branch; otherwise a source with
+        # no earring must remain a hard no-op.
+        evidence = parser_earring
+        for key in (
+            "source_earring_explicit_mask",
+            "source_earring_object_mask",
+        ):
+            value = query_info.get(key)
+            if value is not None:
+                evidence = torch.clamp(evidence + self._mask_like(value, reference), 0, 1)
+
+        height, width = reference.shape[-2:]
+        area_scale = float(height * width) / float(256 * 256)
+        configured_min_area = getattr(self.args, "earring_source_presence_min_area", None)
+        if configured_min_area is None:
+            # Four 256-space pixels is still small enough for a stud, but avoids
+            # letting one or two noisy parser pixels activate the whole branch.
+            configured_min_area = max(
+                4.0,
+                float(getattr(self.args, "earring_min_source_parser_area", 0.5)),
+            )
+        min_area = max(0.0, float(configured_min_area) * area_scale)
+        if bool(getattr(self.args, "disable_earring_path_if_low_confidence", True)):
+            present = evidence.flatten(1).sum(dim=1) >= min_area
+        else:
+            present = evidence.flatten(1).amax(dim=1) > 0
+        no_earring = (~present).to(dtype=reference.dtype).view(-1, 1, 1, 1)
+        no_earring = no_earring.expand_as(reference)
+        return parser_earring.clamp(0, 1), no_earring
+
+    def _finalize_earring_masks(
+        self,
+        query_info: dict[str, torch.Tensor],
+        source_parsing: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Turn broad earring recall into a narrow, target-safe write mask."""
+
+        reference = ensure_mask_4d(query_info["query_mask"]).float()
+        parser_earring, no_earring = self._source_earring_case_masks(
+            source_parsing,
+            query_info,
+            reference,
+        )
+        active = (1.0 - no_earring).clamp(0, 1)
+        query_info["source_parser_earring_mask"] = parser_earring
+        query_info["no_earring_case_mask"] = no_earring
+        query_info["no_earring_case"] = no_earring
+
+        # Search may be wide enough to find an under-segmented dangling object,
+        # but it never grants permission to write source pixels into target hair.
+        earring_roi = query_info.get(
+            "earring_valid_roi",
+            query_info.get("visible_ear_roi", query_info.get("ear_roi", reference)),
+        )
+        earring_roi = self._mask_like(earring_roi, reference)
+        online_candidate = query_info.get(
+            "online_earring_candidate_mask",
+            query_info.get("earring_candidate_mask"),
+        )
+        search_mask = build_earring_search_mask(
+            parser_earring,
+            earring_roi,
+            online_candidate_mask=online_candidate,
+            weak_recall_mask=query_info.get("earring_query_recall_mask"),
+            lobe_search_mask=query_info.get("source_lobe_search_mask"),
+            downward_shift=int(getattr(self.args, "earring_search_downward_shift", 10)),
+            search_dilate=int(getattr(self.args, "earring_search_dilate", 7)),
+            no_earring=no_earring,
+        )
+        search_mask = (search_mask * active).clamp(0, 1)
+
+        confident = torch.zeros_like(reference)
+        trusted_object = parser_earring.clone()
+        for key in (
+            "source_earring_explicit_mask",
+            "source_earring_object_mask",
+            "online_earring_candidate_mask",
+        ):
+            value = query_info.get(key)
+            if value is not None:
+                value = self._mask_like(value, reference)
+                confident = torch.clamp(confident + value, 0, 1)
+                # Only object-core evidence can override a non-earring parser
+                # label.  Broad search/recall masks are deliberately excluded.
+                trusted_object = torch.clamp(trusted_object + value, 0, 1)
+        confident = torch.clamp(confident + parser_earring, 0, 1) * search_mask * active
+
+        target_hair_occlusion = query_info.get("target_ear_hair_occlusion_mask")
+        if target_hair_occlusion is None:
+            target_hair = self._mask_like(query_info.get("target_hair_mask"), reference)
+            ear_roi = self._mask_like(query_info.get("ear_roi"), reference)
+            target_hair_occlusion = target_hair * ear_roi
+        else:
+            target_hair_occlusion = self._mask_like(target_hair_occlusion, reference)
+
+        # Decide visibility per ear side before constructing the write mask.
+        # A target ear covered by the transferred hairstyle must not receive a
+        # partial earring, because even a few copied background pixels create
+        # the reported hole below the ear.  A side remains active only when a
+        # meaningful fraction of its parser ear is genuinely exposed.
+        min_visible_overlap = float(
+            getattr(self.args, "min_target_visible_overlap", 0.10)
+        )
+        min_visible_area = float(getattr(self.args, "min_target_ear_area", 8.0))
+        left_roi = self._mask_like(query_info.get("left_ear_roi"), reference)
+        right_roi = self._mask_like(query_info.get("right_ear_roi"), reference)
+        left_ear = self._mask_like(query_info.get("target_left_ear_mask"), reference) * left_roi
+        right_ear = self._mask_like(query_info.get("target_right_ear_mask"), reference) * right_roi
+
+        def side_visible_gate(side_ear: torch.Tensor, side_roi: torch.Tensor) -> torch.Tensor:
+            exposed = side_ear * (1.0 - target_hair_occlusion).clamp(0, 1)
+            ear_area = side_ear.flatten(1).sum(dim=1)
+            exposed_area = exposed.flatten(1).sum(dim=1)
+            roi_area = side_roi.flatten(1).sum(dim=1)
+            ratio = exposed_area / ear_area.clamp_min(1e-6)
+            active_side = (
+                (ear_area >= min_visible_area)
+                & (exposed_area >= min_visible_area)
+                & (ratio >= min_visible_overlap)
+            ).to(reference.dtype)
+            # If the parser has no ear pixels, do not infer visibility from a
+            # broad geometric ROI.
+            active_side = active_side * (roi_area > 0).to(reference.dtype)
+            return active_side.view(-1, 1, 1, 1)
+
+        left_active = side_visible_gate(left_ear, left_roi)
+        right_active = side_visible_gate(right_ear, right_roi)
+        side_gate = torch.clamp(left_active * left_roi + right_active * right_roi, 0, 1)
+        earring_roi = earring_roi * side_gate
+
+        earlobe_anchor = torch.clamp(
+            self._mask_like(query_info.get("target_left_ear_mask"), reference)
+            + self._mask_like(query_info.get("target_right_ear_mask"), reference),
+            0,
+            1,
+        )
+        truly_visible = self._mask_like(query_info.get("visible_ear_roi"), reference)
+        anchor_dilate = int(getattr(self.args, "earring_anchor_visible_dilate", 3))
+        if anchor_dilate > 1:
+            truly_visible = dilate_mask(truly_visible, anchor_dilate)
+        earlobe_anchor = (
+            earlobe_anchor
+            * truly_visible
+            * (1.0 - target_hair_occlusion).clamp(0, 1)
+            * active
+        ).clamp(0, 1)
+
+        source_labels = ensure_mask_4d(source_parsing).to(device=reference.device)
+        if source_labels.shape[-2:] != reference.shape[-2:]:
+            source_labels = F.interpolate(
+                source_labels.float(),
+                size=reference.shape[-2:],
+                mode="nearest",
+            )
+        source_background = (source_labels.long() == 0).to(dtype=reference.dtype)
+        source_non_earring_semantic = (
+            source_labels.long() != RAW_EARRING
+        ).to(dtype=reference.dtype)
+        source_hair = query_info.get("source_hair_mask")
+        if source_hair is None:
+            source_hair = (source_labels.long() == RAW_HAIR).to(dtype=reference.dtype)
+
+        connectivity_iters = int(getattr(self.args, "earring_write_connectivity_iters", 32))
+        connectivity_kernel = int(getattr(self.args, "earring_write_connectivity_kernel", 5))
+        bridge_dilate = int(getattr(self.args, "earring_write_bridge_dilate", 5))
+        write_mask = build_earring_write_mask(
+            confident,
+            earring_roi,
+            target_hair_occlusion,
+            earlobe_anchor,
+            no_earring=no_earring,
+            source_background_mask=source_background,
+            source_hair_mask=source_hair,
+            source_hair_block_mask=query_info.get("source_hair_block_mask"),
+            source_semantic_block_mask=source_non_earring_semantic,
+            parser_earring_mask=parser_earring,
+            trusted_earring_mask=trusted_object,
+            max_target_hair_overlap=float(
+                getattr(self.args, "earring_write_max_target_hair_overlap", 0.30)
+            ),
+            source_block_dilate=int(getattr(self.args, "earring_write_source_block_dilate", 3)),
+            write_dilate=int(getattr(self.args, "earring_write_dilate", 3)),
+            connectivity_iters=connectivity_iters,
+            connectivity_kernel=connectivity_kernel,
+            bridge_dilate=bridge_dilate,
+        )
+        visible_segment = extract_visible_earring_segment(
+            confident,
+            write_mask,
+            earlobe_anchor,
+            connectivity_iters=connectivity_iters,
+            connectivity_kernel=connectivity_kernel,
+            bridge_dilate=bridge_dilate,
+        )
+        write_mask = (torch.minimum(write_mask, visible_segment) * active).clamp(0, 1)
+        # Hair beside/below the ear that is *not* occupied by a verified earring
+        # remains protected.  This debug/constraint mask is the complement of
+        # write permission inside the target-hair occlusion, not the overlap.
+        target_hair_bridge = (
+            target_hair_occlusion * (1.0 - write_mask).clamp(0, 1)
+        ).clamp(0, 1)
+
+        # The ordinary ear/face detail query remains intact.  Only its broad
+        # earring-search extension is added here; all write-facing masks below
+        # use the connected segment instead.
+        search_weight = max(0.0, float(getattr(self.args, "earring_query_boost", 1.0)))
+        query_info["query_mask"] = torch.clamp(reference + search_weight * search_mask, 0, 1)
+        query_info["earring_search_mask"] = search_mask
+        query_info["earring_write_mask"] = write_mask
+        query_info["earring_visible_segment_mask"] = visible_segment * active
+        query_info["target_hair_ear_bridge_mask"] = target_hair_bridge
+
+        # Earring supervision/injection must consume the write mask.  Detection
+        # candidates stay available under their explicit debug keys, but cannot
+        # punch a hole in target hair or activate an absent-source sample.
+        query_info["source_earring_mask"] = write_mask
+        query_info["earring_confident_mask"] = write_mask
+        highlight = query_info.get("earring_highlight_mask")
+        if highlight is not None:
+            query_info["earring_highlight_mask"] = self._mask_like(highlight, reference) * write_mask
+
+        for key in (
+            "source_earring_detection_mask",
+            "source_earring_object_mask",
+            "earring_candidate_mask",
+            "online_earring_candidate_mask",
+            "online_earring_search_mask",
+            "earring_query_recall_mask",
+            "earring_object_recall_mask",
+            "earring_object_detection_mask",
+            "earring_recall_lobe_support",
+            "earring_recall_block_protect_mask",
+        ):
+            value = query_info.get(key)
+            if value is not None:
+                query_info[key] = self._mask_like(value, reference) * active
+
+        query_info["earring_visibility_mask"] = earring_roi * active
+        query_info["earring_valid_roi"] = earring_roi * active
+        for key in ("left_earring_valid_roi", "right_earring_valid_roi"):
+            value = query_info.get(key)
+            if value is not None:
+                query_info[key] = self._mask_like(value, reference) * active
+        presence_target = query_info.get("presence_target")
+        if presence_target is not None:
+            sample_active = active.flatten(1).amax(dim=1, keepdim=True)
+            query_info["presence_target"] = presence_target * sample_active
+        return query_info
+
     def _enhance_query_recall(
         self,
         source_01: torch.Tensor,
@@ -166,14 +492,49 @@ class PostProcessModelV5(nn.Module):
         query_info: dict[str, torch.Tensor],
         target_01: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
+        query_mask = ensure_mask_4d(query_info["query_mask"]).float()
+        parser_earring, no_earring = self._source_earring_case_masks(
+            source_parsing,
+            query_info,
+            query_mask,
+        )
+        active = (1.0 - no_earring).clamp(0, 1)
+        query_info["source_parser_earring_mask"] = parser_earring
+        query_info["no_earring_case_mask"] = no_earring
+        query_info["no_earring_case"] = no_earring
+
+        # A source with no parser/explicit earring evidence must never enter the
+        # weak visual-recall branch: ear edges and short-hair background are
+        # strong false positives and were the main cause of lower-ear holes.
+        if float(active.detach().amax().item()) <= 0:
+            zero = torch.zeros_like(query_mask)
+            for key in (
+                "earring_search_mask",
+                "earring_write_mask",
+                "earring_visible_segment_mask",
+                "target_hair_ear_bridge_mask",
+                "source_earring_mask",
+                "earring_confident_mask",
+                "earring_candidate_mask",
+                "online_earring_candidate_mask",
+                "online_earring_search_mask",
+                "earring_query_recall_mask",
+                "earring_object_recall_mask",
+                "earring_object_detection_mask",
+            ):
+                query_info[key] = zero
+            return query_info
+
         if not bool(getattr(self.args, "enable_earring_query_recall", True)):
             return query_info
 
-        query_mask = ensure_mask_4d(query_info["query_mask"]).float()
         visible_ear_roi = query_info.get("visible_ear_roi", query_info.get("ear_roi", query_mask))
         earring_valid_roi = query_info.get("earring_valid_roi", visible_ear_roi)
         detection_ear_roi = query_info.get("ear_roi", visible_ear_roi)
-        source_earring_detection_mask = query_info.get("source_earring_detection_mask")
+        source_earring_detection_mask = self._mask_like(
+            query_info.get("source_earring_detection_mask"),
+            query_mask,
+        ) * active
         source_hair_block_mask = query_info.get("source_hair_block_mask")
         existing_source_mask = query_info.get("source_earring_mask")
         existing_object_mask = query_info.get("source_earring_object_mask")
@@ -191,14 +552,14 @@ class PostProcessModelV5(nn.Module):
             source_earring_detection_mask,
             source_hair_block_mask,
             weak_masks,
-            visibility_mask=earring_valid_roi,
+            visibility_mask=self._mask_like(earring_valid_roi, query_mask) * active,
             recall_dilate=getattr(self.args, "earring_query_recall_dilate", 7),
-            downward_shift=getattr(self.args, "earring_query_downward_shift", 18),
+            downward_shift=getattr(self.args, "earring_query_downward_shift", 10),
             lower_lobe_weight=getattr(self.args, "earring_query_lower_lobe_weight", 0.20),
             candidate_boost=getattr(self.args, "earring_query_candidate_boost", 0.90),
-            block_protect=getattr(self.args, "earring_query_block_protect", 0.85),
+            block_protect=getattr(self.args, "earring_query_block_protect", 0.95),
         )
-        earring_valid_mask = resize_mask(earring_valid_roi, query_mask.shape[-2:])
+        earring_valid_mask = resize_mask(earring_valid_roi, query_mask.shape[-2:]) * active
         if existing_source_mask is None:
             existing_source_mask = torch.zeros_like(query_mask)
         else:
@@ -211,7 +572,7 @@ class PostProcessModelV5(nn.Module):
             recall_info["source_earring_mask"] + existing_source_mask + existing_object_mask,
             0,
             1,
-        )
+        ) * active
 
         # Pixel-level earring vs background separation.  The recall candidate may
         # contain background/hair pixels behind the earring (especially for long
@@ -344,16 +705,44 @@ class PostProcessModelV5(nn.Module):
             0,
             1,
         )
-        confident_mask = torch.clamp(confident_mask + existing_confident, 0, 1) * resize_mask(
-            earring_valid_roi,
-            query_mask.shape[-2:],
+        confident_mask = torch.clamp(confident_mask + existing_confident, 0, 1) * earring_valid_mask
+
+        # Rebuild a permissive search mask from object evidence.  This mask may
+        # look below the lobe for a long earring, but remains distinct from the
+        # final write mask created in _resolve_masks.
+        search_mask = build_earring_search_mask(
+            parser_earring,
+            earring_valid_mask,
+            online_candidate_mask=recall_info.get("online_earring_candidate_mask"),
+            weak_recall_mask=recall_info.get("earring_query_recall_mask"),
+            lobe_search_mask=recall_info.get("source_lobe_search_mask"),
+            downward_shift=int(getattr(self.args, "earring_search_downward_shift", 10)),
+            search_dilate=int(getattr(self.args, "earring_search_dilate", 7)),
+            no_earring=no_earring,
         )
-        recall_info["earring_confident_mask"] = confident_mask
-        recall_info["earring_candidate_mask"] = recall_info["online_earring_candidate_mask"]
-        recall_info["earring_search_mask"] = recall_info["online_earring_search_mask"]
+        search_mask = (search_mask * active).clamp(0, 1)
+        recall_info["source_earring_mask"] = (
+            recall_info["source_earring_mask"] * search_mask * active
+        ).clamp(0, 1)
+        recall_info["earring_confident_mask"] = (confident_mask * search_mask * active).clamp(0, 1)
+        recall_info["earring_candidate_mask"] = (
+            recall_info["online_earring_candidate_mask"] * search_mask * active
+        ).clamp(0, 1)
+        recall_info["earring_search_mask"] = search_mask
+        recall_info["online_earring_search_mask"] = (
+            recall_info["online_earring_search_mask"] * active
+        ).clamp(0, 1)
         recall_info["earring_highlight_mask"] = (
-            resize_mask(weak_masks["earring_highlight_mask"], query_mask.shape[-2:]) * earring_valid_roi
+            resize_mask(weak_masks["earring_highlight_mask"], query_mask.shape[-2:])
+            * search_mask
+            * active
         )
+        # Never replace the ordinary visible-ear/detail query with the earring
+        # branch.  Only the positive recall delta is admitted through search.
+        enhanced_query = self._mask_like(recall_info.get("query_mask"), query_mask)
+        recall_delta = (enhanced_query - query_mask).clamp(0, 1)
+        recall_info["query_mask"] = torch.clamp(query_mask + recall_delta * search_mask * active, 0, 1)
+        recall_info["earring_visibility_mask"] = earring_valid_mask
         query_info.update(recall_info)
         return query_info
 
@@ -375,14 +764,11 @@ class PostProcessModelV5(nn.Module):
                 return torch.zeros_like(query_mask)
             return resize_mask(value, query_mask.shape[-2:])
 
-        support = torch.clamp(
-            aux_mask("source_earring_mask")
-            + aux_mask("online_earring_candidate_mask")
-            + 0.35 * aux_mask("earring_query_recall_mask"),
-            0,
-            1,
-        )
-        visibility_mask = aux_mask("earring_visibility_mask")
+        # Search candidates are diagnostic/detection masks only.  They must not
+        # raise the learned fine mask outside the final connected write region.
+        write_mask = aux_mask("earring_write_mask").clamp(0, 1)
+        support = write_mask
+        visibility_mask = (write_mask > 1e-4).to(write_mask.dtype)
         support = dilate_mask(support, int(getattr(self.args, "earring_fine_mask_dilate", 5)))
         support = support * query_mask * visibility_mask
         if support.detach().flatten(1).amax(dim=1).max().item() <= 0:
@@ -469,30 +855,44 @@ class PostProcessModelV5(nn.Module):
         return content.clamp(0, 1)
 
     def _apply_source_content_gate(self, aux: dict[str, torch.Tensor]) -> None:
-        """Clip face-detail source-sampling by the source-content gate.
+        """Clip face-detail sampling, then restore only verified earrings.
 
         The gate restricts source-texture sampling to real source content (skin,
         ear, earring) so an over-wide v58 ear ROI cannot copy source background,
         neck or no-hair gaps onto the target face.
 
-        It is applied ONLY to query_mask (the face-detail recovery path).  All
-        earring-specific masks (source_earring_mask, earring_confident_mask, ...)
-        are deliberately excluded because they are already gated by earring_valid_roi
-        (the target-visibility gate that prevents writes to hair-covered regions).
-        Gating them a second time with source content removes the visual-candidate
-        earring completion that extends beyond parser label-9, leaving only sparse
-        label-9 fragments -> earring recovery fails completely.
+        The broad query may contain earring search/recall pixels.  Those are only
+        candidates and therefore still have to pass the source-content gate.  A
+        parser-missed part of a long earring can legitimately lie on pixels that
+        the parser calls background, though, so the already connected and
+        target-safe ``earring_write_mask`` is added back after gating.  No search,
+        recall, confidence or ROI mask is allowed to bypass the gate.
         """
         query_mask = aux.get("query_mask")
         if query_mask is None:
             return
-        size = ensure_mask_4d(query_mask).shape[-2:]
+        face_query = ensure_mask_4d(query_mask).float()
+        size = face_query.shape[-2:]
         gate = self._build_source_content_gate(aux, size)
         if gate is None:
             return
+        gate = self._mask_like(gate, face_query).clamp(0, 1)
+        verified_earring = self._mask_like(
+            aux.get("earring_write_mask"),
+            face_query,
+        ).clamp(0, 1)
+        no_earring = aux.get("no_earring_case_mask")
+        if no_earring is not None:
+            verified_earring = verified_earring * (
+                1.0 - self._mask_like(no_earring, face_query)
+            ).clamp(0, 1)
+
         aux["source_content_gate_mask"] = gate
-        # Gate only the face-detail query.  Earring masks have their own gate.
-        aux["query_mask"] = (resize_mask(query_mask, size) * gate).clamp(0, 1)
+        aux["source_gated_face_query_mask"] = (face_query * gate).clamp(0, 1)
+        aux["query_mask"] = torch.maximum(
+            aux["source_gated_face_query_mask"],
+            verified_earring,
+        )
 
     def _compute_latent(self, s_face: torch.Tensor, s_hair: torch.Tensor) -> torch.Tensor:
         if self.use_mod:
@@ -640,14 +1040,17 @@ class PostProcessModelV5(nn.Module):
         if source_ear_mask is not None:
             merge_aux_mask("source_earring_detection_mask", gated_aux_mask(source_ear_mask, ear_roi))
             merge_aux_mask("source_earring_mask", gated_aux_mask(source_ear_mask, earring_valid_roi))
+            merge_aux_mask("source_earring_explicit_mask", gated_aux_mask(source_ear_mask, ear_roi))
         if source_earring_object_mask is not None:
             merge_aux_mask("source_earring_detection_mask", gated_aux_mask(source_earring_object_mask, ear_roi))
             merge_aux_mask("source_earring_mask", gated_aux_mask(source_earring_object_mask, earring_valid_roi))
             merge_aux_mask("source_earring_object_mask", gated_aux_mask(source_earring_object_mask, earring_valid_roi))
+            merge_aux_mask("source_earring_explicit_mask", gated_aux_mask(source_earring_object_mask, ear_roi))
         if earring_confident_mask is not None:
             merge_aux_mask("source_earring_detection_mask", gated_aux_mask(earring_confident_mask, ear_roi))
             merge_aux_mask("source_earring_mask", gated_aux_mask(earring_confident_mask, earring_valid_roi))
             merge_aux_mask("earring_confident_mask", gated_aux_mask(earring_confident_mask, earring_valid_roi))
+            merge_aux_mask("source_earring_explicit_mask", gated_aux_mask(earring_confident_mask, ear_roi))
         if earring_highlight_mask is not None:
             merge_aux_mask("earring_highlight_mask", gated_aux_mask(earring_highlight_mask, earring_valid_roi))
 
@@ -676,6 +1079,7 @@ class PostProcessModelV5(nn.Module):
             query_info["presence_target"] = presence_target
 
         query_info = self._enhance_query_recall(source_01, source_parsing, query_info, target_01)
+        query_info = self._finalize_earring_masks(query_info, source_parsing)
 
         query_info["source_parsing"] = source_parsing.long()
         query_info["target_parsing"] = target_parsing.long()
@@ -748,6 +1152,40 @@ class PostProcessModelV5(nn.Module):
         aux.update(info)
         return aux
 
+    @staticmethod
+    def _attach_authoritative_hair_highres(
+        aux: dict[str, torch.Tensor],
+        authoritative_hair_highres: torch.Tensor | None,
+        reference: torch.Tensor,
+    ) -> None:
+        """Store an explicit high-resolution hair authority in RGB [0, 1]."""
+
+        if authoritative_hair_highres is None:
+            return
+        if not torch.is_tensor(authoritative_hair_highres):
+            raise TypeError("authoritative_hair_highres must be a torch.Tensor.")
+        authority = authoritative_hair_highres
+        if authority.ndim == 3:
+            authority = authority.unsqueeze(0)
+        if authority.ndim != 4 or authority.size(1) != 3:
+            raise ValueError(
+                "authoritative_hair_highres must have shape [B,3,H,W], "
+                f"got {tuple(authority.shape)}."
+            )
+        if authority.size(0) != reference.size(0):
+            raise ValueError(
+                "authoritative_hair_highres batch size must match the PP input: "
+                f"{authority.size(0)} != {reference.size(0)}."
+            )
+        authority = authority.to(device=reference.device, dtype=reference.dtype)
+        if not bool(torch.isfinite(authority).all()):
+            raise ValueError("authoritative_hair_highres contains non-finite values.")
+
+        # This interface deliberately accepts the native StyleGAN range.  An
+        # explicit conversion avoids the ambiguous data-dependent range guess
+        # used by generic image helpers for an all-bright sample.
+        aux["authoritative_hair_highres_01"] = ((authority + 1.0) * 0.5).clamp(0, 1)
+
     def forward(
         self,
         source: torch.Tensor,
@@ -758,6 +1196,7 @@ class PostProcessModelV5(nn.Module):
         target_parsing: torch.Tensor | None = None,
         source_hair_mask: torch.Tensor | None = None,
         target_hair_mask: torch.Tensor | None = None,
+        authoritative_hair_highres: torch.Tensor | None = None,
         query_mask: torch.Tensor | None = None,
         source_ear_mask: torch.Tensor | None = None,
         source_earring_object_mask: torch.Tensor | None = None,
@@ -801,6 +1240,11 @@ class PostProcessModelV5(nn.Module):
                 source_visible_skin_reference_mask,
                 source_skin_valid_mask,
             )
+            self._attach_authoritative_hair_highres(
+                aux,
+                authoritative_hair_highres,
+                source,
+            )
             self._apply_source_content_gate(aux)
             return self.latent_avg.to(s_face.device) + s_face, f_face, aux
 
@@ -829,6 +1273,11 @@ class PostProcessModelV5(nn.Module):
             revealed_skin_seam_mask,
             source_visible_skin_reference_mask,
             source_skin_valid_mask,
+        )
+        self._attach_authoritative_hair_highres(
+            aux,
+            authoritative_hair_highres,
+            source,
         )
         # Restrict every source-sampling mask to real source content (skin/ear/
         # earring) so an over-wide v58 ear ROI cannot copy source background,
@@ -889,7 +1338,15 @@ class PostProcessModelV5(nn.Module):
         if target_hair is None:
             return None
 
-        hair_raw = resize_mask(ensure_mask_4d(target_hair).float(), size)
+        # HM_X_repaired is a topology mask.  Nearest-neighbour expansion keeps
+        # narrow repaired crown bridges binary instead of turning them into a
+        # soft strip that a later erosion can erase.
+        hair_raw = F.interpolate(
+            ensure_mask_4d(target_hair).float(),
+            size=size,
+            mode="nearest",
+        )
+        hair_raw = (hair_raw > 0.5).to(dtype=hair_raw.dtype)
         hair_context = hair_raw
         hair_dilate = int(getattr(self.args, "output_target_hair_preserve_dilate", 5))
         if hair_dilate > 0:
@@ -899,56 +1356,69 @@ class PostProcessModelV5(nn.Module):
         # context is clipped away from the face, so light hair at the hairline
         # cannot be brightened or recolored by PP.
         target_face = aux.get("target_face_surface_mask")
+        face_surface = None
         if target_face is not None:
-            face_exclude = resize_mask(target_face, size)
+            face_surface = (resize_mask(target_face, size) > 0.5).to(hair_raw.dtype)
+            face_exclude = face_surface
             seam_dilate = int(getattr(self.args, "output_face_hair_seam_preserve_dilate", 7))
             if seam_dilate > 0:
                 face_exclude = dilate_mask(face_exclude, seam_dilate)
             hair_context = hair_context * (1.0 - face_exclude).clamp(0, 1)
         preserve = torch.maximum(hair_raw, hair_context).clamp(0, 1)
 
-        # Soften the hair->face hand-off at the hairline.  A hard 1->0 alpha edge
-        # between target(SATD) hair and PP-generated face reads as a translucent
-        # "wig-glue" line.  We erode the solid-preserve core a few pixels *into*
-        # the hair, then let a Gaussian ramp fall off from that core.  Clipping
-        # the ramp by the original hair region keeps the feather strictly inside
-        # the hair, so it never pulls target hair color onto the face.
+        # Soften only the true face/hair seam.  Eroding ``preserve`` globally
+        # used to weaken the crown and outer silhouette as well; a narrow crown
+        # repair could disappear entirely with the default 9px setting.
+        face_hair_seam = torch.zeros_like(hair_raw)
         seam_feather = int(getattr(self.args, "output_hairline_feather", 0))
-        if seam_feather > 1:
-            hair_region = preserve
-            core = erode_mask(preserve, seam_feather)
+        if seam_feather > 1 and face_surface is not None:
+            face_hair_seam = (
+                hair_raw * dilate_mask(face_surface, seam_feather)
+            ).clamp(0, 1)
+            core = erode_mask(hair_raw, seam_feather)
             ramp = gaussian_blur(
                 core,
                 kernel_size=seam_feather,
                 sigma=max(1.0, seam_feather / 3.0),
             ).clamp(0, 1)
-            preserve = torch.maximum(core, torch.minimum(hair_region, ramp)).clamp(0, 1)
+            seam_alpha = torch.maximum(core, torch.minimum(hair_raw, ramp)).clamp(0, 1)
+            preserve = (
+                preserve * (1.0 - face_hair_seam)
+                + torch.minimum(preserve, seam_alpha) * face_hair_seam
+            ).clamp(0, 1)
 
-        # Hair preservation is outside the v58 earring chain.  Only v58's
-        # confident pixels inside its visibility gate may remain in front of
-        # target hair; the empty downward channel never grants an exemption.
-        earring_keep = aux.get("earring_confident_mask")
-        earring_valid_roi = aux.get("earring_valid_roi")
-        if earring_keep is None or earring_valid_roi is None:
+        target_hair_ear_bridge = aux.get("target_hair_ear_bridge_mask")
+        if target_hair_ear_bridge is not None:
+            preserve = torch.maximum(
+                preserve,
+                resize_mask(target_hair_ear_bridge, size),
+            ).clamp(0, 1)
+
+        # Only the connected, source-safe write mask may override target-hair
+        # preservation.  Search/confidence/ROI masks are intentionally ignored:
+        # they can be broad and therefore cannot be treated as write permission.
+        earring_write = aux.get("earring_write_mask")
+        if earring_write is None:
             earring_keep = torch.zeros_like(preserve)
         else:
-            earring_keep = resize_mask(earring_keep, size) * resize_mask(earring_valid_roi, size)
+            earring_keep = resize_mask(earring_write, size)
+        no_earring = aux.get("no_earring_case_mask")
+        if no_earring is not None:
+            earring_keep = earring_keep * (1.0 - resize_mask(no_earring, size)).clamp(0, 1)
         keep_dilate = int(getattr(self.args, "output_earring_keep_dilate", 0))
-        if keep_dilate > 0:
-            earring_keep = dilate_mask(earring_keep, keep_dilate)
-            earring_keep = earring_keep * resize_mask(earring_valid_roi, size)
+        if keep_dilate > 0 and earring_write is not None:
+            # A cosmetic dilation may smooth values *inside* the write gate, but
+            # can never expand the gate onto another target-hair pixel.
+            earring_keep = torch.minimum(
+                dilate_mask(earring_keep, keep_dilate),
+                resize_mask(earring_write, size),
+            )
 
+        # This is the only mask allowed to open the hard target-hair authority.
+        # Its own soft edge supplies the earring transition; globally blurring
+        # ``preserve`` would also weaken unrelated crown/outer-contour pixels.
         preserve = preserve * (1.0 - earring_keep).clamp(0, 1)
-        blur = int(getattr(self.args, "output_preserve_blur", 1))
-        if blur > 1:
-            if blur % 2 == 0:
-                blur += 1
-            preserve = F.avg_pool2d(
-                preserve,
-                kernel_size=blur,
-                stride=1,
-                padding=blur // 2,
-            ).clamp(0, 1)
+        aux["output_target_hair_face_seam_mask"] = face_hair_seam
         aux["output_target_hair_preserve_mask"] = preserve
         aux["output_target_hair_earring_keep_mask"] = earring_keep
         return preserve
@@ -1009,69 +1479,217 @@ class PostProcessModelV5(nn.Module):
         if float(revealed.detach().amax().item()) <= 0:
             return image_01
 
-        # Build the recovered-skin reference: target face skin, minus the revealed
-        # region itself, target hair, facial details and earrings.  These are the
-        # pixels where PP has already produced the correct source skin.
-        reference = aux.get("target_face_surface_mask")
-        if reference is None and aux.get("target_parsing") is not None:
-            reference = parsing_label_mask(aux.get("target_parsing"), RAW_FACE_SURFACE_LABELS)
-        if reference is None:
-            return image_01
-        reference = resize_mask(reference, size)
-        reference = reference * (1.0 - dilate_mask(revealed, 5)).clamp(0, 1)
-        for key in ("target_hair_mask",):
-            value = aux.get(key)
-            if value is not None:
-                reference = reference * (1.0 - resize_mask(value, size)).clamp(0, 1)
+        # Semantic safety masks.  Missing parser output falls back to the
+        # revealed neighbourhood rather than disabling harmonisation entirely.
+        target_face = aux.get("target_face_surface_mask")
+        if target_face is None and aux.get("target_parsing") is not None:
+            target_face = parsing_label_mask(aux["target_parsing"], RAW_FACE_SURFACE_LABELS)
+        if target_face is None:
+            target_face = dilate_mask((revealed > 0.05).float(), 65)
+        target_face = resize_mask(target_face, size).clamp(0, 1)
+        target_hair = self._mask_like(aux.get("target_hair_mask"), revealed)
+
         target_parsing = aux.get("target_parsing")
-        if target_parsing is not None:
-            detail = parsing_label_mask(target_parsing, RAW_DETAIL_LABELS)
-            reference = reference * (1.0 - dilate_mask(resize_mask(detail, size), 3)).clamp(0, 1)
-        for key in ("earring_confident_mask", "source_earring_mask", "visible_ear_roi", "ear_roi"):
+        target_detail = (
+            torch.zeros_like(revealed)
+            if target_parsing is None
+            else resize_mask(parsing_label_mask(target_parsing, RAW_DETAIL_LABELS), size)
+        )
+        earring_exclude = torch.zeros_like(revealed)
+        for key in (
+            "earring_write_mask",
+            "earring_confident_mask",
+            "source_earring_mask",
+            "visible_ear_roi",
+        ):
             value = aux.get(key)
             if value is not None:
-                reference = reference * (1.0 - resize_mask(value, size)).clamp(0, 1)
-        reference = reference.clamp(0, 1)
+                earring_exclude = torch.clamp(
+                    earring_exclude + resize_mask(value, size), 0, 1
+                )
+
+        generated_safe = (
+            target_face
+            * (1.0 - dilate_mask(revealed, 5)).clamp(0, 1)
+            * (1.0 - dilate_mask(target_hair, 3)).clamp(0, 1)
+            * (1.0 - dilate_mask(target_detail, 3)).clamp(0, 1)
+            * (1.0 - dilate_mask(earring_exclude, 5)).clamp(0, 1)
+        ).clamp(0, 1)
+        generated_lower = build_lower_face_skin_reference_mask(
+            target_face,
+            revealed,
+            hair_mask=target_hair,
+            detail_mask=target_detail,
+            earring_mask=earring_exclude,
+        )
+
+        # Prefer strict source-visible skin.  If bangs leave too little local
+        # evidence, select the lower face/cheeks; if even that is unavailable,
+        # use already-generated lower-face skin.  This is a per-sample fallback,
+        # so one difficult image cannot disable the whole batch.
+        source_reference = aux.get(
+            "source_visible_skin_reference_mask",
+            aux.get("source_skin_valid_mask"),
+        )
+        if source_reference is None:
+            source_reference = torch.zeros_like(revealed)
+        else:
+            source_reference = resize_mask(source_reference, size).clamp(0, 1)
+        source_face = aux.get("source_face_surface_mask", target_face)
+        source_face = resize_mask(source_face, size).clamp(0, 1)
+        source_hair = self._mask_like(aux.get("source_hair_mask"), revealed)
+        source_parsing = aux.get("source_parsing")
+        source_detail = (
+            torch.zeros_like(revealed)
+            if source_parsing is None
+            else resize_mask(parsing_label_mask(source_parsing, RAW_DETAIL_LABELS), size)
+        )
+        source_lower = build_lower_face_skin_reference_mask(
+            source_face,
+            revealed,
+            hair_mask=source_hair,
+            detail_mask=source_detail,
+            earring_mask=earring_exclude,
+        ) * source_reference
+        local_source = source_reference * dilate_mask((revealed > 0.05).float(), 65)
 
         area_scale = float(size[0] * size[1]) / float(256 * 256)
-        if float(reference.detach().flatten(1).sum(dim=1).min().item()) < 256.0 * area_scale:
-            # Too little recovered skin to define a reliable tone; leave as-is
-            # rather than risk pulling the forehead toward the wrong color.
-            return image_01
+        minimum_reference = float(
+            getattr(self.args, "revealed_skin_min_reference_area", 96.0)
+        ) * area_scale
+
+        def enough(mask: torch.Tensor) -> torch.Tensor:
+            return (mask.flatten(1).sum(dim=1) >= minimum_reference).view(-1, 1, 1, 1)
+
+        source_choice = torch.where(enough(local_source), local_source, source_lower)
+        source_choice = torch.where(enough(source_choice), source_choice, source_reference)
+        generated_choice = torch.where(enough(generated_lower), generated_lower, generated_safe)
+        use_source = enough(source_choice)
+        reference_mask = torch.where(use_source, source_choice, generated_choice).clamp(0, 1)
+
+        # Final non-empty safety net: use the lower portion of the semantic face
+        # (or image) instead of producing a zero/black tone reference.
+        height, width = size
+        y = torch.arange(height, device=image_01.device).view(1, 1, height, 1)
+        geometric_lower = (y >= int(0.55 * height)).to(image_01.dtype)
+        geometric_lower = geometric_lower.expand(image_01.size(0), 1, height, width)
+        geometric_lower = geometric_lower * torch.maximum(target_face, generated_safe)
+        reference_mask = torch.where(
+            enough(reference_mask), reference_mask, geometric_lower
+        ).clamp(0, 1)
+
+        source_01 = aux.get("source_01")
+        if source_01 is None:
+            source_01 = image_01
+        else:
+            source_01 = F.interpolate(
+                normalized_to_01(source_01),
+                size=size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        reference_image = torch.where(use_source.expand_as(image_01), source_01, image_01)
 
         work = 256
         img_small = F.interpolate(image_01, size=(work, work), mode="bilinear", align_corners=False)
-        ref_small = F.interpolate(reference, size=(work, work), mode="bilinear", align_corners=False).clamp(0, 1)
-        rev_small = F.interpolate(revealed, size=(work, work), mode="bilinear", align_corners=False).clamp(0, 1)
+        reference_image_small = F.interpolate(
+            reference_image, size=(work, work), mode="bilinear", align_corners=False
+        )
+        ref_small = F.interpolate(
+            reference_mask, size=(work, work), mode="bilinear", align_corners=False
+        ).clamp(0, 1)
 
-        blur_k = int(getattr(self.args, "revealed_skin_tone_kernel", 21))
+        blur_k = max(3, int(getattr(self.args, "revealed_skin_tone_kernel", 15)))
+        if blur_k % 2 == 0:
+            blur_k += 1
         blur_s = float(getattr(self.args, "revealed_skin_tone_sigma", 7.0))
         iters = int(getattr(self.args, "revealed_skin_diffuse_iters", 24))
 
-        ref_low = low_pass_filter(img_small, kernel_size=blur_k, sigma=blur_s)
-        tone_ref = self._diffuse_fill(ref_low, ref_small, iters, blur_k, blur_s)
-        cur_low = low_pass_filter(img_small, kernel_size=blur_k, sigma=blur_s)
-        correction = (tone_ref - cur_low)
-        # Keep the correction low-frequency and bounded so it only fixes tone,
-        # never introduces edges or color blocks.
-        correction = low_pass_filter(correction, kernel_size=blur_k, sigma=blur_s)
-        limit = float(getattr(self.args, "revealed_skin_tone_limit", 0.35))
+        reference_low = low_pass_filter(
+            reference_image_small, kernel_size=blur_k, sigma=blur_s
+        )
+        tone_ref = self._diffuse_fill(
+            reference_low, ref_small, iters, blur_k, blur_s
+        )
+        current_low = low_pass_filter(img_small, kernel_size=blur_k, sigma=blur_s)
+        correction = low_pass_filter(
+            tone_ref - current_low, kernel_size=blur_k, sigma=blur_s
+        )
+        limit = float(getattr(self.args, "revealed_skin_tone_limit", 0.28))
         correction = correction.clamp(-limit, limit)
         correction = F.interpolate(correction, size=size, mode="bilinear", align_corners=False)
 
-        strength = max(0.0, min(1.0, float(getattr(self.args, "revealed_skin_harmonize_strength", 0.9))))
-        blend = revealed * strength
-        result = (image_01 + correction * blend).clamp(0, 1)
+        # Build a soft seam band entirely on safe target skin.  Tone crosses the
+        # band; source detail never does, which removes black/white/grey rings and
+        # half-transparent brush marks without reintroducing old bangs.
+        core = (revealed > 0.05).float()
+        seam_width = max(3, int(getattr(self.args, "revealed_skin_seam_band", 7)))
+        seam_band = (
+            dilate_mask(core, seam_width) - erode_mask(core, max(3, seam_width // 2))
+        ).clamp(0, 1)
+        seam_band = (
+            seam_band
+            * target_face
+            * (1.0 - target_hair).clamp(0, 1)
+            * (1.0 - target_detail).clamp(0, 1)
+            * (1.0 - earring_exclude).clamp(0, 1)
+        ).clamp(0, 1)
+        blend_mask = torch.maximum(revealed, 0.85 * seam_band).clamp(0, 1)
+        blend_mask = gaussian_blur(
+            blend_mask,
+            kernel_size=max(5, 2 * seam_width + 1),
+            sigma=max(1.0, seam_width / 2.5),
+        ).clamp(0, 1) * target_face
+        blend_mask = blend_mask * (1.0 - target_hair).clamp(0, 1)
 
-        # Optional gentle micro-texture: amplify the revealed region's own high
-        # frequency so the harmonized skin does not look plastic.  Bounded and
-        # local, so it cannot tile source pores or create fragments.
-        gain = float(getattr(self.args, "revealed_skin_detail_gain", 1.0))
+        strength = max(
+            0.0,
+            min(1.0, float(getattr(self.args, "revealed_skin_harmonize_strength", 0.9))),
+        )
+        tone_blend = (blend_mask * strength).clamp(0, 1)
+        # The old path corrected only the revealed forehead.  The untouched
+        # lower face then retained a different low-frequency tone, producing
+        # the three-band face (SATD forehead, PP middle, source lower face).
+        # Apply a restrained correction over all safe face skin as well; the
+        # revealed/seam region keeps the full strength while already-visible
+        # skin receives only a small fraction.  High-frequency texture is never
+        # copied, so pores and natural local variation remain intact.
+        face_safe = (
+            target_face
+            * (1.0 - dilate_mask(target_hair, 3)).clamp(0, 1)
+            * (1.0 - dilate_mask(target_detail, 3)).clamp(0, 1)
+            * (1.0 - dilate_mask(earring_exclude, 5)).clamp(0, 1)
+        ).clamp(0, 1)
+        global_face_blend = gaussian_blur(
+            face_safe,
+            kernel_size=max(9, 2 * seam_width + 5),
+            sigma=max(2.0, seam_width),
+        ).clamp(0, 1)
+        global_face_blend = 0.22 * global_face_blend * (1.0 - blend_mask).clamp(0, 1)
+        tone_blend = torch.maximum(tone_blend, global_face_blend * strength).clamp(0, 1)
+        result = (image_01 + correction * tone_blend).clamp(0, 1)
+
+        # Keep the generator's own micro-texture.  Optional gain >1 is confined
+        # to an eroded safe core and never samples source bangs/dark streaks.
+        detail_safe = (
+            erode_mask(core, 5)
+            * target_face
+            * (1.0 - dilate_mask(target_hair, 5)).clamp(0, 1)
+            * (1.0 - dilate_mask(target_detail, 3)).clamp(0, 1)
+            * (1.0 - dilate_mask(earring_exclude, 5)).clamp(0, 1)
+        ).clamp(0, 1)
+        gain = max(1.0, float(getattr(self.args, "revealed_skin_detail_gain", 1.0)))
         if gain > 1.0:
             high = high_pass_filter(result, kernel_size=blur_k, sigma=blur_s)
-            result = (result + (gain - 1.0) * high * blend).clamp(0, 1)
+            result = (result + (gain - 1.0) * high * detail_safe).clamp(0, 1)
 
-        aux["revealed_skin_harmonize_mask"] = blend
+        aux["lower_face_skin_reference_mask"] = generated_lower
+        aux["source_visible_skin_reference_mask"] = source_choice
+        aux["revealed_skin_seam_mask"] = seam_band
+        aux["revealed_skin_blend_band"] = blend_mask
+        aux["revealed_skin_blend_mask"] = blend_mask
+        aux["revealed_skin_harmonize_mask"] = tone_blend
+        aux["revealed_skin_detail_mask"] = detail_safe
         aux["revealed_skin_tone_reference"] = F.interpolate(
             tone_ref, size=size, mode="bilinear", align_corners=False
         ).clamp(0, 1)
@@ -1093,9 +1711,13 @@ class PostProcessModelV5(nn.Module):
 
         if not bool(getattr(self.args, "enable_output_target_preserve", True)):
             return image_01 * 2 - 1
-        target = aux.get("target_01")
-        if target is None:
-            return image_01 * 2 - 1
+        authority = aux.get("authoritative_hair_highres_01")
+        if authority is None:
+            # Standalone training/data paths do not have I_blend's 1024px
+            # authority.  Falling back to the current high-resolution render is
+            # an intentional no-op for geometry/texture; it is preferable to
+            # enlarging target_01 over the whole hair and erasing strand detail.
+            authority = image_01
 
         # Match v58's single generated earring path: no final RGB hard paste.
         aux["output_source_earring_composite_mask"] = torch.zeros(
@@ -1106,16 +1728,31 @@ class PostProcessModelV5(nn.Module):
             device=image_01.device,
             dtype=image_01.dtype,
         )
-        target = F.interpolate(
-            target,
-            size=image_01.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        ).clamp(0, 1)
+        if authority.ndim == 3:
+            authority = authority.unsqueeze(0)
+        if authority.ndim != 4 or authority.size(1) != 3:
+            raise ValueError(
+                "authoritative_hair_highres_01 must have shape [B,3,H,W], "
+                f"got {tuple(authority.shape)}."
+            )
+        if authority.size(0) != image_01.size(0):
+            raise ValueError(
+                "authoritative_hair_highres_01 batch size must match the render: "
+                f"{authority.size(0)} != {image_01.size(0)}."
+            )
+        authority = authority.to(device=image_01.device, dtype=image_01.dtype)
+        if authority.shape[-2:] != image_01.shape[-2:]:
+            authority = F.interpolate(
+                authority,
+                size=image_01.shape[-2:],
+                mode="bicubic",
+                align_corners=False,
+            )
+        authority = authority.clamp(0, 1)
         preserve = self._target_output_preserve_mask(aux, image_01.shape[-2:])
         if preserve is None:
             return image_01 * 2 - 1
-        protected = image_01 * (1.0 - preserve) + target * preserve
+        protected = image_01 * (1.0 - preserve) + authority * preserve
         return protected.clamp(0, 1) * 2 - 1
 
     def render_refined(

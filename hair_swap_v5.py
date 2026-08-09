@@ -52,14 +52,21 @@ class HairFastV5:
     @bench_session
     def __swap_from_tensors(self, face: torch.Tensor, shape: torch.Tensor, color: torch.Tensor,
                             **kwargs) -> torch.Tensor:
+        for name, image in (("face", face), ("shape", shape), ("color", color)):
+            if image.dim() == 4 and image.shape[0] != 1:
+                raise ValueError(
+                    f"HairFastV5 currently supports one sample per call; {name} has batch {image.shape[0]}."
+                )
         images_to_name = defaultdict(list)
         for image, name in zip((face, shape, color), ("face", "shape", "color")):
             images_to_name[image].append(name)
 
         name_to_embed = self.embed.embedding_images(images_to_name, **kwargs)
         align_shape = self.align.align_images("face", "shape", name_to_embed, **kwargs)
-        align_color = self.align.shape_module("face", "color", name_to_embed, **kwargs) if shape is not color else align_shape
-        return self.blend.blend_images(align_shape, align_color, name_to_embed, **kwargs)
+        # The deterministic colour stage reads the colour image and its parsing
+        # directly.  A second face->colour shape alignment was unused and also
+        # overwrote the real shape HM_X debug files.
+        return self.blend.blend_images(align_shape, align_shape, name_to_embed, **kwargs)
 
     def swap(self, face_img: TImage | TPath, shape_img: TImage | TPath, color_img: TImage | TPath,
              benchmark=False, align=False, seed=None, exp_name=None, **kwargs) -> TReturn:
@@ -105,6 +112,15 @@ def get_parser():
     parser.add_argument("--smooth", type=int, default=5)
     parser.add_argument("--rotate_checkpoint", type=str, default="pretrained_models/Rotate/rotate_best.pth")
     parser.add_argument("--blending_checkpoint", type=str, default="pretrained_models/Blending/checkpoint.pth")
+    parser.add_argument(
+        "--allow_legacy_blending_checkpoint_v8",
+        type=str2bool,
+        default=False,
+        help=(
+            "Allow a blending checkpoint without the v8 color_policy contract. "
+            "Use only for cache construction or deliberate legacy inference."
+        ),
+    )
     parser.add_argument("--pp_checkpoint", type=str, default="pretrained_models/PostProcess/pp_model.pth")
     parser.add_argument("--pp_v5_checkpoint", type=str, default="pretrained_models/PostProcess/pp_model.pth")
     parser.add_argument("--use_satd_v8", type=str2bool, default=False)
@@ -112,6 +128,24 @@ def get_parser():
     parser.add_argument("--satd_blend_v8", type=float, default=0.28)
     parser.add_argument("--satd_boundary_v8", type=int, default=8)
     parser.add_argument("--eq8_reference_blend_v8", type=float, default=0.0)
+    parser.add_argument("--target_hair_close_kernel", type=int, default=9)
+    parser.add_argument("--target_hair_hole_max_area", type=float, default=None)
+    parser.add_argument("--target_hair_hole_max_area_ratio", type=float, default=0.003)
+    parser.add_argument("--target_hair_hole_min_prior_coverage", type=float, default=0.10)
+    parser.add_argument("--target_hair_hole_prior_evidence_radius", type=int, default=2)
+    parser.add_argument("--target_hair_top_fill_only", type=str2bool, default=True)
+    parser.add_argument("--target_hair_ear_bridge_radius", type=int, default=3)
+    parser.add_argument("--target_hair_crown_repair_enabled", type=str2bool, default=True)
+    parser.add_argument("--target_hair_crown_height_ratio", type=float, default=0.50)
+    parser.add_argument("--target_hair_crown_bridge_radius", type=int, default=8)
+    parser.add_argument("--target_hair_crown_prior_dilate", type=int, default=1)
+    parser.add_argument("--target_hair_crown_component_distance", type=int, default=12)
+    parser.add_argument(
+        "--target_hair_crown_component_min_prior_overlap",
+        type=float,
+        default=0.15,
+    )
+    parser.add_argument("--target_hair_crown_max_added_area_ratio", type=float, default=0.008)
     parser.add_argument("--hair_color_preserve_strength", type=float, default=0.7,
                         help="Strength (0–1) of per-channel F statistics restoration "
                              "in the hair region after SATD. 0 = off, 1 = full. "
@@ -139,11 +173,11 @@ def get_parser():
     parser.add_argument("--ear_downward_shift", type=int, default=10)
     parser.add_argument("--target_hair_dilate", type=int, default=11)
     parser.add_argument("--earring_occlusion_dilate", type=int, default=3)
-    parser.add_argument("--source_hair_block_dilate", type=int, default=5)
-    parser.add_argument("--source_hair_block_strength", type=float, default=0.6)
+    parser.add_argument("--source_hair_block_dilate", type=int, default=8)
+    parser.add_argument("--source_hair_block_strength", type=float, default=0.95)
     parser.add_argument("--target_visibility_expand", type=int, default=5)
-    parser.add_argument("--max_target_hair_overlap", type=float, default=0.55)
-    parser.add_argument("--min_target_visible_overlap", type=float, default=0.02)
+    parser.add_argument("--max_target_hair_overlap", type=float, default=0.30)
+    parser.add_argument("--min_target_visible_overlap", type=float, default=0.10)
     parser.add_argument("--min_target_ear_area", type=float, default=8.0)
     parser.add_argument("--earring_channel_down", type=int, default=32)
     parser.add_argument("--ear_blur_kernel", type=int, default=11)
@@ -153,15 +187,58 @@ def get_parser():
     parser.add_argument("--earring_query_boost", type=float, default=1.0)
     parser.add_argument("--enable_earring_query_recall", type=str2bool, default=True)
     parser.add_argument("--earring_query_recall_dilate", type=int, default=7)
-    parser.add_argument("--earring_query_downward_shift", type=int, default=18)
+    parser.add_argument("--earring_query_downward_shift", type=int, default=10)
     parser.add_argument("--earring_query_lower_lobe_weight", type=float, default=0.20)
     parser.add_argument("--earring_query_candidate_boost", type=float, default=0.90)
-    parser.add_argument("--earring_query_block_protect", type=float, default=0.85)
+    parser.add_argument("--earring_query_block_protect", type=float, default=0.95)
+    parser.add_argument("--disable_earring_path_if_low_confidence", type=str2bool, default=True)
+    parser.add_argument("--earring_source_presence_min_area", type=float, default=4.0)
+    parser.add_argument("--earring_search_downward_shift", type=int, default=10)
+    parser.add_argument("--earring_search_dilate", type=int, default=7)
+    parser.add_argument("--earring_write_max_target_hair_overlap", type=float, default=0.30)
+    parser.add_argument("--earring_write_source_block_dilate", type=int, default=3)
+    parser.add_argument("--earring_write_dilate", type=int, default=3)
+    parser.add_argument("--earring_write_connectivity_iters", type=int, default=32)
+    parser.add_argument("--earring_write_connectivity_kernel", type=int, default=5)
+    parser.add_argument("--earring_write_bridge_dilate", type=int, default=5)
+    parser.add_argument("--earring_anchor_visible_dilate", type=int, default=3)
     parser.add_argument("--earring_align_max_shift", type=int, default=12)
     parser.add_argument("--ear_fine_support_dilate", type=int, default=3)
     parser.add_argument("--earring_fine_mask_floor", type=float, default=0.18)
     parser.add_argument("--earring_fine_mask_dilate", type=int, default=5)
     parser.add_argument("--earring_target_hair_override_dilate", type=int, default=1)
+    parser.add_argument("--enable_source_content_gate", type=str2bool, default=True)
+    parser.add_argument("--source_content_gate_dilate", type=int, default=3)
+    parser.add_argument("--source_hair_face_suppress_dilate", type=int, default=5)
+    parser.add_argument("--source_hair_face_suppress_strength", type=float, default=0.65)
+    parser.add_argument("--source_hair_face_suppress_max_y", type=float, default=0.45)
+    parser.add_argument("--source_hair_face_suppress_ear_exclude_dilate", type=int, default=9)
+    parser.add_argument("--enable_output_target_preserve", type=str2bool, default=True)
+    parser.add_argument("--output_target_hair_preserve_dilate", type=int, default=5)
+    parser.add_argument("--output_face_hair_seam_preserve_dilate", type=int, default=7)
+    parser.add_argument("--output_earring_keep_dilate", type=int, default=0)
+    parser.add_argument("--output_preserve_blur", type=int, default=1)
+    parser.add_argument("--output_hairline_feather", type=int, default=9)
+    parser.add_argument("--hair_color_reference_strength_v8", type=float, default=0.9)
+    parser.add_argument("--hair_color_low_frequency_radius_v8", type=int, default=15)
+    parser.add_argument("--hair_color_low_frequency_sigma_v8", type=float, default=None)
+    parser.add_argument("--hair_color_feather_radius_v8", type=int, default=5)
+    parser.add_argument("--hair_color_spatial_reference_weight_v8", type=float, default=0.75)
+    parser.add_argument("--hair_color_detail_chroma_gain_v8", type=float, default=1.0)
+    parser.add_argument("--hair_color_luma_reference_strength_v8", type=float, default=0.30)
+    parser.add_argument("--hair_color_luma_mean_limit_v8", type=float, default=6.0)
+    parser.add_argument("--hair_color_luma_std_ratio_limit_v8", type=float, default=1.25)
+    parser.add_argument("--disable_reference_dominant_hair_color_v8", type=str2bool, default=False)
+    parser.add_argument("--debug_save_intermediate_color", type=str2bool, default=True)
+    parser.add_argument("--enable_revealed_skin_harmonize", type=str2bool, default=True)
+    parser.add_argument("--revealed_skin_harmonize_strength", type=float, default=0.9)
+    parser.add_argument("--revealed_skin_tone_kernel", type=int, default=15)
+    parser.add_argument("--revealed_skin_tone_sigma", type=float, default=7.0)
+    parser.add_argument("--revealed_skin_diffuse_iters", type=int, default=24)
+    parser.add_argument("--revealed_skin_tone_limit", type=float, default=0.28)
+    parser.add_argument("--revealed_skin_detail_gain", type=float, default=1.0)
+    parser.add_argument("--revealed_skin_seam_band", type=int, default=7)
+    parser.add_argument("--revealed_skin_min_reference_area", type=float, default=96.0)
     return parser
 
 
