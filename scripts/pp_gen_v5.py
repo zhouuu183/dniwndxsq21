@@ -630,7 +630,14 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
         connectivity_kernel=args.earring_write_connectivity_kernel,
         bridge_dilate=args.earring_write_bridge_dilate,
     )
-    write_mask = write_masks["write_mask"] * (1.0 - write_masks["hoop_hole_mask"]).clamp(0, 1)
+    geometric_hoop_hole = torch.clamp(
+        strong_info["left_elliptical_hoop_hole"]
+        + strong_info["right_elliptical_hoop_hole"],
+        0,
+        1,
+    ) * active
+    hoop_hole = torch.maximum(write_masks["hoop_hole_mask"], geometric_hoop_hole)
+    write_mask = write_masks["write_mask"] * (1.0 - hoop_hole).clamp(0, 1)
     visible_segment = write_masks["earring_object_mask"] * active
     query_info["query_mask"] = torch.clamp(
         query_info["query_mask"] + max(0.0, float(args.earring_query_boost)) * search_mask,
@@ -656,7 +663,7 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
         "earring_completion_mask": write_masks["completion_mask"],
         "earring_object_mask": write_masks["earring_object_mask"],
         "earring_filled_mask": write_masks["earring_filled_mask"],
-        "hoop_hole_mask": write_masks["hoop_hole_mask"],
+        "hoop_hole_mask": hoop_hole,
         "earlobe_anchor_mask": earlobe_anchor,
         "target_hair_ear_bridge_mask": (
             target_hair_occlusion * (1.0 - write_mask).clamp(0, 1)

@@ -642,13 +642,19 @@ def build_elliptical_hoop_candidates(
     Sobel pixels: copying those pixels produces the broken metal squiggle seen
     beside the ear.  This helper accepts an image-only fallback only when its
     Canny contour supports a fitted ellipse around an actual lobe.  It returns
-    the thin fitted trace, never the ellipse interior or a broad ear rectangle.
+    the edge-supported trace and fitted interior separately: the trace grants
+    source-RGB permission while the interior remains target-owned.
     """
 
     reference = ensure_mask_4d(search_mask).float()
     zeros = torch.zeros_like(reference)
     if cv2 is None:
-        return {"left_elliptical_hoop": zeros, "right_elliptical_hoop": zeros}
+        return {
+            "left_elliptical_hoop": zeros,
+            "right_elliptical_hoop": zeros,
+            "left_elliptical_hoop_hole": zeros,
+            "right_elliptical_hoop_hole": zeros,
+        }
 
     source_01 = normalized_to_01(source_01)
     size = reference.shape[-2:]
@@ -667,7 +673,14 @@ def build_elliptical_hoop_candidates(
     right_anchor_np = (right_anchor.detach().cpu().numpy() > 0.05)
     left_out = np.zeros_like(search_np, dtype=np.float32)
     right_out = np.zeros_like(search_np, dtype=np.float32)
+    left_hole_out = np.zeros_like(search_np, dtype=np.float32)
+    right_hole_out = np.zeros_like(search_np, dtype=np.float32)
     height, width = size
+    coordinate_scale = max(float(height), float(width)) / 256.0
+
+    def scaled_kernel(base: float) -> int:
+        kernel = max(3, int(round(float(base) * coordinate_scale)))
+        return kernel if kernel % 2 == 1 else kernel + 1
 
     def trace_for_anchor(
         image: np.ndarray,
@@ -675,10 +688,11 @@ def build_elliptical_hoop_candidates(
         hair_mask: np.ndarray,
         ear_mask: np.ndarray,
         anchor_mask: np.ndarray,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         points = np.argwhere(anchor_mask)
         if points.size == 0:
-            return np.zeros_like(base_search, dtype=np.float32)
+            zero = np.zeros_like(base_search, dtype=np.float32)
+            return zero, zero
         anchor_y, anchor_x = points.mean(axis=0)
         y_grid, x_grid = np.ogrid[:height, :width]
         # A hoop hangs from a lobe.  This is a *detection* corridor: it needs
@@ -687,14 +701,15 @@ def build_elliptical_hoop_candidates(
         # and multi-arc image support, so this wider window cannot create a
         # generic lower-ear write region.
         local_window = (
-            (y_grid >= anchor_y - 24.0)
-            & (y_grid <= anchor_y + 128.0)
-            & (x_grid >= anchor_x - 88.0)
-            & (x_grid <= anchor_x + 88.0)
+            (y_grid >= anchor_y - 24.0 * coordinate_scale)
+            & (y_grid <= anchor_y + 128.0 * coordinate_scale)
+            & (x_grid >= anchor_x - 88.0 * coordinate_scale)
+            & (x_grid <= anchor_x + 88.0 * coordinate_scale)
         )
         valid = base_search & local_window & ~hair_mask
         if int(valid.sum()) < 24:
-            return np.zeros_like(base_search, dtype=np.float32)
+            zero = np.zeros_like(base_search, dtype=np.float32)
+            return zero, zero
 
         gray = np.clip(np.round(image.mean(axis=2) * 255.0), 0, 255).astype(np.uint8)
         grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
@@ -750,6 +765,7 @@ def build_elliptical_hoop_candidates(
                 fitted_ellipses.append((float(center_x), float(center_y), diameter, diameter, 0.0))
 
         best_mask = None
+        best_hole = None
         best_score = -1.0
         support = cv2.dilate(edges, np.ones((5, 5), dtype=np.uint8)) > 0
         trace_support = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8)) > 0
@@ -791,37 +807,91 @@ def build_elliptical_hoop_candidates(
             # The lobe must touch the fitted perimeter.  A background ellipse
             # farther from the ear is not a valid accessory candidate.
             lobe_touch = bool(
-                (cv2.dilate(ellipse, np.ones((25, 25), dtype=np.uint8)) > 0)[anchor_mask].any()
+                (cv2.dilate(
+                    ellipse,
+                    np.ones((scaled_kernel(25), scaled_kernel(25)), dtype=np.uint8),
+                ) > 0)[anchor_mask].any()
             )
             if not lobe_touch:
                 continue
-            # The inside of a hoop remains target-owned.  Also do not write the
-            # source ear itself.  Only source pixels supported by a real edge
-            # are returned, so the fitted geometry can never copy background
-            # through the hollow centre or along an invented arc.
-            trace = ellipse_bool & trace_support & valid & ~cv2.dilate(
+            # A wire can attach on the ear boundary.  Exclude only the semantic
+            # ear interior, rather than a broad dilation that erases the
+            # source connector from lobe to hoop.
+            ear_interior = cv2.erode(
                 ear_mask.astype(np.uint8),
-                np.ones((5, 5), dtype=np.uint8),
+                np.ones((scaled_kernel(7), scaled_kernel(7)), dtype=np.uint8),
             ).astype(bool)
+            trace = ellipse_bool & trace_support & valid & ~ear_interior
+            # The suspension wire between lobe and hoop is not part of an
+            # ellipse perimeter, so fitting the ring alone necessarily drops
+            # it.  Recover only observed edges in the narrow straight corridor
+            # from the lobe to the nearest accepted ring pixel.  This cannot
+            # paint a broad ear/background patch because the corridor is used
+            # solely as an edge selector and only after hoop validation.
+            trace_points = np.argwhere(trace)
+            if trace_points.size > 0:
+                nearest_index = np.argmin(
+                    ((trace_points.astype(np.float32) - np.asarray([anchor_y, anchor_x])) ** 2).sum(axis=1)
+                )
+                nearest_y, nearest_x = trace_points[nearest_index]
+                connector_distance = float(np.hypot(nearest_y - anchor_y, nearest_x - anchor_x))
+                if connector_distance <= 72.0 * coordinate_scale:
+                    connector_corridor = np.zeros((height, width), dtype=np.uint8)
+                    cv2.line(
+                        connector_corridor,
+                        (int(round(anchor_x)), int(round(anchor_y))),
+                        (int(nearest_x), int(nearest_y)),
+                        255,
+                        thickness=scaled_kernel(5),
+                        lineType=cv2.LINE_8,
+                    )
+                    connector = (
+                        (connector_corridor > 0)
+                        & trace_support
+                        & valid
+                        & ~ear_interior
+                    )
+                    if int(connector.sum()) >= max(3, int(round(2.0 * coordinate_scale))):
+                        trace = trace | connector
             if int(trace.sum()) < max(12, int(minor * 0.35)):
                 continue
+            filled_ellipse = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(
+                filled_ellipse,
+                (int(round(center_x)), int(round(center_y))),
+                (max(1, int(round(axis_x / 2.0))), max(1, int(round(axis_y / 2.0)))),
+                float(angle),
+                0,
+                360,
+                255,
+                -1,
+                lineType=cv2.LINE_8,
+            )
+            # The geometry hole remains target-owned even when an antialiased
+            # source wire is not pixel-wise closed at the detection resolution.
+            hole = (filled_ellipse > 0) & ~cv2.dilate(
+                ellipse,
+                np.ones((scaled_kernel(5), scaled_kernel(5)), dtype=np.uint8),
+            ).astype(bool)
             score = coverage * float(sectors.size) * float(trace.sum())
             if score > best_score:
                 best_score = score
                 best_mask = trace
+                best_hole = hole
         if best_mask is None:
-            return np.zeros_like(base_search, dtype=np.float32)
-        return best_mask.astype(np.float32)
+            zero = np.zeros_like(base_search, dtype=np.float32)
+            return zero, zero
+        return best_mask.astype(np.float32), best_hole.astype(np.float32)
 
     for index in range(reference.size(0)):
-        left_out[index, 0] = trace_for_anchor(
+        left_out[index, 0], left_hole_out[index, 0] = trace_for_anchor(
             source_np[index],
             search_np[index, 0],
             hair_np[index, 0],
             ear_np[index, 0],
             left_anchor_np[index, 0],
         )
-        right_out[index, 0] = trace_for_anchor(
+        right_out[index, 0], right_hole_out[index, 0] = trace_for_anchor(
             source_np[index],
             search_np[index, 0],
             hair_np[index, 0],
@@ -832,6 +902,64 @@ def build_elliptical_hoop_candidates(
     return {
         "left_elliptical_hoop": torch.from_numpy(left_out).to(reference.device, reference.dtype),
         "right_elliptical_hoop": torch.from_numpy(right_out).to(reference.device, reference.dtype),
+        "left_elliptical_hoop_hole": torch.from_numpy(left_hole_out).to(reference.device, reference.dtype),
+        "right_elliptical_hoop_hole": torch.from_numpy(right_hole_out).to(reference.device, reference.dtype),
+    }
+
+
+def refine_earring_hoops_highres(
+    source_01: torch.Tensor,
+    search_mask: torch.Tensor,
+    left_lobe_anchor: torch.Tensor,
+    right_lobe_anchor: torch.Tensor,
+    *,
+    source_hair_mask: torch.Tensor | None = None,
+    source_ear_mask: torch.Tensor | None = None,
+    detection_size: int = 512,
+) -> dict[str, torch.Tensor]:
+    """Trace a validated hoop at 512px for the final RGB composite.
+
+    Learned PP masks live at 256px.  Directly enlarging one of those masks
+    makes a circular wire visibly thick and flattened.  This function retains
+    the same ear-local search policy but reruns the edge-supported geometry on
+    the high-resolution source reference at a bounded work size.
+    """
+
+    source_01 = normalized_to_01(source_01)
+    output_size = tuple(source_01.shape[-2:])
+    largest_side = max(output_size)
+    resize_scale = min(1.0, float(max(64, int(detection_size))) / float(largest_side))
+    detect_size = (
+        max(64, int(round(output_size[0] * resize_scale))),
+        max(64, int(round(output_size[1] * resize_scale))),
+    )
+    detector_scale = max(float(detect_size[0]), float(detect_size[1])) / 256.0
+
+    def resize_for_detection(value: torch.Tensor | None) -> torch.Tensor:
+        if value is None:
+            return torch.zeros(
+                source_01.shape[0],
+                1,
+                *detect_size,
+                device=source_01.device,
+                dtype=source_01.dtype,
+            )
+        value = ensure_mask_4d(value).to(device=source_01.device, dtype=source_01.dtype)
+        return F.interpolate(value, size=detect_size, mode="nearest")
+
+    candidates = build_elliptical_hoop_candidates(
+        F.interpolate(source_01, size=detect_size, mode="bilinear", align_corners=False),
+        resize_for_detection(search_mask),
+        resize_for_detection(left_lobe_anchor),
+        resize_for_detection(right_lobe_anchor),
+        source_hair_mask=resize_for_detection(source_hair_mask),
+        source_ear_mask=resize_for_detection(source_ear_mask),
+        min_axis=12.0 * detector_scale,
+        max_axis=168.0 * detector_scale,
+    )
+    return {
+        key: F.interpolate(value, size=output_size, mode="nearest")
+        for key, value in candidates.items()
     }
 
 
@@ -889,10 +1017,11 @@ def build_strong_earring_candidate(
 
     # Large metal hoops are often parser-missed and their thin wire may be
     # absent from the weak candidate after thresholding.  Promote only the
-    # high-contrast wire *outside* the semantic ear surface; this admits the
-    # visible ring while rejecting the ear's own contour as a fake accessory.
+    # high-contrast wire outside the semantic ear *interior*; this admits the
+    # lobe-to-hoop connector while rejecting the ear's own interior texture as
+    # a fake accessory.
     # It remains subject to side, lobe and density checks below.
-    ear_exterior = (1.0 - dilate_mask(source_ear, 5)).clamp(0, 1)
+    ear_exterior = (1.0 - erode_mask(source_ear, 7)).clamp(0, 1)
     visual_wire = edge_support * contrast_support * ear_exterior * ear_roi
     candidate = torch.maximum(candidate, visual_wire)
     elliptical_hoops = build_elliptical_hoop_candidates(
@@ -905,6 +1034,12 @@ def build_strong_earring_candidate(
     )
     elliptical_candidate = torch.clamp(
         elliptical_hoops["left_elliptical_hoop"] + elliptical_hoops["right_elliptical_hoop"],
+        0,
+        1,
+    )
+    elliptical_hole = torch.clamp(
+        elliptical_hoops["left_elliptical_hoop_hole"]
+        + elliptical_hoops["right_elliptical_hoop_hole"],
         0,
         1,
     )
@@ -975,6 +1110,9 @@ def build_strong_earring_candidate(
         "right_strong_candidate": right,
         "left_elliptical_hoop": elliptical_hoops["left_elliptical_hoop"],
         "right_elliptical_hoop": elliptical_hoops["right_elliptical_hoop"],
+        "elliptical_hoop_hole": elliptical_hole,
+        "left_elliptical_hoop_hole": elliptical_hoops["left_elliptical_hoop_hole"],
+        "right_elliptical_hoop_hole": elliptical_hoops["right_elliptical_hoop_hole"],
     }
 
 

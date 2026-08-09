@@ -27,6 +27,7 @@ from models.ear_modules_v5 import (
     build_earring_search_mask,
     build_earring_write_masks,
     build_strong_earring_candidate,
+    refine_earring_hoops_highres,
     expand_valid_roi_by_completion,
     build_revealed_skin_mask,
     build_weak_earring_masks,
@@ -455,7 +456,15 @@ class PostProcessModelV5(nn.Module):
         )
         write_mask = write_masks["write_mask"] * active
         visible_segment = write_masks["earring_object_mask"] * active
-        hoop_hole = write_masks["hoop_hole_mask"]
+        # A fitted hoop can have a visually broken wire at 256px.  Its centre
+        # is nevertheless known topologically and must remain target-owned;
+        # relying only on flood-fill would let source background leak through
+        # a one-pixel arc gap.
+        geometric_hoop_hole = self._mask_like(
+            query_info.get("elliptical_hoop_hole"),
+            reference,
+        ) * active
+        hoop_hole = torch.maximum(write_masks["hoop_hole_mask"], geometric_hoop_hole)
         # Redundant final exclusion is intentional: later feature-mask floors
         # must never refill a hoop centre.
         write_mask = write_mask * (1.0 - hoop_hole).clamp(0, 1)
@@ -581,6 +590,9 @@ class PostProcessModelV5(nn.Module):
         query_info["right_strong_candidate"] = strong_info["right_strong_candidate"]
         query_info["left_elliptical_hoop"] = strong_info["left_elliptical_hoop"]
         query_info["right_elliptical_hoop"] = strong_info["right_elliptical_hoop"]
+        query_info["elliptical_hoop_hole"] = strong_info["elliptical_hoop_hole"]
+        query_info["left_elliptical_hoop_hole"] = strong_info["left_elliptical_hoop_hole"]
+        query_info["right_elliptical_hoop_hole"] = strong_info["right_elliptical_hoop_hole"]
         parser_earring, no_earring = self._source_earring_case_masks(
             source_parsing,
             query_info,
@@ -1959,6 +1971,11 @@ class PostProcessModelV5(nn.Module):
         if target_authority is None:
             return image_01 * 2 - 1
 
+        earring_reference = resize_rgb(
+            aux.get("earring_reference_01", aux.get("source_01")),
+            mode="bilinear",
+        )
+
         # Compute the exact earring write region before composing the protected
         # target.  Every other semantic face pixel is restored below after the
         # high-resolution hair hand-off, which prevents that hand-off from
@@ -1967,9 +1984,67 @@ class PostProcessModelV5(nn.Module):
         no_earring = aux.get("no_earring_case_mask")
         if no_earring is not None:
             earring_edit = earring_edit * (1.0 - resize_earring_mask(no_earring)).clamp(0, 1)
-        hoop_hole = aux.get("hoop_hole_mask")
-        if hoop_hole is not None:
-            earring_edit = earring_edit * (1.0 - resize_earring_mask(hoop_hole)).clamp(0, 1)
+        hoop_hole = resize_earring_mask(aux.get("hoop_hole_mask"))
+        earring_edit = earring_edit * (1.0 - hoop_hole).clamp(0, 1)
+
+        # Refine accepted hoops from the original source reference at 512px.
+        # The learned PP path stays 256px, but direct 4x nearest upsampling was
+        # exactly what made a round wire look flattened and too thick.
+        highres_hoop_trace = torch.zeros_like(earring_edit)
+        highres_hoop_hole = torch.zeros_like(earring_edit)
+        if earring_reference is not None:
+            highres_hoops = refine_earring_hoops_highres(
+                earring_reference,
+                aux.get("source_lobe_search_mask", aux.get("earring_search_mask")),
+                aux.get("left_lobe_anchor"),
+                aux.get("right_lobe_anchor"),
+                source_hair_mask=aux.get("source_hair_mask"),
+                source_ear_mask=parsing_label_mask(aux.get("source_parsing"), RAW_EAR_SURFACE_LABELS)
+                if aux.get("source_parsing") is not None
+                else None,
+            )
+            left_active = resize_earring_mask(aux.get("left_side_active"))
+            right_active = resize_earring_mask(aux.get("right_side_active"))
+            highres_hoop_trace = torch.clamp(
+                highres_hoops["left_elliptical_hoop"] * left_active
+                + highres_hoops["right_elliptical_hoop"] * right_active,
+                0,
+                1,
+            )
+            highres_hoop_hole = torch.clamp(
+                highres_hoops["left_elliptical_hoop_hole"] * left_active
+                + highres_hoops["right_elliptical_hoop_hole"] * right_active,
+                0,
+                1,
+            )
+            if no_earring is not None:
+                active = (1.0 - resize_earring_mask(no_earring)).clamp(0, 1)
+                highres_hoop_trace = highres_hoop_trace * active
+                highres_hoop_hole = highres_hoop_hole * active
+
+            refined_present = highres_hoop_trace.flatten(1).sum(dim=1, keepdim=True) >= 12.0
+            refined_present = refined_present.to(earring_edit.dtype).view(-1, 1, 1, 1)
+            # Replace only the old coarse ring neighbourhood, retaining any
+            # parser-confirmed lobe connector outside it.  The geometric hole
+            # also clears every old source pixel through a broken ring centre.
+            replacement = torch.clamp(
+                highres_hoop_hole + dilate_mask(highres_hoop_trace, 13),
+                0,
+                1,
+            ) * refined_present
+            anchor = torch.clamp(
+                resize_earring_mask(aux.get("left_lobe_anchor"))
+                + resize_earring_mask(aux.get("right_lobe_anchor")),
+                0,
+                1,
+            )
+            connector_keep = earring_edit * dilate_mask(anchor, 33)
+            earring_edit = torch.maximum(
+                earring_edit * (1.0 - replacement).clamp(0, 1) + highres_hoop_trace,
+                connector_keep,
+            ).clamp(0, 1)
+            hoop_hole = torch.maximum(hoop_hole, highres_hoop_hole)
+            earring_edit = earring_edit * (1.0 - hoop_hole).clamp(0, 1)
         # A verified source earring often touches the lobe.  The former broad
         # ear-boundary subtraction erased small studs and one side of hoops
         # before RGB compositing.  The source object mask already excludes the
@@ -2066,18 +2141,16 @@ class PostProcessModelV5(nn.Module):
                 face_restore = face_alpha
 
         if bool(getattr(self.args, "enable_direct_earring_restore", True)):
-            reference = resize_rgb(
-                aux.get("earring_reference_01", aux.get("source_01")),
-                mode="bilinear",
-            )
-            if reference is not None:
-                protected = protected * (1.0 - earring_edit) + reference * earring_edit
+            if earring_reference is not None:
+                protected = protected * (1.0 - earring_edit) + earring_reference * earring_edit
         else:
             protected = protected * (1.0 - earring_edit) + image_01 * earring_edit
         aux["output_face_target_authority_mask"] = face_authority
         aux["output_direct_face_skin_restore_mask"] = face_restore
         aux["output_source_earring_composite_mask"] = earring_edit
         aux["output_v5_earring_edit_mask"] = earring_edit
+        aux["output_highres_hoop_trace"] = highres_hoop_trace
+        aux["output_highres_hoop_hole"] = highres_hoop_hole
         return protected.clamp(0, 1) * 2 - 1
 
     def render_refined(
