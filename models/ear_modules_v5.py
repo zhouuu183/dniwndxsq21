@@ -624,6 +624,317 @@ def compute_earring_hole_mask(component_mask: torch.Tensor) -> torch.Tensor:
     return (filled - component).clamp(0, 1)
 
 
+def _instance_parsing_mask(
+    parsing: torch.Tensor | None,
+    labels: tuple[int, ...],
+    size: tuple[int, int],
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    """Read raw parser labels at an RGB resolution without soft label edges."""
+
+    if parsing is None:
+        return torch.zeros_like(reference)
+    labels_map = ensure_mask_4d(parsing).to(device=reference.device)
+    if labels_map.shape[-2:] != size:
+        labels_map = F.interpolate(labels_map.float(), size=size, mode="nearest")
+    labels_map = labels_map.long()
+    result = torch.zeros_like(labels_map, dtype=torch.bool)
+    for label in labels:
+        result |= labels_map == int(label)
+    return result.to(dtype=reference.dtype)
+
+
+def _instance_adaptive_threshold(
+    value: torch.Tensor,
+    support: torch.Tensor,
+    *,
+    std_scale: float,
+    minimum_delta: float,
+    minimum_area: float,
+) -> torch.Tensor:
+    """Per-image threshold used by the source-object locator.
+
+    The earring detector must work for silver, black, gold and coloured
+    earrings, so an absolute RGB threshold is brittle.  The threshold is
+    evaluated only in the source ear/lobe corridor.
+    """
+
+    support = (ensure_mask_4d(support).float() > 0.5).to(dtype=value.dtype)
+    if value.size(1) != 1:
+        value = value.mean(dim=1, keepdim=True)
+    flat_support = support.flatten(2)
+    area = flat_support.sum(dim=2, keepdim=True).clamp_min(1.0)
+    mean = (value * support).flatten(2).sum(dim=2, keepdim=True) / area
+    mean = mean.view(-1, 1, 1, 1)
+    variance = ((value - mean).pow(2) * support).flatten(2).sum(dim=2, keepdim=True) / area
+    std = variance.sqrt().view(-1, 1, 1, 1)
+    enough = (flat_support.sum(dim=2, keepdim=True) >= float(minimum_area)).view(-1, 1, 1, 1)
+    return ((value > mean + float(std_scale) * std + float(minimum_delta)) * support * enough).to(value.dtype)
+
+
+def _instance_filter_components(
+    mask: torch.Tensor,
+    support: torch.Tensor,
+    *,
+    minimum_area: int,
+    maximum_area: int,
+    keep_per_side: int = 3,
+) -> torch.Tensor:
+    """Keep compact ear-local components without expanding them into a crop."""
+
+    binary = ((ensure_mask_4d(mask).float() > 0.5) * (ensure_mask_4d(support).float() > 0.05)).detach()
+    output = torch.zeros_like(binary)
+    if binary.flatten(1).amax().item() <= 0:
+        return output
+
+    binary_np = binary.cpu().numpy().astype(np.uint8)
+    output_np = np.zeros_like(binary_np, dtype=np.uint8)
+    for batch_idx in range(binary_np.shape[0]):
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary_np[batch_idx, 0],
+            connectivity=8,
+        ) if cv2 is not None else (0, None, None, None)
+        if component_count <= 1:
+            # OpenCV is optional in import-only environments.  Parser labels
+            # are still retained by the caller, while visual recall becomes a
+            # no-op instead of producing an unchecked broad mask.
+            continue
+        left_best: list[tuple[int, int]] = []
+        right_best: list[tuple[int, int]] = []
+        width = binary_np.shape[-1]
+        for component_id in range(1, component_count):
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            if area < int(minimum_area) or area > int(maximum_area):
+                continue
+            centre_x = int(round(float(stats[component_id, cv2.CC_STAT_LEFT]) + 0.5 * float(stats[component_id, cv2.CC_STAT_WIDTH])))
+            destination = left_best if centre_x <= width // 2 else right_best
+            destination.append((area, component_id))
+        for collection in (left_best, right_best):
+            collection.sort(reverse=True)
+            for _, component_id in collection[:max(1, int(keep_per_side))]:
+                output_np[batch_idx, 0][labels == component_id] = 1
+    return torch.from_numpy(output_np).to(device=mask.device, dtype=mask.dtype)
+
+
+def build_source_earring_instance_masks_v5(
+    source_01: torch.Tensor,
+    source_parsing: torch.Tensor | None,
+    *,
+    source_hair_mask: torch.Tensor | None = None,
+    source_seed_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Locate actual source earring pixels for the final V5 RGB composite.
+
+    This is a narrow port of the old PP earring locator that recovered normal
+    solid earrings reliably.  Unlike the former V5 high-resolution path it
+    does not fit an ellipse, run GrabCut over a crop, or treat the surrounding
+    source background as an object.  Raw label 9 remains a seed, while
+    parser-missed earrings are admitted only as compact, high-contrast objects
+    in the source ear/lobe corridor.
+    """
+
+    source_01 = normalized_to_01(source_01)
+    reference = source_01[:, :1]
+    size = tuple(source_01.shape[-2:])
+    zeros = torch.zeros_like(reference)
+    if source_parsing is None:
+        return {
+            "instance_mask": zeros,
+            "left_instance_mask": zeros,
+            "right_instance_mask": zeros,
+            "hoop_hole_mask": zeros,
+            "left_hoop_hole_mask": zeros,
+            "right_hoop_hole_mask": zeros,
+            "locator_roi": zeros,
+            "locator_seed": zeros,
+            "locator_support": zeros,
+            "locator_parser_mask": zeros,
+        }
+
+    parser_earring = _instance_parsing_mask(source_parsing, (RAW_EARRING,), size, reference)
+    left_ear = _instance_parsing_mask(source_parsing, (RAW_LEFT_EAR,), size, reference)
+    right_ear = _instance_parsing_mask(source_parsing, (RAW_RIGHT_EAR,), size, reference)
+    source_ear = torch.clamp(left_ear + right_ear, 0, 1)
+    face_surface = _instance_parsing_mask(source_parsing, RAW_FACE_SURFACE_LABELS, size, reference)
+    source_background = _instance_parsing_mask(source_parsing, (0,), size, reference)
+    source_hair = (
+        _instance_parsing_mask(source_parsing, (RAW_HAIR,), size, reference)
+        if source_hair_mask is None
+        else (F.interpolate(
+            ensure_mask_4d(source_hair_mask).float().to(device=source_01.device),
+            size=size,
+            mode="nearest",
+        ) > 0.5).to(dtype=source_01.dtype)
+    )
+    supplied_seed = zeros if source_seed_mask is None else (
+        F.interpolate(
+            ensure_mask_4d(source_seed_mask).float().to(device=source_01.device),
+            size=size,
+            mode="nearest",
+        ) > 0.5
+    ).to(dtype=source_01.dtype)
+
+    # The search area follows real source ears into the lobe region.  It is a
+    # detector corridor only: it never becomes a final write mask by itself.
+    scale = max(size) / 256.0
+
+    def scaled(value: float, minimum: int = 1) -> int:
+        rounded = max(int(minimum), int(round(float(value) * scale)))
+        return rounded if rounded % 2 == 1 else rounded + 1
+
+    ear_base = torch.clamp(source_ear + parser_earring + supplied_seed, 0, 1)
+    lobe_corridor = torch.clamp(
+        dilate_mask(ear_base, scaled(19, 3))
+        + dilate_mask(shift_mask(source_ear, down=scaled(12, 1)), scaled(17, 3))
+        + 0.80 * dilate_mask(shift_mask(source_ear, down=scaled(30, 1)), scaled(15, 3))
+        + 0.55 * dilate_mask(shift_mask(source_ear, down=scaled(52, 1)), scaled(13, 3))
+        + dilate_mask(parser_earring + supplied_seed, scaled(9, 3)),
+        0,
+        1,
+    )
+    # Never scan the facial centre for an accessory.  Parser label 9 is
+    # exempt so a large hanging earring is not clipped by a weak ear label.
+    face_inner = erode_mask(face_surface, scaled(9, 3))
+    locator_roi = lobe_corridor * (1.0 - 0.82 * face_inner).clamp(0, 1)
+    locator_roi = torch.clamp(locator_roi + parser_earring + supplied_seed, 0, 1)
+
+    gray = rgb_to_gray(source_01)
+    local_small = F.avg_pool2d(gray, kernel_size=scaled(7, 3), stride=1, padding=scaled(7, 3) // 2)
+    local_large = F.avg_pool2d(gray, kernel_size=scaled(21, 3), stride=1, padding=scaled(21, 3) // 2)
+    high = (gray - local_small).abs()
+    contrast = (gray - local_large).abs()
+    chroma = source_01.amax(dim=1, keepdim=True) - source_01.amin(dim=1, keepdim=True)
+    edge = sobel_magnitude(source_01).clamp(max=1.0)
+    local_colour = low_pass_filter(source_01, kernel_size=scaled(21, 3), sigma=max(1.0, 6.0 * scale))
+    colour_delta = (source_01 - local_colour).abs().mean(dim=1, keepdim=True)
+
+    # Background-coloured pixels are exactly the source content that created
+    # the old "hole" halo.  Measure objectness relative to local background,
+    # skin and hair rather than using edge magnitude alone.
+    def masked_mean(mask: torch.Tensor, minimum_area: float = 24.0) -> tuple[torch.Tensor, torch.Tensor]:
+        area = mask.flatten(1).sum(dim=1).view(-1, 1, 1, 1)
+        valid = (area >= float(minimum_area)).to(dtype=source_01.dtype)
+        mean = (source_01 * mask).sum(dim=(2, 3), keepdim=True) / area.clamp_min(1.0)
+        return mean, valid
+
+    skin_mean, skin_valid = masked_mean(erode_mask(face_surface, scaled(9, 3)))
+    hair_mean, hair_valid = masked_mean(erode_mask(source_hair, scaled(7, 3)))
+    bg_mean, bg_valid = masked_mean(source_background * dilate_mask(locator_roi, scaled(41, 3)))
+    dist_skin = (source_01 - skin_mean).pow(2).mean(dim=1, keepdim=True).sqrt()
+    dist_hair = (source_01 - hair_mean).pow(2).mean(dim=1, keepdim=True).sqrt()
+    dist_bg = (source_01 - bg_mean).pow(2).mean(dim=1, keepdim=True).sqrt()
+    dist_hair = torch.where(hair_valid > 0, dist_hair, torch.ones_like(dist_hair))
+    dist_bg = torch.where(bg_valid > 0, dist_bg, torch.ones_like(dist_bg))
+    colour_objectness = torch.clamp(
+        0.95 * dist_skin + 0.55 * torch.minimum(dist_skin, torch.minimum(dist_hair, dist_bg)) + 0.45 * chroma,
+        0,
+        1,
+    )
+    texture_objectness = torch.clamp(high + contrast + 0.55 * edge + 0.45 * colour_delta, 0, 1)
+    evidence = torch.clamp(
+        1.15 * texture_objectness + 1.05 * colour_objectness + 0.45 * chroma,
+        0,
+        1,
+    ) * locator_roi
+
+    visual_seed = _instance_adaptive_threshold(
+        evidence,
+        locator_roi,
+        std_scale=0.20,
+        minimum_delta=0.010,
+        minimum_area=8.0 * scale * scale,
+    )
+    visual_support = _instance_adaptive_threshold(
+        0.75 * evidence + 0.25 * texture_objectness,
+        locator_roi,
+        std_scale=0.04,
+        minimum_delta=0.003,
+        minimum_area=8.0 * scale * scale,
+    )
+    # Suppress hair edges unless the semantic parser explicitly identifies an
+    # earring there.  This is what lets a target-visible ear recover a metal
+    # object without replacing adjacent source hair with a dark patch.
+    visual_seed = visual_seed * (1.0 - 0.68 * source_hair).clamp(0, 1)
+    visual_support = visual_support * (1.0 - 0.42 * source_hair).clamp(0, 1)
+    parser_neighbourhood = dilate_mask(parser_earring + supplied_seed, scaled(7, 3))
+    # A face parser often labels just one arc of a hollow earring.  Limiting
+    # visual recall to that labelled arc was the reason the other half of a
+    # hoop disappeared.  Search the whole ear/lobe corridor for strong visual
+    # evidence, while retaining label 9 as an additional seed.  Component
+    # filtering below still rejects the large background component.
+    seed = torch.clamp(visual_seed + parser_earring + supplied_seed, 0, 1)
+    support = torch.clamp(
+        visual_support + dilate_mask(parser_earring + supplied_seed, scaled(3, 1)),
+        0,
+        1,
+    ) * locator_roi
+
+    # Grow only through evidence pixels.  The proxy repairs one-pixel gaps in
+    # a wire for connected-component selection; the returned RGB mask remains
+    # source-object supported and is never the grown solid region.
+    reachable = seed * locator_roi
+    for _ in range(2):
+        reachable = torch.clamp(reachable + dilate_mask(reachable, scaled(3, 1)) * support, 0, 1)
+    object_pixels = torch.clamp(reachable * (visual_support + parser_neighbourhood) + parser_earring + supplied_seed, 0, 1)
+    object_pixels = object_pixels * locator_roi
+    proxy = dilate_mask(object_pixels, scaled(3, 1)) * locator_roi
+    minimum_area = max(2, int(round(3.0 * scale * scale)))
+    maximum_area = max(minimum_area, int(round(0.025 * size[0] * size[1])))
+    kept_proxy = _instance_filter_components(
+        proxy,
+        locator_roi,
+        minimum_area=minimum_area,
+        maximum_area=maximum_area,
+    )
+    instance = object_pixels * dilate_mask(kept_proxy, scaled(3, 1))
+    # Raw label 9 is an observed object, not a colour proposal.  Preserve it
+    # after component filtering so small studs cannot disappear.
+    instance = torch.clamp(instance + parser_earring + supplied_seed, 0, 1) * locator_roi
+
+    # Split using source ear positions where available.  The centre split is
+    # only a fallback for parser-missed ears; it is never used as a detector.
+    left_context = torch.clamp(
+        dilate_mask(left_ear, scaled(27, 3))
+        + shift_mask(dilate_mask(left_ear, scaled(23, 3)), down=scaled(36, 1))
+        + (parser_earring + supplied_seed) * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) <= size[1] // 2),
+        0,
+        1,
+    )
+    right_context = torch.clamp(
+        dilate_mask(right_ear, scaled(27, 3))
+        + shift_mask(dilate_mask(right_ear, scaled(23, 3)), down=scaled(36, 1))
+        + (parser_earring + supplied_seed) * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) > size[1] // 2),
+        0,
+        1,
+    )
+    left_instance = instance * left_context
+    right_instance = instance * right_context
+    unassigned = instance * (1.0 - torch.clamp(left_context + right_context, 0, 1))
+    x_grid = torch.arange(size[1], device=reference.device).view(1, 1, 1, -1)
+    left_instance = torch.clamp(left_instance + unassigned * (x_grid <= size[1] // 2), 0, 1)
+    right_instance = torch.clamp(right_instance + unassigned * (x_grid > size[1] // 2), 0, 1)
+
+    # The hole is inferred only from a locally closed visual object.  It is
+    # composed from the target output below, so it can never retain source
+    # hair/background even for an unusually large hollow earring.
+    left_proxy = dilate_mask(left_instance, scaled(3, 1))
+    right_proxy = dilate_mask(right_instance, scaled(3, 1))
+    left_hole = compute_earring_hole_mask(left_proxy) * locator_roi
+    right_hole = compute_earring_hole_mask(right_proxy) * locator_roi
+    return {
+        "instance_mask": torch.clamp(left_instance + right_instance, 0, 1),
+        "left_instance_mask": left_instance.clamp(0, 1),
+        "right_instance_mask": right_instance.clamp(0, 1),
+        "hoop_hole_mask": torch.clamp(left_hole + right_hole, 0, 1),
+        "left_hoop_hole_mask": left_hole.clamp(0, 1),
+        "right_hoop_hole_mask": right_hole.clamp(0, 1),
+        "locator_roi": locator_roi.clamp(0, 1),
+        "locator_seed": seed.clamp(0, 1),
+        "locator_support": support.clamp(0, 1),
+        "locator_parser_mask": parser_earring.clamp(0, 1),
+    }
+
+
 def refine_earring_instances_highres(
     source_01: torch.Tensor,
     source_parsing: torch.Tensor | None,
