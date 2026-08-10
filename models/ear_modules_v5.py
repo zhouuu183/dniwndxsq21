@@ -769,6 +769,10 @@ def build_source_earring_instance_masks_v5(
             mode="nearest",
         ) > 0.5).to(dtype=source_01.dtype)
     )
+    # ``source_seed_mask`` is a low-resolution *presence/locator* hint.  It
+    # must never become an object pixel by itself: an upsampled 256px seed is
+    # exactly the blocky source-background/ear patch that caused black debris,
+    # false hoops and duplicated lobes in the final composite.
     supplied_seed = zeros if source_seed_mask is None else (
         F.interpolate(
             ensure_mask_4d(source_seed_mask).float().to(device=source_01.device),
@@ -785,13 +789,14 @@ def build_source_earring_instance_masks_v5(
         rounded = max(int(minimum), int(round(float(value) * scale)))
         return rounded if rounded % 2 == 1 else rounded + 1
 
-    ear_base = torch.clamp(source_ear + parser_earring + supplied_seed, 0, 1)
+    locator_hint = dilate_mask(supplied_seed, scaled(3, 1))
+    ear_base = torch.clamp(source_ear + parser_earring + locator_hint, 0, 1)
     lobe_corridor = torch.clamp(
         dilate_mask(ear_base, scaled(19, 3))
         + dilate_mask(shift_mask(source_ear, down=scaled(12, 1)), scaled(17, 3))
         + 0.80 * dilate_mask(shift_mask(source_ear, down=scaled(30, 1)), scaled(15, 3))
         + 0.55 * dilate_mask(shift_mask(source_ear, down=scaled(52, 1)), scaled(13, 3))
-        + dilate_mask(parser_earring + supplied_seed, scaled(9, 3)),
+        + dilate_mask(parser_earring + locator_hint, scaled(9, 3)),
         0,
         1,
     )
@@ -799,7 +804,7 @@ def build_source_earring_instance_masks_v5(
     # exempt so a large hanging earring is not clipped by a weak ear label.
     face_inner = erode_mask(face_surface, scaled(9, 3))
     locator_roi = lobe_corridor * (1.0 - 0.82 * face_inner).clamp(0, 1)
-    locator_roi = torch.clamp(locator_roi + parser_earring + supplied_seed, 0, 1)
+    locator_roi = torch.clamp(locator_roi + parser_earring + locator_hint, 0, 1)
 
     gray = rgb_to_gray(source_01)
     local_small = F.avg_pool2d(gray, kernel_size=scaled(7, 3), stride=1, padding=scaled(7, 3) // 2)
@@ -878,22 +883,39 @@ def build_source_earring_instance_masks_v5(
         * (1.0 - source_background).clamp(0, 1)
         * torch.clamp((1.0 - source_ear) + ear_detail, 0, 1)
     )
-    # This is not a generic earring candidate.  It may include a source
-    # background-labelled wire only after the ring verifier proves a complete
-    # lobe-connected circular structure in the final compositor.
+    # Parser-missed jewellery is often labelled as source background.  Permit
+    # such a pixel only when the low-resolution stage already found a compact
+    # ear-local seed *and* the high-resolution pixel carries independent local
+    # object evidence.  The seed still does not write RGB on its own.  This is
+    # intentionally much narrower than the old broad lower-ear recall patch.
+    seeded_background_object = (
+        source_background
+        * dilate_mask(supplied_seed, scaled(5, 1))
+        * visual_seed
+        * torch.clamp(contrast + 0.65 * colour_delta + 0.35 * edge, 0, 1)
+    )
+    seeded_background_object = (seeded_background_object > 0.15).to(source_01.dtype)
+    visual_source_gate = torch.clamp(visual_source_gate + seeded_background_object, 0, 1)
+    # Ring geometry gets a separate, more permissive support map.  It is a
+    # verifier only and never creates a synthetic ellipse for RGB output.
     ring_support = visual_support * (1.0 - source_hair).clamp(0, 1)
     ring_support = ring_support * (1.0 - erode_mask(source_ear, scaled(7, 3))).clamp(0, 1)
     visual_seed = visual_seed * visual_source_gate
     visual_support = visual_support * visual_source_gate
-    parser_neighbourhood = dilate_mask(parser_earring + supplied_seed, scaled(7, 3))
+    parser_neighbourhood = dilate_mask(parser_earring, scaled(7, 3))
     # A face parser often labels just one arc of a hollow earring.  Limiting
     # visual recall to that labelled arc was the reason the other half of a
     # hoop disappeared.  Search the whole ear/lobe corridor for strong visual
     # evidence, while retaining label 9 as an additional seed.  Component
     # filtering below still rejects the large background component.
-    seed = torch.clamp(visual_seed + parser_earring + supplied_seed, 0, 1)
+    # Keep the supplied low-resolution seed as a *connectivity hint* only
+    # after it has met high-resolution visual evidence.  In particular, do not
+    # add ``supplied_seed`` directly here or below: that would copy its coarse
+    # rectangle even when every source pixel is ear skin or grass.
+    seeded_visual = supplied_seed * visual_seed * visual_source_gate
+    seed = torch.clamp(visual_seed + parser_earring + seeded_visual, 0, 1)
     support = torch.clamp(
-        visual_support + dilate_mask(parser_earring + supplied_seed, scaled(3, 1)),
+        visual_support + dilate_mask(parser_earring + seeded_visual, scaled(3, 1)),
         0,
         1,
     ) * locator_roi
@@ -904,7 +926,11 @@ def build_source_earring_instance_masks_v5(
     reachable = seed * locator_roi
     for _ in range(2):
         reachable = torch.clamp(reachable + dilate_mask(reachable, scaled(3, 1)) * support, 0, 1)
-    object_pixels = torch.clamp(reachable * (visual_support + parser_neighbourhood) + parser_earring + supplied_seed, 0, 1)
+    object_pixels = torch.clamp(
+        reachable * (visual_support + parser_neighbourhood) + parser_earring + seeded_visual,
+        0,
+        1,
+    )
     object_pixels = object_pixels * locator_roi
     proxy = dilate_mask(object_pixels, scaled(3, 1)) * locator_roi
     minimum_area = max(2, int(round(3.0 * scale * scale)))
@@ -918,21 +944,21 @@ def build_source_earring_instance_masks_v5(
     instance = object_pixels * dilate_mask(kept_proxy, scaled(3, 1))
     # Raw label 9 is an observed object, not a colour proposal.  Preserve it
     # after component filtering so small studs cannot disappear.
-    instance = torch.clamp(instance + parser_earring + supplied_seed, 0, 1) * locator_roi
+    instance = torch.clamp(instance + parser_earring + seeded_visual, 0, 1) * locator_roi
 
     # Split using source ear positions where available.  The centre split is
     # only a fallback for parser-missed ears; it is never used as a detector.
     left_context = torch.clamp(
         dilate_mask(left_ear, scaled(27, 3))
         + shift_mask(dilate_mask(left_ear, scaled(23, 3)), down=scaled(36, 1))
-        + (parser_earring + supplied_seed) * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) <= size[1] // 2),
+        + parser_earring * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) <= size[1] // 2),
         0,
         1,
     )
     right_context = torch.clamp(
         dilate_mask(right_ear, scaled(27, 3))
         + shift_mask(dilate_mask(right_ear, scaled(23, 3)), down=scaled(36, 1))
-        + (parser_earring + supplied_seed) * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) > size[1] // 2),
+        + parser_earring * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) > size[1] // 2),
         0,
         1,
     )
@@ -974,6 +1000,7 @@ def build_source_earring_instance_masks_v5(
         "right_hoop_hole_mask": right_hole.clamp(0, 1),
         "locator_roi": locator_roi.clamp(0, 1),
         "locator_seed": seed.clamp(0, 1),
+        "locator_presence_seed": supplied_seed.clamp(0, 1),
         "locator_support": support.clamp(0, 1),
         "locator_ring_support": ring_support.clamp(0, 1),
         "locator_parser_mask": parser_earring.clamp(0, 1),

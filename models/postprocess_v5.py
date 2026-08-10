@@ -2007,11 +2007,42 @@ class PostProcessModelV5(nn.Module):
         highres_locator_support = torch.zeros_like(earring_edit)
         highres_locator_ring_support = torch.zeros_like(earring_edit)
         highres_locator_parser = torch.zeros_like(earring_edit)
+        highres_locator_presence_seed = torch.zeros_like(earring_edit)
+        source_earring_presence_gate = torch.zeros_like(earring_edit)
         if earring_reference is not None:
+            # Geometry alone is not source-earring evidence.  Without this
+            # gate, a curved grass or hair edge beside an ear can be fitted as
+            # a hoop and copied to an image whose source has no accessory.
+            # These are source-aligned, independently accepted low-resolution
+            # seeds; they guide high-resolution localisation but are never
+            # composited at their blocky low-resolution shape.
+            reliable_source_seed = torch.zeros_like(earring_edit)
+            for key in (
+                "source_parser_earring_mask",
+                "strong_earring_candidate_core",
+            ):
+                value = aux.get(key)
+                if value is not None:
+                    reliable_source_seed = torch.maximum(
+                        reliable_source_seed,
+                        resize_earring_mask(value),
+                    )
+            no_earring = aux.get("no_earring_case_mask")
+            source_case_active = torch.ones_like(earring_edit)
+            if no_earring is not None:
+                source_case_active = (
+                    1.0 - resize_earring_mask(no_earring)
+                ).clamp(0, 1)
+            source_seed_present = (
+                reliable_source_seed.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(earring_edit.dtype).view(-1, 1, 1, 1)
+            source_case_active = source_case_active * source_seed_present
+            source_earring_presence_gate = source_case_active
             source_instances = build_source_earring_instance_masks_v5(
                 earring_reference,
                 aux.get("source_parsing"),
                 source_hair_mask=aux.get("source_hair_mask"),
+                source_seed_mask=reliable_source_seed,
             )
             left_active = resize_earring_mask(
                 aux.get("left_target_side_open", aux.get("left_side_active"))
@@ -2041,10 +2072,10 @@ class PostProcessModelV5(nn.Module):
                 min_axis=4.0,
                 min_coverage=0.20,
             )
-            left_geometry_trace = highres_geometry["left_elliptical_hoop"] * left_active
-            right_geometry_trace = highres_geometry["right_elliptical_hoop"] * right_active
-            left_geometry_hole = highres_geometry["left_elliptical_hoop_hole"] * left_active
-            right_geometry_hole = highres_geometry["right_elliptical_hoop_hole"] * right_active
+            left_geometry_trace = highres_geometry["left_elliptical_hoop"] * left_active * source_case_active
+            right_geometry_trace = highres_geometry["right_elliptical_hoop"] * right_active * source_case_active
+            left_geometry_hole = highres_geometry["left_elliptical_hoop_hole"] * left_active * source_case_active
+            right_geometry_hole = highres_geometry["right_elliptical_hoop_hole"] * right_active * source_case_active
             highres_geometry_trace = torch.clamp(left_geometry_trace + right_geometry_trace, 0, 1)
             highres_geometry_hole = torch.clamp(left_geometry_hole + right_geometry_hole, 0, 1)
             # ``refine_earring_hoops_highres`` already returns only source
@@ -2057,23 +2088,23 @@ class PostProcessModelV5(nn.Module):
             left_instance = source_instances["left_instance_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
-            ) * left_active
+            ) * left_active * source_case_active
             left_instance = torch.maximum(left_instance, left_geometry_observed)
             right_instance = source_instances["right_instance_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
-            ) * right_active
+            ) * right_active * source_case_active
             right_instance = torch.maximum(right_instance, right_geometry_observed)
-            highres_instance = torch.clamp(left_instance + right_instance, 0, 1)
+            highres_instance = torch.clamp(left_instance + right_instance, 0, 1) * source_case_active
             highres_instance_hole = (
                 source_instances["left_hoop_hole_mask"].to(
                     device=earring_edit.device,
                     dtype=earring_edit.dtype,
-                ) * left_active
+                ) * left_active * source_case_active
                 + source_instances["right_hoop_hole_mask"].to(
                     device=earring_edit.device,
                     dtype=earring_edit.dtype,
-                ) * right_active
+                ) * right_active * source_case_active
             ).clamp(0, 1)
             highres_instance_hole = torch.maximum(
                 highres_instance_hole,
@@ -2096,6 +2127,10 @@ class PostProcessModelV5(nn.Module):
                 dtype=earring_edit.dtype,
             )
             highres_locator_parser = source_instances["locator_parser_mask"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            )
+            highres_locator_presence_seed = source_instances["locator_presence_seed"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             )
@@ -2210,6 +2245,7 @@ class PostProcessModelV5(nn.Module):
         aux["output_direct_face_skin_restore_mask"] = face_restore
         aux["output_source_earring_composite_mask"] = earring_edit
         aux["output_v5_earring_edit_mask"] = earring_edit
+        aux["output_source_earring_presence_gate"] = source_earring_presence_gate
         aux["output_highres_earring_instance"] = highres_instance
         aux["output_highres_earring_hole"] = highres_instance_hole
         aux["output_highres_earring_geometry_seed"] = highres_geometry_trace
@@ -2220,6 +2256,7 @@ class PostProcessModelV5(nn.Module):
         aux["output_source_earring_locator_support"] = highres_locator_support
         aux["output_source_earring_locator_ring_support"] = highres_locator_ring_support
         aux["output_source_earring_locator_parser"] = highres_locator_parser
+        aux["output_source_earring_locator_presence_seed"] = highres_locator_presence_seed
         # Compatibility debug aliases.  They now show the real instance, not
         # a synthetic ellipse, so existing visualisation scripts stay useful.
         aux["output_highres_hoop_trace"] = highres_instance
