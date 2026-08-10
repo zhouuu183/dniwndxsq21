@@ -535,10 +535,6 @@ class EarAwareLossBuilder(LossBuilderMulti):
         earring_confident_mask = aux.get("earring_confident_mask", source_ear_mask)
         earring_highlight_mask = aux.get("earring_highlight_mask")
         earring_reference = aux.get("earring_reference", source)
-        earring_instance_target = aux.get("earring_instance_target")
-        earring_hole_target = aux.get("earring_hole_target")
-        earring_source_presence_target = aux.get("earring_source_presence_target")
-        earring_noop_target = aux.get("earring_noop_target")
         revealed_skin_mask = aux.get("revealed_skin_mask")
         revealed_skin_blend_mask = aux.get("revealed_skin_blend_mask", revealed_skin_mask)
         fine_mask = aux.get("fine_mask")
@@ -839,44 +835,10 @@ class EarAwareLossBuilder(LossBuilderMulti):
             aux.get("earring_write_mask", earring_confident_mask),
             gen_F_256_01.shape[-2:],
         )
-        if earring_instance_target is not None:
-            # Dataset instance supervision is authoritative.  Do not use an
-            # online write/search mask as a proxy for a real earring body.
-            earring_write_mask = resize_mask(
-                earring_instance_target,
-                gen_F_256_01.shape[-2:],
-            )
-            earring_confident_mask = earring_write_mask
-            source_ear_mask = earring_write_mask
-        hoop_hole_mask = earring_hole_target
-        if hoop_hole_mask is None:
-            hoop_hole_mask = aux.get("hoop_hole_mask")
+        hoop_hole_mask = aux.get("hoop_hole_mask")
         if hoop_hole_mask is not None:
             hoop_hole_mask = resize_mask(hoop_hole_mask, gen_F_256_01.shape[-2:])
         no_earring_case = aux.get("no_earring_case_mask", aux.get("no_earring_case"))
-        if earring_noop_target is not None:
-            noop_target = earring_noop_target.to(
-                device=gen_F_256_01.device,
-                dtype=gen_F_256_01.dtype,
-            ).view(-1, 1, 1, 1)
-            no_earring_case = noop_target.expand(
-                -1,
-                1,
-                gen_F_256_01.shape[-2],
-                gen_F_256_01.shape[-1],
-            )
-        elif earring_source_presence_target is not None:
-            source_presence = earring_source_presence_target.to(
-                device=gen_F_256_01.device,
-                dtype=gen_F_256_01.dtype,
-            )
-            noop_target = 1.0 - source_presence[:, 2:3].view(-1, 1, 1, 1)
-            no_earring_case = noop_target.expand(
-                -1,
-                1,
-                gen_F_256_01.shape[-2],
-                gen_F_256_01.shape[-1],
-            )
         if no_earring_case is not None:
             no_earring_case = resize_mask(no_earring_case, gen_F_256_01.shape[-2:])
         target_ear_boundary = aux.get("target_ear_boundary_protect_mask")
@@ -920,37 +882,6 @@ class EarAwareLossBuilder(LossBuilderMulti):
                     high_pass_filter(gen_F_256_01),
                     high_pass_filter(earring_reference),
                     earring_write_mask,
-                )
-            )
-
-        spill_weight = self.losses_dict.get("earring_spill", 0.0)
-        if spill_weight > 0:
-            # Source background, grass, an ear-skin clone and a second lobe
-            # are all "spill": they are local to the earring search corridor
-            # but outside the labelled object and its target-owned hole.
-            spill_scope = torch.clamp(
-                resize_mask(query_mask, gen_F_256_01.shape[-2:])
-                + dilate_mask(
-                    earring_write_mask
-                    + (hoop_hole_mask if hoop_hole_mask is not None else 0),
-                    9,
-                ),
-                0,
-                1,
-            )
-            spill_mask = spill_scope * (
-                1.0 - dilate_mask(
-                    earring_write_mask
-                    + (hoop_hole_mask if hoop_hole_mask is not None else 0),
-                    3,
-                )
-            ).clamp(0, 1)
-            losses["earring_spill"] = spill_weight * (
-                masked_l1(gen_F_256_01, target, spill_mask)
-                + 0.5 * masked_l1(
-                    high_pass_filter(gen_F_256_01),
-                    high_pass_filter(target),
-                    spill_mask,
                 )
             )
         if target_earring_suppress_mask is not None:
@@ -1038,26 +969,21 @@ class EarAwareLossBuilder(LossBuilderMulti):
                 )
 
         earring_supervision_dilate = int(self.losses_dict.get("earring_supervision_dilate", 5))
-        if earring_instance_target is not None:
-            # Never fill a hoop centre or invent an object from a weak online
-            # proposal when exact regenerated-instance supervision exists.
-            mask_target = earring_write_mask
-        else:
-            earring_supervision = dilate_mask(earring_confident_mask, earring_supervision_dilate) * query_mask
-            weak_pseudo_mask = torch.zeros_like(earring_confident_mask)
-            if earring_confident_mask.detach().sum().item() < 1:
-                weak_pseudo_mask, _ = build_weak_ear_pseudo_mask(
-                    earring_reference,
-                    query_mask,
-                    earring_confident_mask,
-                )
-            if no_earring_case is not None:
-                weak_pseudo_mask = weak_pseudo_mask * (1.0 - no_earring_case).clamp(0, 1)
-            mask_target = torch.clamp(
-                weak_pseudo_mask + earring_supervision + earring_confident_mask,
-                0,
-                1,
+        earring_supervision = dilate_mask(earring_confident_mask, earring_supervision_dilate) * query_mask
+        weak_pseudo_mask = torch.zeros_like(earring_confident_mask)
+        if earring_confident_mask.detach().sum().item() < 1:
+            weak_pseudo_mask, _ = build_weak_ear_pseudo_mask(
+                earring_reference,
+                query_mask,
+                earring_confident_mask,
             )
+        if no_earring_case is not None:
+            weak_pseudo_mask = weak_pseudo_mask * (1.0 - no_earring_case).clamp(0, 1)
+        mask_target = torch.clamp(
+            weak_pseudo_mask + earring_supervision + earring_confident_mask,
+            0,
+            1,
+        )
         if hoop_hole_mask is not None:
             mask_target = mask_target * (1.0 - hoop_hole_mask).clamp(0, 1)
         query_expand = float(self.losses_dict.get("ear_query_expand", 0.02))
@@ -1145,16 +1071,9 @@ class EarAwareLossBuilder(LossBuilderMulti):
 
         presence_weight = self.losses_dict.get("ear_presence", 0.0)
         if presence_weight > 0 and presence_logits is not None:
+            weak_presence_target = build_weak_presence_target(mask_target, earring_confident_mask * query_mask)
             if presence_target is not None:
-                # Explicit per-side labels must be able to say "absent".  The
-                # former maximum with a pseudo mask made a grass/ear edge a
-                # positive presence target even in a no-earring example.
-                weak_presence_target = presence_target.float()
-            else:
-                weak_presence_target = build_weak_presence_target(
-                    mask_target,
-                    earring_confident_mask * query_mask,
-                )
+                weak_presence_target = torch.maximum(weak_presence_target, presence_target.float())
             losses["ear_presence"] = presence_weight * self.presence_bce(presence_logits, weak_presence_target)
 
         brightness_weight = self.losses_dict.get("ear_brightness_reg", 0.0)

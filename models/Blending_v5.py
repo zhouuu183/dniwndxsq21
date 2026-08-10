@@ -117,9 +117,6 @@ class BlendingV5(Blending_v8):
             earring_query_block_protect=pp_policy_value("earring_query_block_protect", 0.95),
             disable_earring_path_if_low_confidence=pp_policy_value("disable_earring_path_if_low_confidence", True),
             earring_source_presence_min_area=pp_policy_value("earring_source_presence_min_area", 4.0),
-            earring_learned_presence_threshold=pp_policy_value(
-                "earring_learned_presence_threshold", 0.55
-            ),
             earring_search_downward_shift=pp_policy_value("earring_search_downward_shift", 10),
             earring_search_dilate=pp_policy_value("earring_search_dilate", 7),
             earring_write_max_target_hair_overlap=pp_policy_value(
@@ -662,8 +659,6 @@ class BlendingV5(Blending_v8):
                 "output_source_earring_composite_mask",
                 "output_v5_earring_edit_mask",
                 "output_source_earring_presence_gate",
-                "output_learned_earring_presence_gate",
-                "output_learned_earring_seed",
                 "output_highres_earring_instance",
                 "output_highres_earring_hole",
                 "output_highres_earring_refined_instance",

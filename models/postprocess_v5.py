@@ -2012,8 +2012,6 @@ class PostProcessModelV5(nn.Module):
         highres_refined_instance = torch.zeros_like(earring_edit)
         highres_refined_hole = torch.zeros_like(earring_edit)
         source_earring_presence_gate = torch.zeros_like(earring_edit)
-        learned_earring_presence_gate = torch.zeros_like(earring_edit)
-        learned_earring_seed = torch.zeros_like(earring_edit)
         # The native-resolution earring compositor is intentionally an
         # inference/validation operation.  Its masks are built from detached
         # source pixels and OpenCV, so running it during every training batch
@@ -2041,44 +2039,6 @@ class PostProcessModelV5(nn.Module):
                         reliable_source_seed,
                         resize_earring_mask(value),
                     )
-            # A learned mask may refine an already independently observed
-            # source instance.  It is deliberately *not* allowed to overturn
-            # a no-earring source decision: a positive network score is not
-            # source-pixel evidence and was the path that pasted grass, hair
-            # fragments, or a duplicate earlobe as an invented earring.
-            # Parser-missed genuine earrings enter through the strong visual
-            # candidate above; the learned mask can then reconnect their thin
-            # observed parts but still never writes RGB by itself.
-            observed_source_seed = reliable_source_seed
-            observed_source_present = (
-                observed_source_seed.flatten(1).sum(dim=1, keepdim=True) >= 1.0
-            ).to(earring_edit.dtype).view(-1, 1, 1, 1)
-            learned_mask = aux.get("fine_mask")
-            learned_logits = aux.get("presence_logits")
-            if learned_mask is not None and learned_logits is not None:
-                learned_logits = learned_logits.to(
-                    device=earring_edit.device,
-                    dtype=earring_edit.dtype,
-                )
-                if learned_logits.ndim == 1:
-                    learned_logits = learned_logits.unsqueeze(1)
-                learned_probability = torch.sigmoid(learned_logits)
-                learned_probability = learned_probability[:, :2].amax(dim=1, keepdim=True)
-                learned_probability = learned_probability.view(-1, 1, 1, 1)
-                learned_threshold = float(
-                    getattr(self.args, "earring_learned_presence_threshold", 0.55)
-                )
-                learned_earring_presence_gate = (
-                    learned_probability >= learned_threshold
-                ).to(earring_edit.dtype) * observed_source_present
-                learned_earring_seed = (
-                    resize_earring_mask(learned_mask)
-                    * learned_earring_presence_gate
-                )
-                reliable_source_seed = torch.maximum(
-                    reliable_source_seed,
-                    learned_earring_seed,
-                )
             no_earring = aux.get("no_earring_case_mask")
             source_case_active = torch.ones_like(earring_edit)
             if no_earring is not None:
@@ -2088,9 +2048,6 @@ class PostProcessModelV5(nn.Module):
             source_seed_present = (
                 reliable_source_seed.flatten(1).sum(dim=1, keepdim=True) >= 1.0
             ).to(earring_edit.dtype).view(-1, 1, 1, 1)
-            # ``no_earring_case_mask`` remains a hard source-side veto.  The
-            # learned gate above can refine the pixels of an observed object,
-            # but cannot reactivate an absent source accessory.
             source_case_active = source_case_active * source_seed_present
             source_earring_presence_gate = source_case_active
             source_instances = build_source_earring_instance_masks_v5(
@@ -2337,8 +2294,6 @@ class PostProcessModelV5(nn.Module):
         aux["output_source_earring_composite_mask"] = earring_edit
         aux["output_v5_earring_edit_mask"] = earring_edit
         aux["output_source_earring_presence_gate"] = source_earring_presence_gate
-        aux["output_learned_earring_presence_gate"] = learned_earring_presence_gate
-        aux["output_learned_earring_seed"] = learned_earring_seed
         aux["output_highres_earring_instance"] = highres_instance
         aux["output_highres_earring_hole"] = highres_instance_hole
         aux["output_highres_earring_refined_instance"] = highres_refined_instance
