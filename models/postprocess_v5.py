@@ -353,24 +353,32 @@ class PostProcessModelV5(nn.Module):
         right_roi = self._mask_like(query_info.get("right_ear_roi"), reference)
         left_active = self._mask_like(query_info.get("left_side_active"), reference)
         right_active = self._mask_like(query_info.get("right_side_active"), reference)
-        if left_active.detach().flatten(1).amax(dim=1).max().item() <= 0:
+        left_missing = (
+            left_active.detach().flatten(1).amax(dim=1) <= 0
+        ).view(-1, 1, 1, 1)
+        if left_missing.any().item():
             left_ear = self._mask_like(query_info.get("target_left_ear_mask"), reference)
             left_skin = self._mask_like(query_info.get("target_skin_surface_mask"), reference)
-            left_active = (
+            left_fallback = (
                 (left_ear + left_skin * left_roi * (1.0 - target_hair_occlusion)).clamp(0, 1)
                 .flatten(1)
                 .sum(dim=1, keepdim=True)
                 >= float(getattr(self.args, "min_target_ear_area", 8.0))
             ).to(reference.dtype).view(-1, 1, 1, 1)
-        if right_active.detach().flatten(1).amax(dim=1).max().item() <= 0:
+            left_active = torch.where(left_missing, left_fallback, left_active)
+        right_missing = (
+            right_active.detach().flatten(1).amax(dim=1) <= 0
+        ).view(-1, 1, 1, 1)
+        if right_missing.any().item():
             right_ear = self._mask_like(query_info.get("target_right_ear_mask"), reference)
             right_skin = self._mask_like(query_info.get("target_skin_surface_mask"), reference)
-            right_active = (
+            right_fallback = (
                 (right_ear + right_skin * right_roi * (1.0 - target_hair_occlusion)).clamp(0, 1)
                 .flatten(1)
                 .sum(dim=1, keepdim=True)
                 >= float(getattr(self.args, "min_target_ear_area", 8.0))
             ).to(reference.dtype).view(-1, 1, 1, 1)
+            right_active = torch.where(right_missing, right_fallback, right_active)
         side_gate = torch.clamp(left_active * left_roi + right_active * right_roi, 0, 1)
         # ``left/right_roi`` are deliberately compact ear-local regions.  They
         # are suitable for deciding which side is visible, but are too short to
@@ -1997,6 +2005,7 @@ class PostProcessModelV5(nn.Module):
         highres_locator_roi = torch.zeros_like(earring_edit)
         highres_locator_seed = torch.zeros_like(earring_edit)
         highres_locator_support = torch.zeros_like(earring_edit)
+        highres_locator_ring_support = torch.zeros_like(earring_edit)
         highres_locator_parser = torch.zeros_like(earring_edit)
         if earring_reference is not None:
             source_instances = build_source_earring_instance_masks_v5(
@@ -2037,11 +2046,11 @@ class PostProcessModelV5(nn.Module):
             right_geometry_hole = highres_geometry["right_elliptical_hoop_hole"] * right_active
             highres_geometry_trace = torch.clamp(left_geometry_trace + right_geometry_trace, 0, 1)
             highres_geometry_hole = torch.clamp(left_geometry_hole + right_geometry_hole, 0, 1)
-            left_geometry_observed = source_instances["locator_support"].to(
+            left_geometry_observed = source_instances["locator_ring_support"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             ) * dilate_mask(left_geometry_trace, 3)
-            right_geometry_observed = source_instances["locator_support"].to(
+            right_geometry_observed = source_instances["locator_ring_support"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             ) * dilate_mask(right_geometry_trace, 3)
@@ -2079,6 +2088,10 @@ class PostProcessModelV5(nn.Module):
                 dtype=earring_edit.dtype,
             )
             highres_locator_support = source_instances["locator_support"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            )
+            highres_locator_ring_support = source_instances["locator_ring_support"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             )
@@ -2205,6 +2218,7 @@ class PostProcessModelV5(nn.Module):
         aux["output_source_earring_locator_roi"] = highres_locator_roi
         aux["output_source_earring_locator_seed"] = highres_locator_seed
         aux["output_source_earring_locator_support"] = highres_locator_support
+        aux["output_source_earring_locator_ring_support"] = highres_locator_ring_support
         aux["output_source_earring_locator_parser"] = highres_locator_parser
         # Compatibility debug aliases.  They now show the real instance, not
         # a synthetic ellipse, so existing visualisation scripts stay useful.

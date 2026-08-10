@@ -748,6 +748,7 @@ def build_source_earring_instance_masks_v5(
             "locator_roi": zeros,
             "locator_seed": zeros,
             "locator_support": zeros,
+            "locator_ring_support": zeros,
             "locator_parser_mask": zeros,
             "left_lobe_anchor": zeros,
             "right_lobe_anchor": zeros,
@@ -820,13 +821,16 @@ def build_source_earring_instance_masks_v5(
         return mean, valid
 
     skin_mean, skin_valid = masked_mean(erode_mask(face_surface, scaled(9, 3)))
+    ear_mean, ear_valid = masked_mean(erode_mask(source_ear, scaled(7, 3)))
     hair_mean, hair_valid = masked_mean(erode_mask(source_hair, scaled(7, 3)))
     bg_mean, bg_valid = masked_mean(source_background * dilate_mask(locator_roi, scaled(41, 3)))
     dist_skin = (source_01 - skin_mean).pow(2).mean(dim=1, keepdim=True).sqrt()
+    dist_ear = (source_01 - ear_mean).pow(2).mean(dim=1, keepdim=True).sqrt()
     dist_hair = (source_01 - hair_mean).pow(2).mean(dim=1, keepdim=True).sqrt()
     dist_bg = (source_01 - bg_mean).pow(2).mean(dim=1, keepdim=True).sqrt()
     dist_hair = torch.where(hair_valid > 0, dist_hair, torch.ones_like(dist_hair))
     dist_bg = torch.where(bg_valid > 0, dist_bg, torch.ones_like(dist_bg))
+    dist_ear = torch.where(ear_valid > 0, dist_ear, torch.ones_like(dist_ear))
     colour_objectness = torch.clamp(
         0.95 * dist_skin + 0.55 * torch.minimum(dist_skin, torch.minimum(dist_hair, dist_bg)) + 0.45 * chroma,
         0,
@@ -853,23 +857,32 @@ def build_source_earring_instance_masks_v5(
         minimum_delta=0.003,
         minimum_area=8.0 * scale * scale,
     )
-    # A source background/hair pixel cannot become an earring merely because
-    # it has an edge.  This is the failure that produced black hair fragments
-    # on an otherwise exposed target ear.  Label 9 is added back below as an
-    # explicit exception.  Background-labelled metal remains eligible only
-    # where it differs from its local background, which retains real hoop
-    # wires while rejecting the quiet interior/background they enclose.
-    background_detail = _instance_adaptive_threshold(
-        high + contrast + colour_delta + 0.35 * chroma,
-        source_background * locator_roi,
+    # A generic visual object may not originate from source background or
+    # source hair.  The earlier policy admitted textured background as long
+    # as it looked unlike its local neighbours, which is exactly why grass was
+    # pasted around the ear.  Hoops use a separate geometry-verified support
+    # path below because their wire can be parser-labelled background.
+    #
+    # Ear skin is not excluded wholesale: a small stud sits on it.  It must,
+    # however, be visually distinct from the local ear colour/texture; this
+    # removes the duplicated round earlobe while retaining metal and gems.
+    ear_detail = _instance_adaptive_threshold(
+        dist_ear + 0.65 * chroma + 0.45 * colour_delta + 0.25 * edge,
+        source_ear * locator_roi,
         std_scale=0.10,
         minimum_delta=0.004,
         minimum_area=8.0 * scale * scale,
     )
     visual_source_gate = (
         (1.0 - source_hair).clamp(0, 1)
-        * torch.clamp((1.0 - source_background) + background_detail, 0, 1)
+        * (1.0 - source_background).clamp(0, 1)
+        * torch.clamp((1.0 - source_ear) + ear_detail, 0, 1)
     )
+    # This is not a generic earring candidate.  It may include a source
+    # background-labelled wire only after the ring verifier proves a complete
+    # lobe-connected circular structure in the final compositor.
+    ring_support = visual_support * (1.0 - source_hair).clamp(0, 1)
+    ring_support = ring_support * (1.0 - erode_mask(source_ear, scaled(7, 3))).clamp(0, 1)
     visual_seed = visual_seed * visual_source_gate
     visual_support = visual_support * visual_source_gate
     parser_neighbourhood = dilate_mask(parser_earring + supplied_seed, scaled(7, 3))
@@ -962,6 +975,7 @@ def build_source_earring_instance_masks_v5(
         "locator_roi": locator_roi.clamp(0, 1),
         "locator_seed": seed.clamp(0, 1),
         "locator_support": support.clamp(0, 1),
+        "locator_ring_support": ring_support.clamp(0, 1),
         "locator_parser_mask": parser_earring.clamp(0, 1),
         "left_lobe_anchor": left_lobe_anchor.clamp(0, 1),
         "right_lobe_anchor": right_lobe_anchor.clamp(0, 1),

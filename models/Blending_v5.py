@@ -666,6 +666,7 @@ class BlendingV5(Blending_v8):
                 "output_source_earring_locator_roi",
                 "output_source_earring_locator_seed",
                 "output_source_earring_locator_support",
+                "output_source_earring_locator_ring_support",
                 "output_source_earring_locator_parser",
                 "output_highres_hoop_trace",
                 "output_highres_hoop_hole",
