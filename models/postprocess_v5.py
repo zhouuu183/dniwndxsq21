@@ -28,6 +28,7 @@ from models.ear_modules_v5 import (
     build_earring_write_masks,
     build_strong_earring_candidate,
     build_source_earring_instance_masks_v5,
+    refine_earring_instances_highres,
     refine_earring_hoops_highres,
     expand_valid_roi_by_completion,
     build_revealed_skin_mask,
@@ -2008,6 +2009,8 @@ class PostProcessModelV5(nn.Module):
         highres_locator_ring_support = torch.zeros_like(earring_edit)
         highres_locator_parser = torch.zeros_like(earring_edit)
         highres_locator_presence_seed = torch.zeros_like(earring_edit)
+        highres_refined_instance = torch.zeros_like(earring_edit)
+        highres_refined_hole = torch.zeros_like(earring_edit)
         source_earring_presence_gate = torch.zeros_like(earring_edit)
         if earring_reference is not None:
             # Geometry alone is not source-earring evidence.  Without this
@@ -2061,6 +2064,36 @@ class PostProcessModelV5(nn.Module):
                 if source_parsing is not None
                 else None
             )
+            # The compact locator above is deliberately conservative.  Run a
+            # second source-native pass to recover an ordinary stud, pendant
+            # or suspension wire that the parser reduced to a few pixels.  Its
+            # seed can initialise the segmentation but cannot be returned as
+            # RGB by itself (see ``refine_earring_instances_highres``).
+            highres_refined = refine_earring_instances_highres(
+                earring_reference,
+                source_parsing,
+                reliable_source_seed,
+                source_instances["locator_roi"],
+                source_instances["left_lobe_anchor"],
+                source_instances["right_lobe_anchor"],
+                left_active,
+                right_active,
+                source_hair_mask=aux.get("source_hair_mask"),
+                source_ear_mask=source_ear,
+            )
+            refined_left = highres_refined["left_instance_mask"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            ) * left_active * source_case_active
+            refined_right = highres_refined["right_instance_mask"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            ) * right_active * source_case_active
+            highres_refined_instance = torch.clamp(refined_left + refined_right, 0, 1)
+            highres_refined_hole = highres_refined["hoop_hole_mask"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            ) * source_case_active
             highres_geometry = refine_earring_hoops_highres(
                 earring_reference,
                 source_instances["locator_roi"],
@@ -2089,11 +2122,13 @@ class PostProcessModelV5(nn.Module):
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             ) * left_active * source_case_active
+            left_instance = torch.maximum(left_instance, refined_left)
             left_instance = torch.maximum(left_instance, left_geometry_observed)
             right_instance = source_instances["right_instance_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             ) * right_active * source_case_active
+            right_instance = torch.maximum(right_instance, refined_right)
             right_instance = torch.maximum(right_instance, right_geometry_observed)
             highres_instance = torch.clamp(left_instance + right_instance, 0, 1) * source_case_active
             highres_instance_hole = (
@@ -2106,6 +2141,10 @@ class PostProcessModelV5(nn.Module):
                     dtype=earring_edit.dtype,
                 ) * right_active * source_case_active
             ).clamp(0, 1)
+            highres_instance_hole = torch.maximum(
+                highres_instance_hole,
+                highres_refined_hole,
+            )
             highres_instance_hole = torch.maximum(
                 highres_instance_hole,
                 highres_geometry_hole,
@@ -2248,6 +2287,8 @@ class PostProcessModelV5(nn.Module):
         aux["output_source_earring_presence_gate"] = source_earring_presence_gate
         aux["output_highres_earring_instance"] = highres_instance
         aux["output_highres_earring_hole"] = highres_instance_hole
+        aux["output_highres_earring_refined_instance"] = highres_refined_instance
+        aux["output_highres_earring_refined_hole"] = highres_refined_hole
         aux["output_highres_earring_geometry_seed"] = highres_geometry_trace
         aux["output_highres_earring_geometry_hole"] = highres_geometry_hole
         aux["output_highres_earring_geometry_footprint"] = highres_geometry_footprint

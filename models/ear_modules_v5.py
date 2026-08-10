@@ -1238,6 +1238,7 @@ def refine_earring_instances_highres(
         active: np.ndarray,
         anchor: np.ndarray,
         side_seed: np.ndarray,
+        observed_seed: np.ndarray,
         side_search: np.ndarray,
         side_hair: np.ndarray,
         side_ear: np.ndarray,
@@ -1246,7 +1247,12 @@ def refine_earring_instances_highres(
         empty = np.zeros((height, width), dtype=bool)
         if not active.any():
             return empty, empty
+        # ``side_seed`` may come from a 256px detector.  It is allowed to
+        # initialise GrabCut and connectivity, but it is not a source object
+        # pixel.  Only the raw parser label is observed directly; every other
+        # recovered pixel has to survive the high-resolution structure test.
         seed = side_seed.copy()
+        observed = observed_seed.copy()
         anchor_points = np.argwhere(anchor)
         if anchor_points.size == 0:
             seed_points = np.argwhere(seed)
@@ -1267,6 +1273,7 @@ def refine_earring_instances_highres(
         # image evidence near the lobe.  This is still a source-instance seed,
         # never permission to copy the lobe neighbourhood itself.
         seed &= local_window
+        observed &= local_window
         if int(seed.sum()) < max(3, int(round(0.75 * scale))):
             seed = strict_visual_seed(
                 image,
@@ -1291,6 +1298,7 @@ def refine_earring_instances_highres(
 
         crop_image = image[y0:y1, x0:x1]
         crop_seed = seed[y0:y1, x0:x1]
+        crop_observed = observed[y0:y1, x0:x1]
         crop_local = local[y0:y1, x0:x1]
         crop_hair = side_hair[y0:y1, x0:x1]
         crop_ear = side_ear[y0:y1, x0:x1]
@@ -1346,10 +1354,14 @@ def refine_earring_instances_highres(
         local_delta = np.abs(crop_image.astype(np.int16) - blurred.astype(np.int16)).mean(axis=2)
         delta_floor = max(5.0, float(np.percentile(local_delta[crop_local], 78)))
         visual_support = edge_band | (local_delta >= delta_floor)
-        candidate &= (visual_support | crop_seed)
-        candidate |= crop_seed
+        # Do not retain a coarse seed rectangle.  This is the critical
+        # difference between a source-instance extractor and the old
+        # lower-ear patch: parser pixels are observed; low-resolution seed
+        # pixels only propose where a real high-resolution boundary may be.
+        candidate &= visual_support
+        candidate |= crop_observed
         candidate &= (~crop_hair_interior | near_seed)
-        candidate = component_mask_connected_to_seed(candidate, crop_seed)
+        candidate = component_mask_connected_to_seed(candidate, crop_seed | crop_observed)
 
         # GraphCut can occasionally absorb a flat background region when a
         # source parser label is tiny.  Fall back to genuine source edges plus
@@ -1361,7 +1373,10 @@ def refine_earring_instances_highres(
                 edges.astype(np.uint8),
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(5), odd(5))),
             ).astype(bool)
-            candidate = component_mask_connected_to_seed((edge_band & crop_local) | crop_seed, crop_seed)
+            candidate = component_mask_connected_to_seed(
+                (edge_band & crop_local) | crop_observed,
+                crop_seed | crop_observed,
+            )
 
         hole = enclosed_holes(candidate, crop_local)
         instance = np.zeros((height, width), dtype=bool)
@@ -1380,6 +1395,7 @@ def refine_earring_instances_highres(
             left_active_np[index, 0],
             left_anchor_np[index, 0],
             seed,
+            parser_np[index, 0],
             search_np[index, 0],
             hair_np[index, 0],
             ear_np[index, 0],
@@ -1389,6 +1405,7 @@ def refine_earring_instances_highres(
             right_active_np[index, 0],
             right_anchor_np[index, 0],
             seed,
+            parser_np[index, 0],
             search_np[index, 0],
             hair_np[index, 0],
             ear_np[index, 0],
