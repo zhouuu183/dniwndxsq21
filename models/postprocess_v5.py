@@ -2012,7 +2012,16 @@ class PostProcessModelV5(nn.Module):
         highres_refined_instance = torch.zeros_like(earring_edit)
         highres_refined_hole = torch.zeros_like(earring_edit)
         source_earring_presence_gate = torch.zeros_like(earring_edit)
-        if earring_reference is not None:
+        # The native-resolution earring compositor is intentionally an
+        # inference/validation operation.  Its masks are built from detached
+        # source pixels and OpenCV, so running it during every training batch
+        # cannot contribute gradients.  Keeping it out of the training
+        # forward removes the large CPU synchronisation cost without changing
+        # the learned PP path or final inference output.
+        enable_highres_output = bool(
+            getattr(self.args, "enable_highres_earring_output_refine", True)
+        ) and not self.training
+        if earring_reference is not None and enable_highres_output:
             # Geometry alone is not source-earring evidence.  Without this
             # gate, a curved grass or hair edge beside an ear can be fitted as
             # a hoop and copied to an image whose source has no accessory.
@@ -2298,6 +2307,10 @@ class PostProcessModelV5(nn.Module):
         aux["output_source_earring_locator_ring_support"] = highres_locator_ring_support
         aux["output_source_earring_locator_parser"] = highres_locator_parser
         aux["output_source_earring_locator_presence_seed"] = highres_locator_presence_seed
+        aux["output_highres_earring_output_refine_enabled"] = torch.full_like(
+            earring_edit,
+            float(enable_highres_output),
+        )
         # Compatibility debug aliases.  They now show the real instance, not
         # a synthetic ellipse, so existing visualisation scripts stay useful.
         aux["output_highres_hoop_trace"] = highres_instance

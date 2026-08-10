@@ -672,6 +672,7 @@ class BlendingV5(Blending_v8):
                 "output_source_earring_locator_ring_support",
                 "output_source_earring_locator_parser",
                 "output_source_earring_locator_presence_seed",
+                "output_highres_earring_output_refine_enabled",
                 "output_highres_hoop_trace",
                 "output_highres_hoop_hole",
                 "output_face_target_authority_mask",
