@@ -28,6 +28,7 @@ from models.ear_modules_v5 import (
     build_earring_write_masks,
     build_strong_earring_candidate,
     build_source_earring_instance_masks_v5,
+    refine_earring_hoops_highres,
     expand_valid_roi_by_completion,
     build_revealed_skin_mask,
     build_weak_earring_masks,
@@ -2009,14 +2010,51 @@ class PostProcessModelV5(nn.Module):
             right_active = resize_earring_mask(
                 aux.get("right_target_side_open", aux.get("right_side_active"))
             )
+            # This is a ring-only verifier.  It returns a geometric boundary
+            # and a separate interior, but neither synthetic geometry mask is
+            # composited directly.  The boundary only unlocks nearby source
+            # pixels already accepted by the visual locator, while the
+            # interior remains target-owned.
+            source_parsing = aux.get("source_parsing")
+            source_ear = (
+                parsing_label_mask(source_parsing, RAW_EAR_SURFACE_LABELS)
+                if source_parsing is not None
+                else None
+            )
+            highres_geometry = refine_earring_hoops_highres(
+                earring_reference,
+                source_instances["locator_roi"],
+                source_instances["left_lobe_anchor"],
+                source_instances["right_lobe_anchor"],
+                source_hair_mask=aux.get("source_hair_mask"),
+                source_ear_mask=source_ear,
+                min_axis=4.0,
+                min_coverage=0.20,
+            )
+            left_geometry_trace = highres_geometry["left_elliptical_hoop"] * left_active
+            right_geometry_trace = highres_geometry["right_elliptical_hoop"] * right_active
+            left_geometry_hole = highres_geometry["left_elliptical_hoop_hole"] * left_active
+            right_geometry_hole = highres_geometry["right_elliptical_hoop_hole"] * right_active
+            highres_geometry_trace = torch.clamp(left_geometry_trace + right_geometry_trace, 0, 1)
+            highres_geometry_hole = torch.clamp(left_geometry_hole + right_geometry_hole, 0, 1)
+            left_geometry_observed = source_instances["locator_support"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            ) * dilate_mask(left_geometry_trace, 3)
+            right_geometry_observed = source_instances["locator_support"].to(
+                device=earring_edit.device,
+                dtype=earring_edit.dtype,
+            ) * dilate_mask(right_geometry_trace, 3)
             left_instance = source_instances["left_instance_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             ) * left_active
+            left_instance = torch.maximum(left_instance, left_geometry_observed)
             right_instance = source_instances["right_instance_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
             ) * right_active
+            right_instance = torch.maximum(right_instance, right_geometry_observed)
             highres_instance = torch.clamp(left_instance + right_instance, 0, 1)
             highres_instance_hole = (
                 source_instances["left_hoop_hole_mask"].to(
@@ -2028,6 +2066,10 @@ class PostProcessModelV5(nn.Module):
                     dtype=earring_edit.dtype,
                 ) * right_active
             ).clamp(0, 1)
+            highres_instance_hole = torch.maximum(
+                highres_instance_hole,
+                highres_geometry_hole,
+            )
             highres_locator_roi = source_instances["locator_roi"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,

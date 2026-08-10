@@ -749,6 +749,8 @@ def build_source_earring_instance_masks_v5(
             "locator_seed": zeros,
             "locator_support": zeros,
             "locator_parser_mask": zeros,
+            "left_lobe_anchor": zeros,
+            "right_lobe_anchor": zeros,
         }
 
     parser_earring = _instance_parsing_mask(source_parsing, (RAW_EARRING,), size, reference)
@@ -851,11 +853,25 @@ def build_source_earring_instance_masks_v5(
         minimum_delta=0.003,
         minimum_area=8.0 * scale * scale,
     )
-    # Suppress hair edges unless the semantic parser explicitly identifies an
-    # earring there.  This is what lets a target-visible ear recover a metal
-    # object without replacing adjacent source hair with a dark patch.
-    visual_seed = visual_seed * (1.0 - 0.68 * source_hair).clamp(0, 1)
-    visual_support = visual_support * (1.0 - 0.42 * source_hair).clamp(0, 1)
+    # A source background/hair pixel cannot become an earring merely because
+    # it has an edge.  This is the failure that produced black hair fragments
+    # on an otherwise exposed target ear.  Label 9 is added back below as an
+    # explicit exception.  Background-labelled metal remains eligible only
+    # where it differs from its local background, which retains real hoop
+    # wires while rejecting the quiet interior/background they enclose.
+    background_detail = _instance_adaptive_threshold(
+        high + contrast + colour_delta + 0.35 * chroma,
+        source_background * locator_roi,
+        std_scale=0.10,
+        minimum_delta=0.004,
+        minimum_area=8.0 * scale * scale,
+    )
+    visual_source_gate = (
+        (1.0 - source_hair).clamp(0, 1)
+        * torch.clamp((1.0 - source_background) + background_detail, 0, 1)
+    )
+    visual_seed = visual_seed * visual_source_gate
+    visual_support = visual_support * visual_source_gate
     parser_neighbourhood = dilate_mask(parser_earring + supplied_seed, scaled(7, 3))
     # A face parser often labels just one arc of a hollow earring.  Limiting
     # visual recall to that labelled arc was the reason the other half of a
@@ -914,6 +930,21 @@ def build_source_earring_instance_masks_v5(
     left_instance = torch.clamp(left_instance + unassigned * (x_grid <= size[1] // 2), 0, 1)
     right_instance = torch.clamp(right_instance + unassigned * (x_grid > size[1] // 2), 0, 1)
 
+    left_lobe_anchor = build_earlobe_anchor(
+        left_ear,
+        fallback_skin_mask=face_surface * (x_grid <= size[1] // 2).to(face_surface.dtype),
+        ear_roi=left_context,
+        lower_ratio=0.62,
+        dilate=scaled(3, 1),
+    )
+    right_lobe_anchor = build_earlobe_anchor(
+        right_ear,
+        fallback_skin_mask=face_surface * (x_grid > size[1] // 2).to(face_surface.dtype),
+        ear_roi=right_context,
+        lower_ratio=0.62,
+        dilate=scaled(3, 1),
+    )
+
     # The hole is inferred only from a locally closed visual object.  It is
     # composed from the target output below, so it can never retain source
     # hair/background even for an unusually large hollow earring.
@@ -932,6 +963,8 @@ def build_source_earring_instance_masks_v5(
         "locator_seed": seed.clamp(0, 1),
         "locator_support": support.clamp(0, 1),
         "locator_parser_mask": parser_earring.clamp(0, 1),
+        "left_lobe_anchor": left_lobe_anchor.clamp(0, 1),
+        "right_lobe_anchor": right_lobe_anchor.clamp(0, 1),
     }
 
 
