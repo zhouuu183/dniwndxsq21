@@ -52,6 +52,16 @@ ONLINE_EARRING_AUX_KEYS = {
     "earring_candidate_mask",
     "earring_search_mask",
 }
+EARRING_INSTANCE_MASK_KEYS = (
+    "source_earring_instance_mask",
+    "earring_instance_mask",
+    "earring_hole_mask",
+)
+EARRING_INSTANCE_VECTOR_KEYS = (
+    "earring_source_presence_target",
+    "earring_target_visibility_target",
+    "earring_presence_target",
+)
 # Only the six pipeline images the user wants to inspect.  All mask/debug
 # columns were removed from the validation preview.
 VAL_COLUMNS = (
@@ -249,8 +259,8 @@ USER_EARRING_MIN_REFINED_OBJECT_AREA = 2.0
 USER_ALLOW_VISUAL_EARRING_SEED = False
 USER_VISUAL_EARRING_SEED_MIN_AREA = 6.0
 USER_VISUAL_EARRING_SEED_MAX_DENSITY = 0.12
-USER_PREFER_DATASET_EARRING_REFERENCE = False
-USER_USE_DATASET_EARRING_AUX = False
+USER_PREFER_DATASET_EARRING_REFERENCE = True
+USER_USE_DATASET_EARRING_AUX = True
 USER_EXPAND_DATASET_EARRING_FROM_REFERENCE_DELTA = False
 USER_EARRING_VISIBLE_ROI_EXCLUDE_TARGET_HAIR = False
 USER_REFRESH_EARRING_REFERENCE = False
@@ -298,6 +308,7 @@ USER_LAMBDA_TARGET_EAR_GEOMETRY = 5.0
 USER_LAMBDA_NO_EARRING_NOOP = 6.0
 USER_LAMBDA_HOOP_HOLE_PRESERVE = 8.0
 USER_LAMBDA_EARRING_OBJECT_RESTORE = 3.0
+USER_LAMBDA_EARRING_SPILL = 4.0
 USER_USE_DATASET_QUERY_MASK = False
 USER_USE_DATASET_SOURCE_EARRING_MASK = True
 USER_POSITIVE_ONLY_WARMUP_EPOCHS = 20
@@ -528,6 +539,7 @@ RESOLVED_USER_CONFIG = {
     "no_earring_noop": USER_LAMBDA_NO_EARRING_NOOP,
     "hoop_hole_preserve": USER_LAMBDA_HOOP_HOLE_PRESERVE,
     "earring_object_restore": USER_LAMBDA_EARRING_OBJECT_RESTORE,
+    "earring_spill": USER_LAMBDA_EARRING_SPILL,
     "use_dataset_query_mask": USER_USE_DATASET_QUERY_MASK,
     "use_dataset_source_earring_mask": USER_USE_DATASET_SOURCE_EARRING_MASK,
     "positive_only_warmup_epochs": USER_POSITIVE_ONLY_WARMUP_EPOCHS,
@@ -756,6 +768,7 @@ def build_parser(defaults):
     parser.add_argument("--no_earring_noop", type=float, default=defaults["no_earring_noop"])
     parser.add_argument("--hoop_hole_preserve", type=float, default=defaults["hoop_hole_preserve"])
     parser.add_argument("--earring_object_restore", type=float, default=defaults["earring_object_restore"])
+    parser.add_argument("--earring_spill", type=float, default=defaults["earring_spill"])
     parser.add_argument("--use_dataset_query_mask", type=str2bool, default=defaults["use_dataset_query_mask"])
     parser.add_argument(
         "--use_dataset_source_earring_mask",
@@ -939,6 +952,7 @@ class TrainerV5:
                 "no_earring_noop": args.no_earring_noop,
                 "hoop_hole_preserve": args.hoop_hole_preserve,
                 "earring_object_restore": args.earring_object_restore,
+                "earring_spill": args.earring_spill,
             }
             self.loss_builder = EarAwareLossBuilder(loss_weights, device=self.device)
             if args.compute_fid:
@@ -1140,6 +1154,16 @@ class TrainerV5:
                 "earring_search_mask",
                 resolve_dataset_gate(DATASET_AUX_MASK_FLAGS["earring_search_mask"]),
             )
+
+        # These are dataset truths, not online proposals.  Keep them under
+        # distinct names so losses never confuse a search/write mask with an
+        # actual object, a hollow centre, or a negative no-earring example.
+        aux["earring_instance_target"] = batch["earring_instance_mask"]
+        aux["earring_hole_target"] = batch["earring_hole_mask"]
+        aux["earring_source_presence_target"] = batch["earring_source_presence_target"]
+        aux["earring_target_visibility_target"] = batch["earring_target_visibility_target"]
+        aux["earring_noop_target"] = batch["earring_noop_target"]
+        aux["presence_target"] = batch["earring_presence_target"]
 
         gen_im_W, _ = self.net.generator([latent_s], input_is_latent=True, return_latents=False)
         F_w, _ = self.net.generator([latent_s], input_is_latent=True, return_latents=False, start_layer=0, end_layer=4)
@@ -1475,7 +1499,8 @@ class PPDatasetV5(Dataset):
                         "source_earring_mask", "target_earring_mask", "query_mask", "ear_roi",
                         "visible_ear_roi", "earring_valid_roi", "target_covered_ear_block_mask",
                         "source_hair_block_mask", "source_earring_object_mask", "source_earring_seed_mask",
-                        "earring_search_mask", *CLEANUP_MASK_KEYS, *PP_EXTRA_MASK_KEYS]
+                        "earring_search_mask", *EARRING_INSTANCE_MASK_KEYS,
+                        *CLEANUP_MASK_KEYS, *PP_EXTRA_MASK_KEYS]
         for key in keys_to_flip:
             if key in sample:
                 sample[key] = T.functional.hflip(sample[key])
@@ -1487,6 +1512,8 @@ class PPDatasetV5(Dataset):
         sample["left_ear_roi"] = right_roi
         sample["right_ear_roi"] = left_roi
         sample["presence_target"] = sample["presence_target"][[1, 0, 2]]
+        for key in EARRING_INSTANCE_VECTOR_KEYS:
+            sample[key] = sample[key][[1, 0, 2]]
         return sample
 
     def __getitem__(self, idx):
@@ -1510,8 +1537,15 @@ class PPDatasetV5(Dataset):
                 dtype=torch.float32,
             ),
             "source_earring_mask": item["source_earring_mask"].clone(),
-            "source_earring_object_mask": item.get("source_earring_object_mask", item["source_earring_mask"]).clone(),
-            "source_earring_seed_mask": item.get("source_earring_seed_mask", item["source_earring_mask"]).clone(),
+            "source_earring_object_mask": item["source_earring_object_mask"].clone(),
+            "source_earring_seed_mask": item["source_earring_seed_mask"].clone(),
+            "source_earring_instance_mask": item["source_earring_instance_mask"].clone(),
+            "earring_instance_mask": item["earring_instance_mask"].clone(),
+            "earring_hole_mask": item["earring_hole_mask"].clone(),
+            "earring_source_presence_target": item["earring_source_presence_target"].clone(),
+            "earring_target_visibility_target": item["earring_target_visibility_target"].clone(),
+            "earring_presence_target": item["earring_presence_target"].clone(),
+            "earring_noop_target": item["earring_noop_target"].clone(),
             "target_earring_mask": item["target_earring_mask"].clone(),
             "query_mask": item["query_mask"].clone(),
             "earring_search_mask": item.get("earring_search_mask", torch.zeros_like(fallback_mask)).clone(),
@@ -1527,7 +1561,7 @@ class PPDatasetV5(Dataset):
             ).clone(),
             "left_ear_roi": item["left_ear_roi"].clone(),
             "right_ear_roi": item["right_ear_roi"].clone(),
-            "presence_target": item["presence_target"].clone(),
+            "presence_target": item["earring_presence_target"].clone(),
         }
         for key in CLEANUP_MASK_KEYS:
             sample[key] = item.get(key, torch.zeros_like(fallback_mask)).clone()
@@ -1603,7 +1637,7 @@ def item_visible_earring_area(item) -> float:
         return 0.0
     visible = visible.float()
     area = 0.0
-    for key in ("source_earring_object_mask", "source_earring_mask", "earring_confident_mask"):
+    for key in ("earring_instance_mask", "source_earring_object_mask", "source_earring_mask"):
         value = item.get(key)
         if torch.is_tensor(value):
             area = max(area, float((value.float() * visible).sum().item()))
@@ -1612,11 +1646,8 @@ def item_visible_earring_area(item) -> float:
 
 def is_positive_hint(item, query_area_threshold: float) -> bool:
     has_earring_seed = bool(
-        item["source_earring_mask"].sum().item() > 0
-        or item_has_nonempty_mask(item, "source_earring_object_mask")
-        or item["target_earring_mask"].sum().item() > 0
-        or item_has_nonempty_mask(item, "earring_confident_mask")
-        or item_has_nonempty_mask(item, "earring_highlight_mask")
+        item_has_nonempty_mask(item, "earring_instance_mask")
+        or item["earring_presence_target"][:2].sum().item() > 0
     )
     if not has_earring_seed:
         return False

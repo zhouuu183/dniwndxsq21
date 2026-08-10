@@ -193,6 +193,7 @@ def get_parser():
     parser.add_argument("--earring_query_block_protect", type=float, default=0.95)
     parser.add_argument("--disable_earring_path_if_low_confidence", type=str2bool, default=True)
     parser.add_argument("--earring_source_presence_min_area", type=float, default=4.0)
+    parser.add_argument("--earring_learned_presence_threshold", type=float, default=0.55)
     parser.add_argument("--earring_search_downward_shift", type=int, default=10)
     parser.add_argument("--earring_search_dilate", type=int, default=7)
     parser.add_argument("--earring_write_max_target_hair_overlap", type=float, default=0.30)

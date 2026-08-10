@@ -29,6 +29,7 @@ from models.ear_modules_v5 import (
     build_earring_highlight_mask,
     build_earring_search_mask,
     build_earring_write_masks,
+    build_source_earring_instance_masks_v5,
     build_strong_earring_candidate,
     expand_valid_roi_by_completion,
     build_revealed_skin_mask,
@@ -37,13 +38,14 @@ from models.ear_modules_v5 import (
     assign_components_to_ear_sides,
     parsing_label_mask,
     resize_mask,
+    shift_tensor_per_batch,
 )
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import list_image_files
 from utils.train import seed_everything
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
-DATASET_CONFIG_SCHEMA_VERSION = 3
+DATASET_CONFIG_SCHEMA_VERSION = 4
 DATASET_POLICY_FILES = (
     "scripts/pp_gen_v5.py",
     "hair_swap_v5.py",
@@ -920,9 +922,53 @@ class DatasetItemBatchBuilder:
                 source_hair_block_mask,
             )
             earring_search_mask = earring_policy["earring_search_mask"]
-            source_earring_mask = earring_policy["earring_write_mask"]
             active_earring_case = earring_policy["active"]
             earring_valid_roi = earring_valid_roi * active_earring_case
+
+            # Dataset supervision must describe a real source instance, not
+            # the old broad write permission.  The latter was saved under all
+            # three names (source/object/write), which taught the model that a
+            # lower-ear crop, a short hoop arc and an earring were equivalent.
+            # A low-resolution parser/strong candidate may initialise this
+            # locator but cannot become an object pixel by itself.
+            source_instance_seed = torch.clamp(
+                earring_policy["source_parser_earring_mask"]
+                + earring_policy["strong_earring_candidate_core"],
+                0,
+                1,
+            ) * active_earring_case
+            source_instances = build_source_earring_instance_masks_v5(
+                source_256,
+                source_parsing,
+                source_hair_mask=query_info.get("source_hair_mask"),
+                source_seed_mask=source_instance_seed,
+            )
+            source_instance_mask = source_instances["instance_mask"] * active_earring_case
+            source_hole_mask = source_instances["hoop_hole_mask"] * active_earring_case
+            source_instance_mask = source_instance_mask * (1.0 - source_hole_mask).clamp(0, 1)
+            source_left_instance = source_instances["left_instance_mask"] * active_earring_case
+            source_right_instance = source_instances["right_instance_mask"] * active_earring_case
+            source_left_hole = source_instances["left_hoop_hole_mask"] * active_earring_case
+            source_right_hole = source_instances["right_hoop_hole_mask"] * active_earring_case
+
+            source_left_present = (
+                source_left_instance.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(source_256.dtype)
+            source_right_present = (
+                source_right_instance.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(source_256.dtype)
+            source_presence_target = torch.cat(
+                [
+                    source_left_present,
+                    source_right_present,
+                    torch.maximum(source_left_present, source_right_present),
+                ],
+                dim=1,
+            )
+
+            source_earring_mask = source_instance_mask
+            left_visible = torch.zeros_like(source_left_present, dtype=torch.bool)
+            right_visible = torch.zeros_like(source_right_present, dtype=torch.bool)
 
             # Per-side visibility gating: replace pixel-wise multiply (which clips
             # the completed earring back to the thin shell) with a per-side scalar
@@ -943,17 +989,9 @@ class DatasetItemBatchBuilder:
                 left_visible = left_earring_valid_roi.flatten(1).sum(dim=1, keepdim=True) >= min_visible_area
                 right_visible = right_earring_valid_roi.flatten(1).sum(dim=1, keepdim=True) >= min_visible_area
 
-                left_mask, right_mask = assign_components_to_ear_sides(
-                    source_earring_mask,
-                    query_info["left_ear_roi"],
-                    query_info["right_ear_roi"],
-                    query_info.get("left_lobe_anchor"),
-                    query_info.get("right_lobe_anchor"),
-                )
-
                 # Gate by visibility (scalar decision per side, not pixel-wise multiply)
-                left_mask = left_mask * left_visible.view(-1, 1, 1, 1).float()
-                right_mask = right_mask * right_visible.view(-1, 1, 1, 1).float()
+                left_mask = source_left_instance * left_visible.view(-1, 1, 1, 1).float()
+                right_mask = source_right_instance * right_visible.view(-1, 1, 1, 1).float()
 
                 source_earring_mask = torch.clamp(left_mask + right_mask, 0, 1)
             align_info = align_earring_reference_to_target(
@@ -973,6 +1011,20 @@ class DatasetItemBatchBuilder:
             # the narrow target gate after the shift so aligned supervision also
             # obeys the target-hair overlap bound.
             aligned_candidate = align_info["earring_confident_mask"] * active_earring_case
+            aligned_source_hole = torch.clamp(
+                shift_tensor_per_batch(
+                    source_left_hole,
+                    align_info["left_earring_shift_y"].view(-1),
+                    align_info["left_earring_shift_x"].view(-1),
+                ) * left_visible.view(-1, 1, 1, 1).float()
+                + shift_tensor_per_batch(
+                    source_right_hole,
+                    align_info["right_earring_shift_y"].view(-1),
+                    align_info["right_earring_shift_x"].view(-1),
+                ) * right_visible.view(-1, 1, 1, 1).float(),
+                0,
+                1,
+            ) * active_earring_case
             aligned_masks = build_earring_write_masks(
                 aligned_candidate,
                 torch.zeros_like(aligned_candidate),
@@ -987,20 +1039,41 @@ class DatasetItemBatchBuilder:
                 connectivity_kernel=self.args.earring_write_connectivity_kernel,
                 bridge_dilate=self.args.earring_write_bridge_dilate,
             )
-            earring_confident_mask = (
+            earring_hole_mask = torch.maximum(
+                aligned_source_hole,
+                aligned_masks["hoop_hole_mask"] * active_earring_case,
+            ).clamp(0, 1)
+            earring_instance_mask = (
                 aligned_masks["write_mask"]
-                * (1.0 - aligned_masks["hoop_hole_mask"]).clamp(0, 1)
+                * (1.0 - earring_hole_mask).clamp(0, 1)
                 * active_earring_case
             ).clamp(0, 1)
-            align_info["earring_confident_mask"] = earring_confident_mask
+            earring_confident_mask = earring_instance_mask
+            align_info["earring_confident_mask"] = earring_instance_mask
             align_info["earring_reference"] = (
-                target_256 * (1.0 - earring_confident_mask)
-                + align_info["earring_reference"] * earring_confident_mask
+                target_256 * (1.0 - earring_instance_mask)
+                + align_info["earring_reference"] * earring_instance_mask
             ).clamp(0, 1)
-            source_earring_mask = earring_confident_mask
+            source_earring_mask = earring_instance_mask
+            target_visibility_target = torch.cat(
+                [
+                    left_visible.to(source_256.dtype),
+                    right_visible.to(source_256.dtype),
+                    torch.maximum(left_visible, right_visible).to(source_256.dtype),
+                ],
+                dim=1,
+            )
+            # The final compositor must be a no-op not only when the source
+            # has no earring, but also when every source earring is covered by
+            # the transferred hairstyle.  Treating an occluded positive as a
+            # generic positive trained the PP branch to write into a target
+            # hair/ear boundary even though inference correctly suppresses the
+            # copy on that side.
+            earring_presence_target = source_presence_target * target_visibility_target
+            earring_noop_target = 1.0 - earring_presence_target[:, 2:3]
             earring_highlight_mask = build_earring_highlight_mask(
                 align_info["earring_reference"],
-                earring_confident_mask,
+                earring_instance_mask,
                 query_info["query_mask"],
             )
             revealed_info = build_revealed_skin_mask(
@@ -1009,7 +1082,7 @@ class DatasetItemBatchBuilder:
                 source_parsing,
                 target_hair_d,
                 source_hair_d,
-                earring_confident_mask,
+                earring_instance_mask,
                 source_256,
             )
 
@@ -1035,30 +1108,40 @@ class DatasetItemBatchBuilder:
                     "target_hair_mask": query_info["target_hair_mask"][idx].cpu(),
                     "source_hair_block_mask": source_hair_block_mask[idx].cpu(),
                     "source_earring_mask": source_earring_mask[idx].cpu(),
-                    "source_earring_object_mask": source_earring_mask[idx].cpu(),
+                    "source_earring_object_mask": earring_instance_mask[idx].cpu(),
                     "source_earring_seed_mask": earring_policy["source_parser_earring_mask"][idx].cpu(),
+                    "source_earring_instance_mask": source_instance_mask[idx].cpu(),
                     "target_earring_mask": query_info["target_earring_mask"][idx].cpu(),
                     "earring_reference": align_info["earring_reference"][idx].cpu(),
                     "query_mask": query_info["query_mask"][idx].cpu(),
                     "earring_search_mask": earring_search_mask[idx].cpu(),
-                    "earring_write_mask": source_earring_mask[idx].cpu(),
+                    "earring_write_mask": earring_instance_mask[idx].cpu(),
+                    "earring_instance_mask": earring_instance_mask[idx].cpu(),
+                    "earring_hole_mask": earring_hole_mask[idx].cpu(),
+                    "earring_source_presence_target": source_presence_target[idx].cpu(),
+                    "earring_target_visibility_target": target_visibility_target[idx].cpu(),
+                    "earring_presence_target": earring_presence_target[idx].cpu(),
+                    "earring_noop_target": earring_noop_target[idx].cpu(),
                     "earring_visible_segment_mask": earring_policy["earring_visible_segment_mask"][idx].cpu(),
                     "earring_core_mask": aligned_masks["core_mask"][idx].cpu(),
                     "earring_completion_mask": aligned_masks["completion_mask"][idx].cpu(),
                     "earring_object_mask": aligned_masks["earring_object_mask"][idx].cpu(),
                     "earring_filled_mask": aligned_masks["earring_filled_mask"][idx].cpu(),
-                    "hoop_hole_mask": aligned_masks["hoop_hole_mask"][idx].cpu(),
+                    "hoop_hole_mask": earring_hole_mask[idx].cpu(),
                     "strong_earring_candidate_core": earring_policy["strong_earring_candidate_core"][idx].cpu(),
                     "left_strong_candidate": earring_policy["left_strong_candidate"][idx].cpu(),
                     "right_strong_candidate": earring_policy["right_strong_candidate"][idx].cpu(),
-                    "no_earring_case_mask": earring_policy["no_earring_case_mask"][idx].cpu(),
+                    "no_earring_case_mask": (
+                        earring_policy["no_earring_case_mask"][idx]
+                        * earring_noop_target[idx].view(1, 1, 1)
+                    ).cpu(),
                     "target_hair_ear_bridge_mask": earring_policy["target_hair_ear_bridge_mask"][idx].cpu(),
                     "ear_roi": query_info["ear_roi"][idx].cpu(),
                     "visible_ear_roi": visible_ear_roi[idx].cpu(),
                     "earring_valid_roi": earring_valid_roi[idx].cpu(),
                     "left_ear_roi": query_info["left_ear_roi"][idx].cpu(),
                     "right_ear_roi": query_info["right_ear_roi"][idx].cpu(),
-                    "presence_target": query_info["presence_target"][idx].cpu(),
+                    "presence_target": earring_presence_target[idx].cpu(),
                 }
                 for key in CLEANUP_MASK_KEYS:
                     item[key] = cleanup_masks[key][idx].cpu()
