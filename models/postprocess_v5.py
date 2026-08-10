@@ -2037,6 +2037,7 @@ class PostProcessModelV5(nn.Module):
                 source_instances["right_lobe_anchor"],
                 source_hair_mask=aux.get("source_hair_mask"),
                 source_ear_mask=source_ear,
+                detection_size=max(earring_reference.shape[-2:]),
                 min_axis=4.0,
                 min_coverage=0.20,
             )
@@ -2046,14 +2047,13 @@ class PostProcessModelV5(nn.Module):
             right_geometry_hole = highres_geometry["right_elliptical_hoop_hole"] * right_active
             highres_geometry_trace = torch.clamp(left_geometry_trace + right_geometry_trace, 0, 1)
             highres_geometry_hole = torch.clamp(left_geometry_hole + right_geometry_hole, 0, 1)
-            left_geometry_observed = source_instances["locator_ring_support"].to(
-                device=earring_edit.device,
-                dtype=earring_edit.dtype,
-            ) * dilate_mask(left_geometry_trace, 3)
-            right_geometry_observed = source_instances["locator_ring_support"].to(
-                device=earring_edit.device,
-                dtype=earring_edit.dtype,
-            ) * dilate_mask(right_geometry_trace, 3)
+            # ``refine_earring_hoops_highres`` already returns only source
+            # Canny-supported pixels lying on a lobe-connected ring.  A second
+            # intersection with the sparse general visual support discarded
+            # most of a real hoop (often leaving only one short arc).  Use the
+            # verified source trace directly; it is not a rendered ellipse.
+            left_geometry_observed = left_geometry_trace
+            right_geometry_observed = right_geometry_trace
             left_instance = source_instances["left_instance_mask"].to(
                 device=earring_edit.device,
                 dtype=earring_edit.dtype,
