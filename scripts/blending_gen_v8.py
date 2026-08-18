@@ -280,8 +280,20 @@ def main():
             save_latents(ACTIVE_OUTPUT_DIR, "FS", fs_cache_name("color", color_name), latent_in=name_to_embed["color"]["S"])
             save_latents(ACTIVE_OUTPUT_DIR, "Align", align_cache_name(face_name, "shape", shape_name), latent_F=align_shape["latent_F_align"])
             save_latents(ACTIVE_OUTPUT_DIR, "Align", align_cache_name(face_name, "color", color_name), latent_F=align_color["latent_F_align"])
-            save_latents(ACTIVE_OUTPUT_DIR, "Masks", align_cache_name(face_name, "shape", shape_name), remove_mask=build_remove_protect_mask(align_shape))
-            save_latents(ACTIVE_OUTPUT_DIR, "Masks", align_cache_name(face_name, "color", color_name), remove_mask=build_remove_protect_mask(align_color))
+            save_latents(
+                ACTIVE_OUTPUT_DIR,
+                "Masks",
+                align_cache_name(face_name, "shape", shape_name),
+                remove_mask=build_remove_protect_mask(align_shape),
+                target_hair=align_shape["HM_X"].float(),
+            )
+            save_latents(
+                ACTIVE_OUTPUT_DIR,
+                "Masks",
+                align_cache_name(face_name, "color", color_name),
+                remove_mask=build_remove_protect_mask(align_color),
+                target_hair=align_color["HM_X"].float(),
+            )
 
     print(f"dataset profile: {USER_DATASET_PROFILE}")
     print(f"saved {len(triplets)} blending triplets to {ACTIVE_OUTPUT_DIR / 'dataset.exps'}")

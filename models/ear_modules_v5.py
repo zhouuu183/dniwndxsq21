@@ -557,6 +557,29 @@ def assign_components_to_ear_sides(
         left_anchor_points = np.argwhere(left_anchor_np[batch_index, 0])
         right_anchor_points = np.argwhere(right_anchor_np[batch_index, 0])
         height, width = foreground.shape
+        coordinate_scale = max(float(height), float(width)) / 256.0
+
+        def nearest_component_distance(points: np.ndarray, component: np.ndarray) -> float:
+            """Return the closest source-lobe/component-pixel distance.
+
+            The component centroid is a poor side cue for a hanging pendant or
+            a large hoop: its lower arc can be much closer to the opposite
+            lobe than the centroid suggests.  Sampling caps the temporary
+            pairwise array for high-resolution inference while retaining the
+            nearest-pixel test.
+            """
+
+            if points.size == 0 or component.size == 0:
+                return float("inf")
+            if points.shape[0] > 512:
+                points = points[np.linspace(0, points.shape[0] - 1, 512).astype(np.int64)]
+            if component.shape[0] > 2048:
+                component = component[
+                    np.linspace(0, component.shape[0] - 1, 2048).astype(np.int64)
+                ]
+            delta = points.astype(np.float32)[:, None, :] - component.astype(np.float32)[None, :, :]
+            return float(np.sqrt((delta * delta).sum(axis=2)).min())
+
         for start_y, start_x in np.argwhere(foreground):
             if visited[start_y, start_x]:
                 continue
@@ -577,20 +600,43 @@ def assign_components_to_ear_sides(
             xs = coords[:, 1].astype(np.int64)
             left_overlap = float(left_np[batch_index, 0, ys, xs].mean())
             right_overlap = float(right_np[batch_index, 0, ys, xs].mean())
-            centre = coords.mean(axis=0)
 
-            def anchor_score(points: np.ndarray) -> float:
+            def anchor_score(points: np.ndarray) -> tuple[float, float]:
                 if points.size == 0:
-                    return 0.0
-                # The nearest real lobe pixel is robust to elongated earrings.
-                distance = np.sqrt(((points.astype(np.float32) - centre) ** 2).sum(axis=1)).min()
-                return float(1.0 / (1.0 + distance / 24.0))
+                    return 0.0, float("inf")
+                # Use the nearest real lobe pixel, not the component centroid.
+                distance = nearest_component_distance(points, coords)
+                score = max(0.0, 1.0 - distance / max(48.0 * coordinate_scale, 1.0))
+                return score, distance
 
-            left_score = left_overlap + anchor_score(left_anchor_points)
-            right_score = right_overlap + anchor_score(right_anchor_points)
-            if left_score <= 0.0 and right_score <= 0.0:
+            left_anchor_score, left_distance = anchor_score(left_anchor_points)
+            right_anchor_score, right_distance = anchor_score(right_anchor_points)
+            # A candidate must have real side-context overlap or be close to a
+            # real lobe.  Without this gate, every unrelated foreground object
+            # gets a tiny nonzero inverse-distance score and can be assigned.
+            max_anchor_distance = 72.0 * coordinate_scale
+            left_associated = left_overlap > 0.0 or left_distance <= max_anchor_distance
+            right_associated = right_overlap > 0.0 or right_distance <= max_anchor_distance
+            if not left_associated and not right_associated:
                 continue
-            destination = left_out if left_score >= right_score else right_out
+            left_score = left_overlap + left_anchor_score
+            right_score = right_overlap + right_anchor_score
+            if left_associated and not right_associated:
+                destination = left_out
+            elif right_associated and not left_associated:
+                destination = right_out
+            elif left_score > right_score:
+                destination = left_out
+            elif right_score > left_score:
+                destination = right_out
+            elif left_distance < right_distance:
+                destination = left_out
+            elif right_distance < left_distance:
+                destination = right_out
+            else:
+                # Exact ties have no source-side evidence; do not let tensor
+                # position decide which ear receives the object.
+                continue
             destination[batch_index, 0, ys, xs] = candidate_np[batch_index, 0, ys, xs]
 
     left = torch.from_numpy(left_out).to(device=candidate.device, dtype=candidate.dtype)
@@ -607,6 +653,39 @@ def compute_earring_hole_mask(component_mask: torch.Tensor) -> torch.Tensor:
     """
 
     component = (ensure_mask_4d(component_mask).float() > 0.5).float()
+    # This topology mask never carries a gradient.  On a 1024px output the
+    # former tensor flood-fill could require 1024 sequential max-pool passes,
+    # which made validation and dataset generation disproportionately slow.
+    # Connected components gives the same 8-connected border-reachability
+    # result in one native pass per sample.
+    if cv2 is not None:
+        component_np = component.detach().cpu().numpy()[:, 0].astype(bool)
+        holes_np = np.zeros_like(component_np, dtype=np.float32)
+        for batch_index, object_pixels in enumerate(component_np):
+            background_pixels = (~object_pixels).astype(np.uint8)
+            component_count, labels = cv2.connectedComponents(
+                background_pixels,
+                connectivity=8,
+            )
+            if component_count <= 1:
+                continue
+            border_labels = np.unique(
+                np.concatenate(
+                    (
+                        labels[0, :],
+                        labels[-1, :],
+                        labels[:, 0],
+                        labels[:, -1],
+                    )
+                )
+            )
+            reachable = np.isin(labels, border_labels)
+            holes_np[batch_index] = background_pixels.astype(bool) & ~reachable
+        return torch.from_numpy(holes_np).unsqueeze(1).to(
+            device=component.device,
+            dtype=component.dtype,
+        )
+
     background = 1.0 - component
     border = torch.zeros_like(background)
     border[..., 0, :] = 1
@@ -679,8 +758,21 @@ def _instance_filter_components(
     minimum_area: int,
     maximum_area: int,
     keep_per_side: int = 3,
+    left_context: torch.Tensor | None = None,
+    right_context: torch.Tensor | None = None,
+    left_lobe_anchor: torch.Tensor | None = None,
+    right_lobe_anchor: torch.Tensor | None = None,
+    require_side_context: bool = False,
 ) -> torch.Tensor:
-    """Keep compact ear-local components without expanding them into a crop."""
+    """Keep compact components after real source-side association.
+
+    The old implementation sorted components by image x-coordinate before the
+    source ears were consulted.  Crops, mirrored inputs and profile views make
+    that split unreliable, and a good component on one side could suppress a
+    valid one on the other.  When side context is supplied, each component is
+    assigned from source-ear overlap / lobe proximity first, then ranked only
+    against components for that same side.
+    """
 
     binary = ((ensure_mask_4d(mask).float() > 0.5) * (ensure_mask_4d(support).float() > 0.05)).detach()
     output = torch.zeros_like(binary)
@@ -688,8 +780,22 @@ def _instance_filter_components(
         return output
 
     binary_np = binary.cpu().numpy().astype(np.uint8)
+    reference = binary
+    left_context_np = (_resize_like_mask(left_context, reference).detach().cpu().numpy() > 0.05)
+    right_context_np = (_resize_like_mask(right_context, reference).detach().cpu().numpy() > 0.05)
+    left_anchor_np = (_resize_like_mask(left_lobe_anchor, reference).detach().cpu().numpy() > 0.05)
+    right_anchor_np = (_resize_like_mask(right_lobe_anchor, reference).detach().cpu().numpy() > 0.05)
     output_np = np.zeros_like(binary_np, dtype=np.uint8)
     for batch_idx in range(binary_np.shape[0]):
+        # Context is a property of one source sample, never of the entire
+        # batch.  A sample without a parsed ear/lobe must not inherit another
+        # sample's side-aware policy (or vice versa).
+        use_side_context = bool(
+            left_context_np[batch_idx, 0].any()
+            or right_context_np[batch_idx, 0].any()
+            or left_anchor_np[batch_idx, 0].any()
+            or right_anchor_np[batch_idx, 0].any()
+        )
         component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
             binary_np[batch_idx, 0],
             connectivity=8,
@@ -699,21 +805,773 @@ def _instance_filter_components(
             # are still retained by the caller, while visual recall becomes a
             # no-op instead of producing an unchecked broad mask.
             continue
-        left_best: list[tuple[int, int]] = []
-        right_best: list[tuple[int, int]] = []
-        width = binary_np.shape[-1]
+        left_best: list[tuple[float, int, int]] = []
+        right_best: list[tuple[float, int, int]] = []
+        global_best: list[tuple[int, int]] = []
+        height, width = binary_np.shape[-2:]
+        coordinate_scale = max(float(height), float(width)) / 256.0
+
+        def distance_map(mask_np: np.ndarray) -> np.ndarray | None:
+            if not mask_np.any():
+                return None
+            # ``distanceTransform`` measures distance to zeros, so invert the
+            # foreground side cue before querying component pixels.
+            return cv2.distanceTransform((~mask_np).astype(np.uint8), cv2.DIST_L2, 3)
+
+        left_context_distance = distance_map(left_context_np[batch_idx, 0])
+        right_context_distance = distance_map(right_context_np[batch_idx, 0])
+        left_anchor_distance = distance_map(left_anchor_np[batch_idx, 0])
+        right_anchor_distance = distance_map(right_anchor_np[batch_idx, 0])
+
+        def side_score(
+            component: np.ndarray,
+            context_np: np.ndarray,
+            context_distance: np.ndarray | None,
+            anchor_distance: np.ndarray | None,
+        ) -> tuple[float, bool]:
+            area = max(1, int(component.sum()))
+            overlap = float((component & context_np).sum()) / float(area)
+            context_near = (
+                float(context_distance[component].min())
+                if context_distance is not None
+                else float("inf")
+            )
+            anchor_near = (
+                float(anchor_distance[component].min())
+                if anchor_distance is not None
+                else float("inf")
+            )
+            # Direct source-ear corridor overlap is authoritative.  A very
+            # small parser/seed component may instead start immediately beside
+            # the lobe, but a distant textured component cannot enter merely
+            # because it is on the same half of the image.
+            associated = (
+                overlap > 0.0
+                or context_near <= 13.0 * coordinate_scale
+                or anchor_near <= 72.0 * coordinate_scale
+            )
+            if not associated:
+                return 0.0, False
+            score = (
+                2.50 * overlap
+                + max(0.0, 1.0 - context_near / max(32.0 * coordinate_scale, 1.0))
+                + max(0.0, 1.25 - anchor_near / max(64.0 * coordinate_scale, 1.0))
+            )
+            return score, True
+
         for component_id in range(1, component_count):
             area = int(stats[component_id, cv2.CC_STAT_AREA])
             if area < int(minimum_area) or area > int(maximum_area):
                 continue
-            centre_x = int(round(float(stats[component_id, cv2.CC_STAT_LEFT]) + 0.5 * float(stats[component_id, cv2.CC_STAT_WIDTH])))
-            destination = left_best if centre_x <= width // 2 else right_best
-            destination.append((area, component_id))
-        for collection in (left_best, right_best):
-            collection.sort(reverse=True)
-            for _, component_id in collection[:max(1, int(keep_per_side))]:
+            component = labels == component_id
+            if not use_side_context:
+                if not require_side_context:
+                    global_best.append((area, component_id))
+                continue
+            left_score, left_associated = side_score(
+                component,
+                left_context_np[batch_idx, 0],
+                left_context_distance,
+                left_anchor_distance,
+            )
+            right_score, right_associated = side_score(
+                component,
+                right_context_np[batch_idx, 0],
+                right_context_distance,
+                right_anchor_distance,
+            )
+            if left_associated and not right_associated:
+                left_best.append((left_score, area, component_id))
+            elif right_associated and not left_associated:
+                right_best.append((right_score, area, component_id))
+            elif left_associated and right_associated:
+                if left_score > right_score:
+                    left_best.append((left_score, area, component_id))
+                elif right_score > left_score:
+                    right_best.append((right_score, area, component_id))
+                # A perfect tie is source-side ambiguous.  Dropping it is
+                # safer than assigning with an image-centre fallback.
+        if use_side_context:
+            for collection in (left_best, right_best):
+                collection.sort(reverse=True)
+                for _, _, component_id in collection[:max(1, int(keep_per_side))]:
+                    output_np[batch_idx, 0][labels == component_id] = 1
+        else:
+            global_best.sort(reverse=True)
+            # Preserve the legacy total-capacity budget for callers that have
+            # no side geometry, without inventing an image-midline split.
+            for _, component_id in global_best[:max(1, 2 * int(keep_per_side))]:
                 output_np[batch_idx, 0][labels == component_id] = 1
     return torch.from_numpy(output_np).to(device=mask.device, dtype=mask.dtype)
+
+
+def _retain_raw_components_touching_proxy(
+    raw_mask: torch.Tensor,
+    accepted_proxy: torch.Tensor,
+    *,
+    minimum_area: int,
+    maximum_area: int,
+    left_context: torch.Tensor | None = None,
+    right_context: torch.Tensor | None = None,
+    left_lobe_anchor: torch.Tensor | None = None,
+    right_lobe_anchor: torch.Tensor | None = None,
+    require_side_context: bool = True,
+) -> torch.Tensor:
+    """Keep full raw components only after a real ear-side proxy accepted them.
+
+    The proxy is intentionally compact: it answers whether a parser component
+    belongs to a real source ear/lobe corridor.  It must not also define the
+    object extent.  Applying the proxy directly to label-9 was cutting long
+    pendants, hook wires and hoop arcs to the small lobe neighbourhood before
+    the high-resolution stage ever saw them.  Conversely, restoring *all* raw
+    label-9 pixels reintroduced parser mistakes as black source patches.
+
+    This helper therefore keeps a complete raw connected component only when
+    that component touches an already accepted proxy, is itself associated with
+    one real source ear/lobe in the same sample, and its original area is
+    plausible.  The source-side split still happens afterwards, so no image
+    midpoint is used to decide the receiving ear.
+    """
+
+    raw = (ensure_mask_4d(raw_mask).float() > 0.5).detach()
+    proxy = (ensure_mask_4d(accepted_proxy).float() > 0.5).detach()
+    if proxy.shape[-2:] != raw.shape[-2:]:
+        proxy = F.interpolate(proxy.float(), size=raw.shape[-2:], mode="nearest") > 0.5
+    left_context = _resize_like_mask(left_context, raw)
+    right_context = _resize_like_mask(right_context, raw)
+    left_anchor = _resize_like_mask(left_lobe_anchor, raw)
+    right_anchor = _resize_like_mask(right_lobe_anchor, raw)
+    output = torch.zeros_like(raw)
+    if cv2 is None or not bool(raw.flatten(1).amax().item() > 0):
+        # The production V5 runtime provides OpenCV for the high-resolution
+        # locator.  In an import-only environment, fail closed rather than
+        # turning every raw parser pixel into a direct RGB write mask.
+        return output
+
+    raw_np = raw.cpu().numpy().astype(np.uint8)
+    proxy_np = proxy.cpu().numpy().astype(np.uint8)
+    left_context_np = left_context.detach().cpu().numpy() > 0.05
+    right_context_np = right_context.detach().cpu().numpy() > 0.05
+    left_anchor_np = left_anchor.detach().cpu().numpy() > 0.05
+    right_anchor_np = right_anchor.detach().cpu().numpy() > 0.05
+    output_np = np.zeros_like(raw_np, dtype=np.uint8)
+    for batch_idx in range(raw_np.shape[0]):
+        # Context must belong to this source sample.  Without it, a raw label
+        # near an unrelated crop/background object has no side or lobe proof
+        # and must never gain RGB authority from another batch item.
+        left_anchor_points = np.argwhere(left_anchor_np[batch_idx, 0])
+        right_anchor_points = np.argwhere(right_anchor_np[batch_idx, 0])
+        has_side_context = bool(
+            left_context_np[batch_idx, 0].any()
+            or right_context_np[batch_idx, 0].any()
+            or left_anchor_points.size > 0
+            or right_anchor_points.size > 0
+        )
+        if require_side_context and not has_side_context:
+            continue
+
+        height, width = raw_np.shape[-2:]
+        coordinate_scale = max(float(height), float(width)) / 256.0
+
+        def nearest_anchor_distance(points: np.ndarray, component_points: np.ndarray) -> float:
+            if points.size == 0 or component_points.size == 0:
+                return float("inf")
+            if points.shape[0] > 512:
+                points = points[np.linspace(0, points.shape[0] - 1, 512).astype(np.int64)]
+            if component_points.shape[0] > 2048:
+                component_points = component_points[
+                    np.linspace(0, component_points.shape[0] - 1, 2048).astype(np.int64)
+                ]
+            delta = (
+                points.astype(np.float32)[:, None, :]
+                - component_points.astype(np.float32)[None, :, :]
+            )
+            return float(np.sqrt((delta * delta).sum(axis=2)).min())
+
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            raw_np[batch_idx, 0],
+            connectivity=8,
+        )
+        for component_id in range(1, component_count):
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            if area < int(minimum_area) or area > int(maximum_area):
+                continue
+            component = labels == component_id
+            if not np.any(component & (proxy_np[batch_idx, 0] > 0)):
+                continue
+            component_points = np.argwhere(component)
+
+            def side_is_associated(
+                context: np.ndarray,
+                anchor_points: np.ndarray,
+            ) -> tuple[float, bool]:
+                context_overlap = bool(np.any(component & context))
+                anchor_distance = nearest_anchor_distance(anchor_points, component_points)
+                # The lobe is the primary proof.  Direct source-ear corridor
+                # overlap is retained only for parser-degenerate tiny ears
+                # where no lower-lobe anchor can be formed at all.
+                associated = (
+                    anchor_distance <= 72.0 * coordinate_scale
+                    if anchor_points.size > 0
+                    else context_overlap
+                )
+                if not associated:
+                    return 0.0, False
+                score = (
+                    (1.0 if context_overlap else 0.0)
+                    + max(0.0, 1.0 - anchor_distance / max(72.0 * coordinate_scale, 1.0))
+                )
+                return score, True
+
+            left_score, left_associated = side_is_associated(
+                left_context_np[batch_idx, 0], left_anchor_points
+            )
+            right_score, right_associated = side_is_associated(
+                right_context_np[batch_idx, 0], right_anchor_points
+            )
+            if not left_associated and not right_associated:
+                continue
+            if left_associated and right_associated and left_score == right_score:
+                # An unresolved two-ear tie is not a safe object association.
+                continue
+            output_np[batch_idx, 0][component] = 1
+    return torch.from_numpy(output_np).to(device=raw_mask.device, dtype=raw_mask.dtype)
+
+
+def _build_parser_miss_visual_instances_v5(
+    source_01: torch.Tensor,
+    visual_seed: torch.Tensor,
+    visual_support: torch.Tensor,
+    parser_earring: torch.Tensor,
+    associated_seed: torch.Tensor,
+    source_background: torch.Tensor,
+    background_permission: torch.Tensor,
+    source_hair: torch.Tensor,
+    source_ear: torch.Tensor,
+    source_face_surface: torch.Tensor,
+    left_context: torch.Tensor,
+    right_context: torch.Tensor,
+    left_recall_context: torch.Tensor,
+    right_recall_context: torch.Tensor,
+    left_lobe_anchor: torch.Tensor,
+    right_lobe_anchor: torch.Tensor,
+    left_parser_instance: torch.Tensor,
+    right_parser_instance: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Find strict native-resolution ordinary earrings missed by parser label 9.
+
+    This is an ordinary-instance path.  It never fits an ellipse, fills a
+    contour hole, or returns a geometric footprint.  A separately returned
+    seed may ask the dedicated paired-contour verifier to inspect a native
+    closed hoop, but that seed has no RGB authority by itself.  Every accepted
+    component must:
+
+    * be in one sample's real source ear/lobe corridor and within lobe distance;
+    * have independent high-frequency/chroma evidence;
+    * avoid source background, hair, and eroded ear/face interiors; and
+    * touch a narrow exterior lobe attachment band while staying compact.
+
+    The returned masks contain only observed visual evidence pixels.  Temporary
+    morphology is used for component grouping and attachment tests, never as a
+    direct RGB write region.  A parser label or associated coarse seed on a side
+    suppresses this fallback for that side, leaving the parser-first long-tail
+    path authoritative there.
+    """
+
+    reference = ensure_mask_4d(source_01).float()
+    zeros = torch.zeros_like(reference[:, :1])
+    if cv2 is None:
+        return {
+            "visual_recall_instance_mask": zeros,
+            "left_visual_recall_instance_mask": zeros,
+            "right_visual_recall_instance_mask": zeros,
+            "visual_recall_seed_mask": zeros,
+            "left_visual_recall_seed_mask": zeros,
+            "right_visual_recall_seed_mask": zeros,
+            "visual_recall_attachment_mask": zeros,
+            "left_visual_recall_attachment_mask": zeros,
+            "right_visual_recall_attachment_mask": zeros,
+            "visual_recall_candidate_mask": zeros,
+            "left_visual_recall_candidate_mask": zeros,
+            "right_visual_recall_candidate_mask": zeros,
+            "visual_recall_hoop_seed_mask": zeros,
+            "left_visual_recall_hoop_seed_mask": zeros,
+            "right_visual_recall_hoop_seed_mask": zeros,
+            "visual_recall_present": zeros[:, :, :1, :1],
+            "left_visual_recall_present": zeros[:, :, :1, :1],
+            "right_visual_recall_present": zeros[:, :, :1, :1],
+        }
+
+    image_size = tuple(reference.shape[-2:])
+
+    def mask_np(value: torch.Tensor | None) -> np.ndarray:
+        value = _resize_like_mask(value, reference)
+        return value.detach().cpu().numpy()[:, 0] > 0.5
+
+    source_np = np.clip(
+        reference.detach().cpu().permute(0, 2, 3, 1).numpy() * 255.0,
+        0,
+        255,
+    ).astype(np.uint8)
+    seed_np = mask_np(visual_seed)
+    support_np = mask_np(visual_support)
+    parser_np = mask_np(parser_earring)
+    associated_np = mask_np(associated_seed)
+    background_np = mask_np(source_background)
+    background_permission_np = mask_np(background_permission)
+    hair_np = mask_np(source_hair)
+    ear_np = mask_np(source_ear)
+    face_np = mask_np(source_face_surface)
+    left_context_np = mask_np(left_context)
+    right_context_np = mask_np(right_context)
+    left_recall_context_np = mask_np(left_recall_context)
+    right_recall_context_np = mask_np(right_recall_context)
+    left_anchor_np = mask_np(left_lobe_anchor)
+    right_anchor_np = mask_np(right_lobe_anchor)
+    left_parser_np = mask_np(left_parser_instance)
+    right_parser_np = mask_np(right_parser_instance)
+
+    batch, height, width = parser_np.shape
+    scale = max(height, width) / 256.0
+
+    def kernel(value: float, minimum: int = 3) -> int:
+        size = max(int(minimum), int(round(float(value) * scale)))
+        return size if size % 2 == 1 else size + 1
+
+    def empty() -> np.ndarray:
+        return np.zeros((height, width), dtype=bool)
+
+    left_out = np.zeros((batch, 1, height, width), dtype=np.float32)
+    right_out = np.zeros_like(left_out)
+    left_seed_out = np.zeros_like(left_out)
+    right_seed_out = np.zeros_like(left_out)
+    left_attach_out = np.zeros_like(left_out)
+    right_attach_out = np.zeros_like(left_out)
+    left_candidate_out = np.zeros_like(left_out)
+    right_candidate_out = np.zeros_like(left_out)
+    left_hoop_seed_out = np.zeros_like(left_out)
+    right_hoop_seed_out = np.zeros_like(left_out)
+
+    def trace_side(
+        image: np.ndarray,
+        candidate_seed: np.ndarray,
+        candidate_support: np.ndarray,
+        parser: np.ndarray,
+        associated: np.ndarray,
+        background: np.ndarray,
+        background_permission: np.ndarray,
+        hair: np.ndarray,
+        ear: np.ndarray,
+        face: np.ndarray,
+        context: np.ndarray,
+        anchor: np.ndarray,
+        parser_instance: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        zero = empty()
+        anchor_points = np.argwhere(anchor)
+        if anchor_points.size == 0:
+            return zero, zero, zero, zero, zero
+
+        # A parser-miss fallback is side-local and compact.  A raw parser
+        # instance remains authoritative, but an associated coarse seed is only
+        # a search hint, not an observed source object.  Suppressing recall for
+        # that seed made every background-labelled parser miss impossible to
+        # recover, even after the low-resolution branch had identified the
+        # correct lobe.
+        anchor_y, anchor_x = anchor_points.mean(axis=0)
+        y_grid, x_grid = np.ogrid[:height, :width]
+        local_window = (
+            (y_grid >= anchor_y - 36.0 * scale)
+            & (y_grid <= anchor_y + 144.0 * scale)
+            & (x_grid >= anchor_x - 84.0 * scale)
+            & (x_grid <= anchor_x + 84.0 * scale)
+        )
+        # The lobe-relative box bounds the maximum ordinary accessory size;
+        # the real source-side corridor proves that this is the matching ear.
+        # A tiny dilation handles parsing boundaries but is never returned.
+        local_window &= cv2.dilate(
+            context.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(5), kernel(5))),
+        ).astype(bool)
+        # A short accepted parser arc must not disable native recall for this
+        # entire side.  It is a connection proof for the *same* accessory, not
+        # permission to add an unrelated second object.  The component loop
+        # below therefore requires any extension to touch this narrow link.
+        parser_link = cv2.dilate(
+            (parser_instance & local_window).astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(7))),
+        ).astype(bool)
+        parser_present = bool(parser_link.any())
+        # ``associated`` is the accepted low-resolution source-side seed.  It
+        # is deliberately not copied as RGB (upsampling it would recreate the
+        # old blocky ear/background patch), but it must participate as a
+        # *connection proof*.  Previously this argument was passed all the way
+        # into this function and then never used, so a parser-missed earring
+        # could be located at 256px yet had no way to start native-resolution
+        # recall.  Keep the link local to this measured ear corridor; the
+        # native edge/chroma, attachment and component checks below remain the
+        # actual object authority.
+        associated_link = cv2.dilate(
+            (associated & local_window).astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(7))),
+        ).astype(bool)
+        associated_present = bool(associated_link.any())
+        source_link = parser_link | associated_link
+
+        # Do not let broad morphology turn a background/hair edge into a write
+        # pixel.  The exterior attachment belt is used only to prove contact;
+        # pixels inside the semantic ear/face cores remain forbidden.
+        hair_guard = cv2.dilate(
+            hair.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(5), kernel(5))),
+        ).astype(bool)
+        background_guard = cv2.dilate(
+            background.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+        ).astype(bool)
+        # A parser-missed metal/gem pixel is frequently labelled background.
+        # It can be considered only where the independently validated strong
+        # seed has asked for a native-resolution inspection.  The permission is
+        # still not RGB authority: the component below must pass edge/chroma,
+        # lobe attachment and compactness checks before it is returned.
+        if background_permission.any():
+            background_permission = cv2.dilate(
+                background_permission.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+            ).astype(bool)
+            background_guard &= ~background_permission
+        # A parser-recognised short arc may be surrounded by background-labelled
+        # metal.  Open only the immediate native inspection band around that
+        # already accepted arc; the pixels still require edge/chroma evidence
+        # and a connected accepted component before they can be copied.
+        if parser_present:
+            parser_background_permission = (
+                background
+                & parser_link
+                & local_window
+            )
+            background_guard &= ~parser_background_permission
+        if associated_present:
+            # A real metal/gem accessory is frequently label-0 around a
+            # low-resolution accepted seed.  Open only image-evidence pixels
+            # in this already side-associated inspection window.  The final
+            # connected component must still touch ``source_link`` and the
+            # exterior lobe attachment band, so this is not a broad
+            # background write permission.
+            associated_background_permission = (
+                background
+                & local_window
+                & cv2.dilate(
+                    candidate_seed.astype(np.uint8) | candidate_support.astype(np.uint8),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+                ).astype(bool)
+            )
+            background_guard &= ~associated_background_permission
+        ear_core = cv2.erode(
+            ear.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(7))),
+        ).astype(bool)
+        face_core = cv2.erode(
+            face.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(7))),
+        ).astype(bool)
+        attachment_band = (
+            cv2.dilate(
+                anchor.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(17), kernel(5))),
+            ).astype(bool)
+            & ~ear_core
+            & (~face_core | associated_present)
+            & ~hair_guard
+            & ~background_guard
+            & local_window
+        )
+        valid = (
+            local_window
+            & ~hair_guard
+            & ~background_guard
+            & ~ear_core
+            # A reliable low-resolution source seed may be attached to an
+            # accessory that the parser incorrectly labelled as face surface
+            # (very common for dark discs and cheek-side pendants).  Keep the
+            # face-core exclusion for unseeded visual recall, but let the
+            # seed-linked branch inspect native structure there.  It still has
+            # to pass the lobe-link/component checks below before any source
+            # pixel can become an instance alpha.
+            & (~face_core | associated_present)
+        )
+        if int(valid.sum()) < max(24, int(round(8.0 * scale * scale))):
+            return zero, zero, zero, zero, zero
+
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        values = gray[valid]
+        if values.size < max(24, int(round(8.0 * scale * scale))):
+            return zero, zero, zero, zero, zero
+        low = max(12, int(np.percentile(values, 35)))
+        high = max(low + 18, int(np.percentile(values, 82)))
+        edges = cv2.Canny(gray, low, min(255, high)) > 0
+        blurred = cv2.GaussianBlur(image, (kernel(9), kernel(9)), 0)
+        local_delta = np.abs(image.astype(np.int16) - blurred.astype(np.int16)).mean(axis=2)
+        chroma = image.max(axis=2).astype(np.int16) - image.min(axis=2).astype(np.int16)
+        delta_floor = max(5.0, float(np.percentile(local_delta[valid], 76)))
+        chroma_floor = max(10.0, float(np.percentile(chroma[valid], 84)))
+        edge_band = cv2.dilate(
+            edges.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+        ).astype(bool)
+        evidence = (
+            edge_band
+            & ((local_delta >= delta_floor) | (chroma >= chroma_floor))
+            & valid
+        )
+        # A high-resolution edge is evidence, not an object detector by
+        # itself.  Letting every lobe-local edge start a component recreated
+        # earrings on grass, hair and ear folds.  ``candidate_seed`` is either
+        # non-background source evidence or an explicitly associated strong
+        # low-resolution proposal; both cases still need this native edge test
+        # before any RGB pixel is accepted.
+        seed = candidate_seed & evidence & valid
+        support = candidate_support & evidence & valid
+        candidate = seed | support
+        if associated_present:
+            # The associated seed is a locator only.  It contributes no RGB
+            # pixels, but permits measured native edges in the same strict
+            # lobe-local window to form a connected component.  Without this
+            # path, a parser-missed solid earring labelled as face/background
+            # has an empty ``candidate_seed`` and can never reach the later
+            # high-resolution object verifier.
+            candidate |= evidence
+        if int(candidate.sum()) < max(3, int(round(0.75 * scale * scale))):
+            return zero, zero, zero, zero, zero
+
+        proxy = cv2.morphologyEx(
+            candidate.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+        ).astype(bool)
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            proxy.astype(np.uint8),
+            connectivity=8,
+        )
+        selected = zero.copy()
+        selected_seed = zero.copy()
+        selected_attachment = zero.copy()
+        selected_candidate = zero.copy()
+        selected_hoop_seed = zero.copy()
+        # This is a *native visual candidate* budget, not an earring-stud
+        # classifier.  The former 360px-at-256 limit rejects the complete
+        # contour of a large disk/pendant before the high-resolution verifier
+        # can decide whether its interior is safe.  Keep an image-relative cap
+        # against background components while allowing a real ornament body.
+        max_area = min(
+            max(8, int(round(0.055 * height * width))),
+            max(8, int(round(1400.0 * scale * scale))),
+        )
+        # Keep small native studs after resolution scaling.  They still need
+        # the exterior/attachment/edge checks below; this is not a free area
+        # relaxation for background components.
+        min_area = max(3, int(round(0.75 * scale * scale)))
+        max_width = max(12, int(round(84.0 * scale)))
+        max_height = max(20, int(round(144.0 * scale)))
+        attachment_proxy = cv2.dilate(
+            attachment_band.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(5), kernel(5))),
+        ).astype(bool)
+        best_score = -1.0
+        for component_id in range(1, component_count):
+            component = labels == component_id
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            bbox_width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+            bbox_height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+            if area < min_area or area > max_area or bbox_width > max_width or bbox_height > max_height:
+                continue
+            points = np.argwhere(component)
+            if points.size == 0:
+                continue
+            distance = np.sqrt(
+                (points[:, 0] - anchor_y) ** 2 + (points[:, 1] - anchor_x) ** 2
+            ).min()
+            if distance > 72.0 * scale:
+                continue
+            if not np.any(component & attachment_proxy):
+                continue
+            if (parser_present or associated_present) and not np.any(component & source_link):
+                # Neither a parsed fragment nor an accepted low-resolution
+                # locator may license a second unrelated ear-side texture.
+                # A native component has to meet one of those side-local links
+                # before it can become a recovery candidate.
+                continue
+            object_pixels = candidate & component
+            object_area = int(object_pixels.sum())
+            if object_area < min_area:
+                continue
+            # A parser-missed fallback must contain a visible exterior part.
+            # A high-contrast ear fold or lobe boundary can satisfy every
+            # texture test while remaining wholly inside labels 7/8 (or the
+            # face surface); allowing it would synthesize a small earring on
+            # an accessory-free source.  Parser-confirmed pixels are handled
+            # by the parser-first path and do not reach this fallback.
+            # Background-labelled pixels are allowed only inside the narrow
+            # strong-candidate inspection permission created by the caller.
+            # Treat them as exterior for this check, but do not generalise that
+            # exception to the rest of the parser background.
+            exterior = object_pixels & (
+                ~(ear | face | hair | background)
+                | (background & background_permission)
+                | (face & associated_present)
+            )
+            exterior_area = int(exterior.sum())
+            if exterior_area < max(1, int(np.ceil(0.18 * object_area))):
+                continue
+            density = float(object_area) / float(max(1, bbox_width * bbox_height))
+            if density < 0.015:
+                continue
+            attachment_pixels = object_pixels & attachment_band
+            attachment_area = int(attachment_pixels.sum())
+            if attachment_area < max(1, int(round(0.5 * scale))):
+                continue
+            score = (
+                float(attachment_area) * 4.0
+                + float(object_area)
+                + max(0.0, 1.0 - distance / max(72.0 * scale, 1.0)) * 8.0
+            )
+            if score <= best_score:
+                continue
+            best_score = score
+            selected[:] = False
+            selected_seed[:] = False
+            selected_attachment[:] = False
+            selected_candidate[:] = False
+            selected_hoop_seed[:] = False
+            selected[object_pixels] = True
+            selected_seed[candidate_seed & component] = True
+            selected_attachment[attachment_pixels] = True
+            selected_candidate[component] = True
+            # A visual candidate may authorize the paired-contour verifier only
+            # when its native support already encloses a compact interior.  The
+            # verifier still has to confirm two independent boundaries and
+            # lobe contact; this seed never grants RGB authority or hole pixels.
+            component_crop = component.astype(np.uint8)
+            component_closed = cv2.morphologyEx(
+                component_crop,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(5), kernel(5))),
+            )
+            contour_info = cv2.findContours(
+                component_closed,
+                cv2.RETR_CCOMP,
+                cv2.CHAIN_APPROX_NONE,
+            )
+            contours = contour_info[-2]
+            hierarchy = contour_info[-1]
+            hoop_like = False
+            if hierarchy is not None and contours:
+                for contour_index, contour in enumerate(contours):
+                    parent = int(hierarchy[0, contour_index, 3])
+                    if parent < 0:
+                        continue
+                    outer_area = float(cv2.contourArea(contours[parent]))
+                    inner_area = float(cv2.contourArea(contour))
+                    if outer_area <= 1.0 or inner_area < max(3.0, 0.04 * outer_area):
+                        continue
+                    if inner_area > 0.70 * outer_area:
+                        continue
+                    outer_x, outer_y, outer_w, outer_h = cv2.boundingRect(contours[parent])
+                    ratio = min(outer_w, outer_h) / max(float(max(outer_w, outer_h)), 1.0)
+                    if ratio < 0.38:
+                        continue
+                    hoop_like = True
+                    break
+            if hoop_like:
+                selected_hoop_seed[candidate_seed & component] = True
+        return selected, selected_seed, selected_attachment, selected_candidate, selected_hoop_seed
+
+    for batch_idx in range(batch):
+        (
+            left_out[batch_idx, 0],
+            left_seed_out[batch_idx, 0],
+            left_attach_out[batch_idx, 0],
+            left_candidate_out[batch_idx, 0],
+            left_hoop_seed_out[batch_idx, 0],
+        ) = trace_side(
+            source_np[batch_idx],
+            seed_np[batch_idx],
+            support_np[batch_idx],
+            parser_np[batch_idx],
+            associated_np[batch_idx],
+            background_np[batch_idx],
+            background_permission_np[batch_idx],
+            hair_np[batch_idx],
+            ear_np[batch_idx],
+            face_np[batch_idx],
+            # The visual fallback may follow a verified long pendant below the
+            # compact parser/hoop corridor.  Parser instance membership and
+            # hoop evidence remain compact-gated elsewhere; only this native
+            # recall trace receives the extended rail.
+            left_recall_context_np[batch_idx],
+            left_anchor_np[batch_idx],
+            left_parser_np[batch_idx],
+        )
+        (
+            right_out[batch_idx, 0],
+            right_seed_out[batch_idx, 0],
+            right_attach_out[batch_idx, 0],
+            right_candidate_out[batch_idx, 0],
+            right_hoop_seed_out[batch_idx, 0],
+        ) = trace_side(
+            source_np[batch_idx],
+            seed_np[batch_idx],
+            support_np[batch_idx],
+            parser_np[batch_idx],
+            associated_np[batch_idx],
+            background_np[batch_idx],
+            background_permission_np[batch_idx],
+            hair_np[batch_idx],
+            ear_np[batch_idx],
+            face_np[batch_idx],
+            right_recall_context_np[batch_idx],
+            right_anchor_np[batch_idx],
+            right_parser_np[batch_idx],
+        )
+
+    left = torch.from_numpy(left_out).to(reference.device, reference.dtype)
+    right = torch.from_numpy(right_out).to(reference.device, reference.dtype)
+    left_seed = torch.from_numpy(left_seed_out).to(reference.device, reference.dtype)
+    right_seed = torch.from_numpy(right_seed_out).to(reference.device, reference.dtype)
+    left_attachment = torch.from_numpy(left_attach_out).to(reference.device, reference.dtype)
+    right_attachment = torch.from_numpy(right_attach_out).to(reference.device, reference.dtype)
+    left_candidate = torch.from_numpy(left_candidate_out).to(reference.device, reference.dtype)
+    right_candidate = torch.from_numpy(right_candidate_out).to(reference.device, reference.dtype)
+    left_hoop_seed = torch.from_numpy(left_hoop_seed_out).to(reference.device, reference.dtype)
+    right_hoop_seed = torch.from_numpy(right_hoop_seed_out).to(reference.device, reference.dtype)
+    combined = torch.clamp(left + right, 0, 1)
+    combined_seed = torch.clamp(left_seed + right_seed, 0, 1)
+    combined_attachment = torch.clamp(left_attachment + right_attachment, 0, 1)
+    combined_candidate = torch.clamp(left_candidate + right_candidate, 0, 1)
+    combined_hoop_seed = torch.clamp(left_hoop_seed + right_hoop_seed, 0, 1)
+    left_present = (left.flatten(1).sum(dim=1, keepdim=True) >= 1.0).to(reference.dtype).view(batch, 1, 1, 1)
+    right_present = (right.flatten(1).sum(dim=1, keepdim=True) >= 1.0).to(reference.dtype).view(batch, 1, 1, 1)
+    combined_present = torch.clamp(left_present + right_present, 0, 1)
+    return {
+        "visual_recall_instance_mask": combined,
+        "left_visual_recall_instance_mask": left,
+        "right_visual_recall_instance_mask": right,
+        "visual_recall_seed_mask": combined_seed,
+        "left_visual_recall_seed_mask": left_seed,
+        "right_visual_recall_seed_mask": right_seed,
+        "visual_recall_attachment_mask": combined_attachment,
+        "left_visual_recall_attachment_mask": left_attachment,
+        "right_visual_recall_attachment_mask": right_attachment,
+        "visual_recall_candidate_mask": combined_candidate,
+        "left_visual_recall_candidate_mask": left_candidate,
+        "right_visual_recall_candidate_mask": right_candidate,
+        "visual_recall_hoop_seed_mask": combined_hoop_seed,
+        "left_visual_recall_hoop_seed_mask": left_hoop_seed,
+        "right_visual_recall_hoop_seed_mask": right_hoop_seed,
+        "visual_recall_present": combined_present,
+        "left_visual_recall_present": left_present,
+        "right_visual_recall_present": right_present,
+    }
 
 
 def build_source_earring_instance_masks_v5(
@@ -742,16 +1600,36 @@ def build_source_earring_instance_masks_v5(
             "instance_mask": zeros,
             "left_instance_mask": zeros,
             "right_instance_mask": zeros,
+            "left_parser_instance_mask": zeros,
+            "right_parser_instance_mask": zeros,
             "hoop_hole_mask": zeros,
             "left_hoop_hole_mask": zeros,
             "right_hoop_hole_mask": zeros,
             "locator_roi": zeros,
             "locator_seed": zeros,
+            "locator_presence_seed": zeros,
             "locator_support": zeros,
             "locator_ring_support": zeros,
             "locator_parser_mask": zeros,
+            "left_context": zeros,
+            "right_context": zeros,
             "left_lobe_anchor": zeros,
             "right_lobe_anchor": zeros,
+            "visual_recall_instance_mask": zeros,
+            "left_visual_recall_instance_mask": zeros,
+            "right_visual_recall_instance_mask": zeros,
+            "visual_recall_seed_mask": zeros,
+            "left_visual_recall_seed_mask": zeros,
+            "right_visual_recall_seed_mask": zeros,
+            "visual_recall_attachment_mask": zeros,
+            "left_visual_recall_attachment_mask": zeros,
+            "right_visual_recall_attachment_mask": zeros,
+            "visual_recall_candidate_mask": zeros,
+            "left_visual_recall_candidate_mask": zeros,
+            "right_visual_recall_candidate_mask": zeros,
+            "visual_recall_present": zeros[:, :, :1, :1],
+            "left_visual_recall_present": zeros[:, :, :1, :1],
+            "right_visual_recall_present": zeros[:, :, :1, :1],
         }
 
     parser_earring = _instance_parsing_mask(source_parsing, (RAW_EARRING,), size, reference)
@@ -789,14 +1667,188 @@ def build_source_earring_instance_masks_v5(
         rounded = max(int(minimum), int(round(float(value) * scale)))
         return rounded if rounded % 2 == 1 else rounded + 1
 
-    locator_hint = dilate_mask(supplied_seed, scaled(3, 1))
-    ear_base = torch.clamp(source_ear + parser_earring + locator_hint, 0, 1)
+    # Establish source-side geometry *before* any parser label or learned seed
+    # can influence the locator.  A coarse mask is useful only after it has
+    # been linked to an actual source ear/lobe corridor; it must not enlarge a
+    # free-standing lower-face/background search area.
+    left_context = torch.clamp(
+        dilate_mask(left_ear, scaled(27, 3))
+        + shift_mask(dilate_mask(left_ear, scaled(23, 3)), down=scaled(36, 1)),
+        0,
+        1,
+    )
+    right_context = torch.clamp(
+        dilate_mask(right_ear, scaled(27, 3))
+        + shift_mask(dilate_mask(right_ear, scaled(23, 3)), down=scaled(36, 1)),
+        0,
+        1,
+    )
+    left_lobe_anchor = build_earlobe_anchor(
+        left_ear,
+        ear_roi=left_context,
+        lower_ratio=0.62,
+        dilate=scaled(3, 1),
+    )
+    right_lobe_anchor = build_earlobe_anchor(
+        right_ear,
+        ear_roi=right_context,
+        lower_ratio=0.62,
+        dilate=scaled(3, 1),
+    )
+    # A genuine hanging object can start at the lower lobe and extend below
+    # the raw ear label.  This is still source-ear-derived geometry rather than
+    # an image-midline fallback.
+    left_context = torch.clamp(
+        left_context
+        + shift_mask(dilate_mask(left_lobe_anchor, scaled(19, 3)), down=scaled(52, 1)),
+        0,
+        1,
+    )
+    right_context = torch.clamp(
+        right_context
+        + shift_mask(dilate_mask(right_lobe_anchor, scaled(19, 3)), down=scaled(52, 1)),
+        0,
+        1,
+    )
+    # The two expanded corridors can overlap near a frontal face.  Make that
+    # overlap exclusive from the real source-lobe locations so a seed on one
+    # side cannot activate both ears downstream.  Equal-distance pixels remain
+    # unassigned rather than falling back to an image-centre convention.
+    y_coords = torch.arange(size[0], device=reference.device, dtype=reference.dtype).view(1, 1, -1, 1)
+    x_coords = torch.arange(size[1], device=reference.device, dtype=reference.dtype).view(1, 1, 1, -1)
+
+    def anchor_centre(anchor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        anchor_area = anchor.sum(dim=(2, 3), keepdim=True)
+        present = anchor_area >= 1.0
+        centre_y = (anchor * y_coords).sum(dim=(2, 3), keepdim=True) / anchor_area.clamp_min(1.0)
+        centre_x = (anchor * x_coords).sum(dim=(2, 3), keepdim=True) / anchor_area.clamp_min(1.0)
+        return centre_y, centre_x, present
+
+    left_anchor_y, left_anchor_x, left_anchor_present = anchor_centre(left_lobe_anchor)
+    right_anchor_y, right_anchor_x, right_anchor_present = anchor_centre(right_lobe_anchor)
+    both_anchors_present = left_anchor_present & right_anchor_present
+    overlap = (left_context * right_context).clamp(0, 1)
+    left_distance = (y_coords - left_anchor_y).pow(2) + (x_coords - left_anchor_x).pow(2)
+    right_distance = (y_coords - right_anchor_y).pow(2) + (x_coords - right_anchor_x).pow(2)
+    left_overlap = overlap * (left_distance < right_distance).to(dtype=reference.dtype)
+    right_overlap = overlap * (right_distance < left_distance).to(dtype=reference.dtype)
+    left_separated = torch.clamp(left_context * (1.0 - overlap) + left_overlap, 0, 1)
+    right_separated = torch.clamp(right_context * (1.0 - overlap) + right_overlap, 0, 1)
+    left_context = torch.where(both_anchors_present, left_separated, left_context)
+    right_context = torch.where(both_anchors_present, right_separated, right_context)
+
+    # Keep the association corridor compact, but give the already strict
+    # native ordinary-instance verifier a separate, narrow downward rail.
+    # A verified long pendant can extend much farther than the 52px lobe
+    # search offset above.  Reusing that short association box as its final
+    # crop was cutting valid tails even though the component had already been
+    # linked to this exact source lobe.  This rail is passed only to the
+    # visual-recall helper; parser/seed association and hoop authorization
+    # continue to use the compact contexts above.
+    left_recall_context = torch.clamp(
+        left_context
+        + shift_mask(dilate_mask(left_lobe_anchor, scaled(13, 3)), down=scaled(104, 1))
+        + shift_mask(dilate_mask(left_lobe_anchor, scaled(11, 3)), down=scaled(140, 1)),
+        0,
+        1,
+    )
+    right_recall_context = torch.clamp(
+        right_context
+        + shift_mask(dilate_mask(right_lobe_anchor, scaled(13, 3)), down=scaled(104, 1))
+        + shift_mask(dilate_mask(right_lobe_anchor, scaled(11, 3)), down=scaled(140, 1)),
+        0,
+        1,
+    )
+    recall_overlap = (left_recall_context * right_recall_context).clamp(0, 1)
+    left_recall_context = torch.where(
+        both_anchors_present,
+        torch.clamp(
+            left_recall_context * (1.0 - recall_overlap)
+            + recall_overlap * (left_distance < right_distance).to(dtype=reference.dtype),
+            0,
+            1,
+        ),
+        left_recall_context,
+    )
+    right_recall_context = torch.where(
+        both_anchors_present,
+        torch.clamp(
+            right_recall_context * (1.0 - recall_overlap)
+            + recall_overlap * (right_distance < left_distance).to(dtype=reference.dtype),
+            0,
+            1,
+        ),
+        right_recall_context,
+    )
+    source_side_context = torch.clamp(left_context + right_context, 0, 1)
+    association_support = dilate_mask(source_side_context, scaled(7, 1))
+
+    # Parser label 9 remains the normal-earring authority, but a parser blob
+    # on an unrelated cheek/background component cannot be re-pasted merely by
+    # living on the conventional image half.  The same source-side rule applies
+    # to a learned low-resolution seed.
+    # This limit is applied to an ear-local association proxy, not to the
+    # final raw parser component.  Large dangling accessories can occupy more
+    # than 3.5% of a portrait while still being a single label-9 component
+    # attached to one lobe.  Keep a larger budget only for this semantic,
+    # side-associated path; visual-only candidates retain their much smaller
+    # object budget below and cannot use this relaxation to copy background.
+    association_maximum_area = max(1, int(round(0.055 * size[0] * size[1])))
+    # A 3px association dilation increases the temporary proxy area even when
+    # the original label-9 component is within the final object budget.  Give
+    # that proxy margin, then enforce ``association_maximum_area`` again on the
+    # complete raw component below; this preserves long verified tails without
+    # allowing a larger RGB write object.
+    association_proxy_maximum_area = max(
+        association_maximum_area,
+        int(round(0.075 * size[0] * size[1])),
+    )
+    parser_association_proxy = _instance_filter_components(
+        dilate_mask(parser_earring, scaled(3, 1)) * association_support,
+        association_support,
+        minimum_area=max(1, int(round(0.50 * scale * scale))),
+        maximum_area=association_proxy_maximum_area,
+        keep_per_side=3,
+        left_context=left_context,
+        right_context=right_context,
+        left_lobe_anchor=left_lobe_anchor,
+        right_lobe_anchor=right_lobe_anchor,
+        require_side_context=True,
+    )
+    parser_earring = _retain_raw_components_touching_proxy(
+        parser_earring,
+        dilate_mask(parser_association_proxy, scaled(3, 1)),
+        minimum_area=max(1, int(round(0.50 * scale * scale))),
+        maximum_area=association_maximum_area,
+        left_context=left_context,
+        right_context=right_context,
+        left_lobe_anchor=left_lobe_anchor,
+        right_lobe_anchor=right_lobe_anchor,
+        require_side_context=True,
+    )
+    seed_association_proxy = _instance_filter_components(
+        dilate_mask(supplied_seed, scaled(3, 1)) * association_support,
+        association_support,
+        minimum_area=max(1, int(round(0.50 * scale * scale))),
+        maximum_area=association_proxy_maximum_area,
+        keep_per_side=3,
+        left_context=left_context,
+        right_context=right_context,
+        left_lobe_anchor=left_lobe_anchor,
+        right_lobe_anchor=right_lobe_anchor,
+        require_side_context=True,
+    )
+    associated_seed = supplied_seed * dilate_mask(seed_association_proxy, scaled(3, 1))
+    associated_seed = associated_seed * association_support
+
+    ear_base = torch.clamp(source_ear + parser_earring, 0, 1)
     lobe_corridor = torch.clamp(
-        dilate_mask(ear_base, scaled(19, 3))
+        source_side_context
+        + dilate_mask(ear_base, scaled(19, 3))
         + dilate_mask(shift_mask(source_ear, down=scaled(12, 1)), scaled(17, 3))
         + 0.80 * dilate_mask(shift_mask(source_ear, down=scaled(30, 1)), scaled(15, 3))
         + 0.55 * dilate_mask(shift_mask(source_ear, down=scaled(52, 1)), scaled(13, 3))
-        + dilate_mask(parser_earring + locator_hint, scaled(9, 3)),
+        + dilate_mask(parser_earring, scaled(9, 3)),
         0,
         1,
     )
@@ -804,7 +1856,7 @@ def build_source_earring_instance_masks_v5(
     # exempt so a large hanging earring is not clipped by a weak ear label.
     face_inner = erode_mask(face_surface, scaled(9, 3))
     locator_roi = lobe_corridor * (1.0 - 0.82 * face_inner).clamp(0, 1)
-    locator_roi = torch.clamp(locator_roi + parser_earring + locator_hint, 0, 1)
+    locator_roi = torch.clamp(locator_roi + parser_earring, 0, 1)
 
     gray = rgb_to_gray(source_01)
     local_small = F.avg_pool2d(gray, kernel_size=scaled(7, 3), stride=1, padding=scaled(7, 3) // 2)
@@ -848,14 +1900,14 @@ def build_source_earring_instance_masks_v5(
         1,
     ) * locator_roi
 
-    visual_seed = _instance_adaptive_threshold(
+    raw_visual_seed = _instance_adaptive_threshold(
         evidence,
         locator_roi,
         std_scale=0.20,
         minimum_delta=0.010,
         minimum_area=8.0 * scale * scale,
     )
-    visual_support = _instance_adaptive_threshold(
+    raw_visual_support = _instance_adaptive_threshold(
         0.75 * evidence + 0.25 * texture_objectness,
         locator_roi,
         std_scale=0.04,
@@ -883,39 +1935,80 @@ def build_source_earring_instance_masks_v5(
         * (1.0 - source_background).clamp(0, 1)
         * torch.clamp((1.0 - source_ear) + ear_detail, 0, 1)
     )
-    # Parser-missed jewellery is often labelled as source background.  Permit
-    # such a pixel only when the low-resolution stage already found a compact
-    # ear-local seed *and* the high-resolution pixel carries independent local
-    # object evidence.  The seed still does not write RGB on its own.  This is
-    # intentionally much narrower than the old broad lower-ear recall patch.
-    seeded_background_object = (
-        source_background
-        * dilate_mask(supplied_seed, scaled(5, 1))
-        * visual_seed
-        * torch.clamp(contrast + 0.65 * colour_delta + 0.35 * edge, 0, 1)
-    )
-    seeded_background_object = (seeded_background_object > 0.15).to(source_01.dtype)
-    visual_source_gate = torch.clamp(visual_source_gate + seeded_background_object, 0, 1)
     # Ring geometry gets a separate, more permissive support map.  It is a
     # verifier only and never creates a synthetic ellipse for RGB output.
-    ring_support = visual_support * (1.0 - source_hair).clamp(0, 1)
+    ring_support = raw_visual_support * (1.0 - source_hair).clamp(0, 1)
     ring_support = ring_support * (1.0 - erode_mask(source_ear, scaled(7, 3))).clamp(0, 1)
-    visual_seed = visual_seed * visual_source_gate
-    visual_support = visual_support * visual_source_gate
-    parser_neighbourhood = dilate_mask(parser_earring, scaled(7, 3))
-    # A face parser often labels just one arc of a hollow earring.  Limiting
-    # visual recall to that labelled arc was the reason the other half of a
-    # hoop disappeared.  Search the whole ear/lobe corridor for strong visual
-    # evidence, while retaining label 9 as an additional seed.  Component
-    # filtering below still rejects the large background component.
-    # Keep the supplied low-resolution seed as a *connectivity hint* only
-    # after it has met high-resolution visual evidence.  In particular, do not
-    # add ``supplied_seed`` directly here or below: that would copy its coarse
-    # rectangle even when every source pixel is ear skin or grass.
-    seeded_visual = supplied_seed * visual_seed * visual_source_gate
-    seed = torch.clamp(visual_seed + parser_earring + seeded_visual, 0, 1)
+    visual_seed = raw_visual_seed * visual_source_gate
+    visual_support = raw_visual_support * visual_source_gate
+
+    # A real but parser-missed accessory is commonly assigned label 0.  Do not
+    # reopen the whole background: only an already source-side-associated
+    # low-resolution strong candidate may request a native-resolution check,
+    # and the checked pixel must still be materially distinct from the local
+    # background.  This produces a narrow *inspection permission* for the
+    # ordinary visual-recall helper below, never a direct source-RGB mask.
+    background_seed_neighbourhood = (
+        dilate_mask(associated_seed, scaled(5, 1)) * locator_roi * source_background
+    ).clamp(0, 1)
+    # Some genuine metal is labelled background and has no low-resolution
+    # strong seed at all.  Permit a native probe only on a narrow rail grown
+    # from a measured source lobe.  This is deliberately side-local and much
+    # smaller than ``locator_roi``; it gives the strict visual extractor a
+    # chance to find an exposed stud/pendant without reopening the ear-side
+    # grass or background crop.
+    source_lobe_anchors = torch.clamp(left_lobe_anchor + right_lobe_anchor, 0, 1)
+    native_lobe_rail = torch.clamp(
+        dilate_mask(source_lobe_anchors, scaled(9, 3))
+        + shift_mask(dilate_mask(source_lobe_anchors, scaled(7, 3)), down=scaled(15, 1))
+        + shift_mask(dilate_mask(source_lobe_anchors, scaled(7, 3)), down=scaled(30, 1))
+        + shift_mask(dilate_mask(source_lobe_anchors, scaled(7, 3)), down=scaled(48, 1))
+        + shift_mask(dilate_mask(source_lobe_anchors, scaled(7, 3)), down=scaled(68, 1))
+        + shift_mask(dilate_mask(source_lobe_anchors, scaled(5, 3)), down=scaled(88, 1))
+        + shift_mask(dilate_mask(source_lobe_anchors, scaled(5, 3)), down=scaled(108, 1)),
+        0,
+        1,
+    )
+    native_background_probe = (
+        source_background
+        * native_lobe_rail
+        * locator_roi
+        * (1.0 - source_hair).clamp(0, 1)
+    ).clamp(0, 1)
+    background_seed_neighbourhood = torch.clamp(
+        background_seed_neighbourhood + native_background_probe,
+        0,
+        1,
+    )
+    background_distinct = _instance_adaptive_threshold(
+        0.85 * dist_bg + 0.60 * colour_delta + 0.35 * chroma + 0.30 * edge,
+        background_seed_neighbourhood,
+        std_scale=0.18,
+        minimum_delta=0.006,
+        minimum_area=3.0 * scale * scale,
+    )
+    background_recall_gate = (
+        background_seed_neighbourhood * background_distinct
+    ).clamp(0, 1)
+    recall_source_gate = torch.clamp(
+        visual_source_gate + background_recall_gate,
+        0,
+        1,
+    )
+    recall_visual_seed = raw_visual_seed * recall_source_gate
+    recall_visual_support = raw_visual_support * recall_source_gate
+    # The generic source-instance path is parser-first.  A coarse strong seed
+    # is useful for the dedicated parser-miss visual inspector below, but it
+    # must not enter this generic grower: an upsampled seed overlapping an ear
+    # fold can otherwise turn a bright/dark lobe texture into source RGB.  This
+    # was the direct route behind duplicated earlobes and black ear chunks.
+    proposal_seed = parser_earring
+    proposal_neighbourhood = dilate_mask(proposal_seed, scaled(9, 3)) * locator_roi
+    seeded_visual = visual_seed * proposal_neighbourhood
+    seed = torch.clamp(parser_earring + seeded_visual, 0, 1)
     support = torch.clamp(
-        visual_support + dilate_mask(parser_earring + seeded_visual, scaled(3, 1)),
+        visual_support * proposal_neighbourhood
+        + dilate_mask(parser_earring + seeded_visual, scaled(3, 1)),
         0,
         1,
     ) * locator_roi
@@ -927,7 +2020,7 @@ def build_source_earring_instance_masks_v5(
     for _ in range(2):
         reachable = torch.clamp(reachable + dilate_mask(reachable, scaled(3, 1)) * support, 0, 1)
     object_pixels = torch.clamp(
-        reachable * (visual_support + parser_neighbourhood) + parser_earring + seeded_visual,
+        reachable * visual_support + parser_earring,
         0,
         1,
     )
@@ -940,70 +2033,159 @@ def build_source_earring_instance_masks_v5(
         locator_roi,
         minimum_area=minimum_area,
         maximum_area=maximum_area,
+        # Final RGB recovery permits one connected ordinary accessory per
+        # ear side.  A hoop follows its own complete-contour path below; it
+        # must not be reconstructed as several nearby ordinary components.
+        keep_per_side=1,
+        # This filter is only for native visual recall.  Use the extended
+        # lobe rail so a long pendant is not discarded before side assignment;
+        # parser/strong-seed association and hoop authority stay compact.
+        left_context=left_recall_context,
+        right_context=right_recall_context,
+        left_lobe_anchor=left_lobe_anchor,
+        right_lobe_anchor=right_lobe_anchor,
     )
-    instance = object_pixels * dilate_mask(kept_proxy, scaled(3, 1))
-    # Raw label 9 is an observed object, not a colour proposal.  Preserve it
-    # after component filtering so small studs cannot disappear.
-    instance = torch.clamp(instance + parser_earring + seeded_visual, 0, 1) * locator_roi
+    left_kept_proxy, right_kept_proxy = assign_components_to_ear_sides(
+        kept_proxy,
+        left_recall_context,
+        right_recall_context,
+        left_lobe_anchor,
+        right_lobe_anchor,
+    )
+    left_visual_instance = object_pixels * dilate_mask(left_kept_proxy, scaled(3, 1))
+    right_visual_instance = object_pixels * dilate_mask(right_kept_proxy, scaled(3, 1))
 
-    # Split using source ear positions where available.  The centre split is
-    # only a fallback for parser-missed ears; it is never used as a detector.
-    left_context = torch.clamp(
-        dilate_mask(left_ear, scaled(27, 3))
-        + shift_mask(dilate_mask(left_ear, scaled(23, 3)), down=scaled(36, 1))
-        + parser_earring * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) <= size[1] // 2),
-        0,
-        1,
+    # ``parser_earring`` now contains only complete raw components that first
+    # touched an accepted source-ear proxy.  Do not run it through a second
+    # compact proxy filter here: that second filter was the remaining route
+    # that cut a verified long pendant or full ring back to a lobe-sized dot.
+    # The side assignment retains complete components and is mutually exclusive
+    # for the two real source ears.
+    left_parser_instance, right_parser_instance = assign_components_to_ear_sides(
+        parser_earring,
+        left_context,
+        right_context,
+        left_lobe_anchor,
+        right_lobe_anchor,
     )
-    right_context = torch.clamp(
-        dilate_mask(right_ear, scaled(27, 3))
-        + shift_mask(dilate_mask(right_ear, scaled(23, 3)), down=scaled(36, 1))
-        + parser_earring * (torch.arange(size[1], device=reference.device).view(1, 1, 1, -1) > size[1] // 2),
-        0,
-        1,
+    # Recover a parser-missed *ordinary* accessory only from independent
+    # high-resolution structure in the exterior lobe belt.  This fallback is
+    # intentionally separate from the contour-hoop verifier and never grants
+    # permission to copy a background-labelled annulus or its hole.
+    visual_recall = _build_parser_miss_visual_instances_v5(
+        source_01,
+        recall_visual_seed,
+        recall_visual_support,
+        parser_earring,
+        associated_seed,
+        source_background,
+        background_recall_gate,
+        source_hair,
+        source_ear,
+        face_surface,
+        left_context,
+        right_context,
+        left_recall_context,
+        right_recall_context,
+        left_lobe_anchor,
+        right_lobe_anchor,
+        left_parser_instance,
+        right_parser_instance,
     )
-    left_instance = instance * left_context
-    right_instance = instance * right_context
-    unassigned = instance * (1.0 - torch.clamp(left_context + right_context, 0, 1))
-    x_grid = torch.arange(size[1], device=reference.device).view(1, 1, 1, -1)
-    left_instance = torch.clamp(left_instance + unassigned * (x_grid <= size[1] // 2), 0, 1)
-    right_instance = torch.clamp(right_instance + unassigned * (x_grid > size[1] // 2), 0, 1)
+    left_visual_recall = visual_recall["left_visual_recall_instance_mask"]
+    right_visual_recall = visual_recall["right_visual_recall_instance_mask"]
 
-    left_lobe_anchor = build_earlobe_anchor(
-        left_ear,
-        fallback_skin_mask=face_surface * (x_grid <= size[1] // 2).to(face_surface.dtype),
-        ear_roi=left_context,
-        lower_ratio=0.62,
-        dilate=scaled(3, 1),
-    )
-    right_lobe_anchor = build_earlobe_anchor(
-        right_ear,
-        fallback_skin_mask=face_surface * (x_grid > size[1] // 2).to(face_surface.dtype),
-        ear_roi=right_context,
-        lower_ratio=0.62,
-        dilate=scaled(3, 1),
-    )
+    # ``locator_roi`` is a detector corridor, not an object boundary.  The
+    # parser component has already passed source-side association and the
+    # complete raw component is deliberately retained above.  Multiplying the
+    # union by this corridor would cut a verified pendant/hoop back to the
+    # lobe-sized fragment that caused the original short-arc regression.
+    # Visual-recall pixels are native-resolution evidence generated from
+    # ``visual_seed``/``visual_support`` and independently linked to the lobe
+    # by the helper.  Do not recrop them with ``locator_roi``: that low-res
+    # detector corridor ends above a verified long pendant and was the last
+    # geometric cause of missing lower tails.
+    left_visual_instance = left_visual_instance * locator_roi
+    right_visual_instance = right_visual_instance * locator_roi
+    # Ordinary accessories require an associated raw parser component for RGB
+    # authority.  The visual detector is still retained as a closed-loop hoop
+    # seed below, but a generic lobe-adjacent edge is not sufficient evidence
+    # to paste a solid pendant, stud, ear fold or background texture.
+    #
+    # This deliberately favours a no-op over a fabricated accessory.  A true
+    # parser-missed hollow hoop remains available to the paired-contour
+    # verifier through ``*_visual_recall_hoop_seed_mask``.
+    left_instance_base = left_parser_instance
+    right_instance_base = right_parser_instance
+    # The native visual fallback is a verified source object, not merely a
+    # search proposal: it has passed lobe attachment, exterior-content,
+    # contrast and connected-component checks.  Merge it with the parser
+    # fragment so a parser-missed pendant tail is written back.  Keep its
+    # topology solid here; hollow rings are authorised separately by the
+    # paired-contour verifier below.
+    left_instance = torch.clamp(left_instance_base + left_visual_recall, 0, 1)
+    right_instance = torch.clamp(right_instance_base + right_visual_recall, 0, 1)
 
     # The hole is inferred only from a locally closed visual object.  It is
     # composed from the target output below, so it can never retain source
     # hair/background even for an unusually large hollow earring.
-    left_proxy = dilate_mask(left_instance, scaled(3, 1))
-    right_proxy = dilate_mask(right_instance, scaled(3, 1))
+    # Do not infer a hollow centre from the parser-miss visual fallback.  It is
+    # an ordinary-solid path; only the established parser/coarse instance may
+    # contribute a low-resolution topology hint, while complete hoops are
+    # handled by the paired-contour branch below.
+    left_proxy = dilate_mask(left_instance_base, scaled(3, 1))
+    right_proxy = dilate_mask(right_instance_base, scaled(3, 1))
     left_hole = compute_earring_hole_mask(left_proxy) * locator_roi
     right_hole = compute_earring_hole_mask(right_proxy) * locator_roi
     return {
         "instance_mask": torch.clamp(left_instance + right_instance, 0, 1),
         "left_instance_mask": left_instance.clamp(0, 1),
         "right_instance_mask": right_instance.clamp(0, 1),
+        "left_parser_instance_mask": left_parser_instance.clamp(0, 1),
+        "right_parser_instance_mask": right_parser_instance.clamp(0, 1),
+        # Export the exact recall alpha that was merged into the instance, not
+        # merely the helper's pre-merge diagnostic view.
+        "visual_recall_instance_mask": torch.clamp(left_visual_recall + right_visual_recall, 0, 1),
+        "left_visual_recall_instance_mask": left_visual_recall.clamp(0, 1),
+        "right_visual_recall_instance_mask": right_visual_recall.clamp(0, 1),
+        "visual_recall_seed_mask": visual_recall["visual_recall_seed_mask"].clamp(0, 1),
+        "left_visual_recall_seed_mask": visual_recall["left_visual_recall_seed_mask"].clamp(0, 1),
+        "right_visual_recall_seed_mask": visual_recall["right_visual_recall_seed_mask"].clamp(0, 1),
+        "visual_recall_attachment_mask": visual_recall["visual_recall_attachment_mask"].clamp(0, 1),
+        "left_visual_recall_attachment_mask": visual_recall["left_visual_recall_attachment_mask"].clamp(0, 1),
+        "right_visual_recall_attachment_mask": visual_recall["right_visual_recall_attachment_mask"].clamp(0, 1),
+        "visual_recall_candidate_mask": visual_recall["visual_recall_candidate_mask"].clamp(0, 1),
+        "left_visual_recall_candidate_mask": visual_recall["left_visual_recall_candidate_mask"].clamp(0, 1),
+        "right_visual_recall_candidate_mask": visual_recall["right_visual_recall_candidate_mask"].clamp(0, 1),
+        # Only a native closed-loop seed may reach the paired-contour hoop
+        # verifier.  Ordinary visual recall remains an ordinary-instance path
+        # and can never authorize a geometric ring by itself.
+        "visual_recall_hoop_seed_mask": visual_recall["visual_recall_hoop_seed_mask"].clamp(0, 1),
+        "left_visual_recall_hoop_seed_mask": visual_recall["left_visual_recall_hoop_seed_mask"].clamp(0, 1),
+        "right_visual_recall_hoop_seed_mask": visual_recall["right_visual_recall_hoop_seed_mask"].clamp(0, 1),
+        "visual_recall_present": visual_recall["visual_recall_present"],
+        "left_visual_recall_present": visual_recall["left_visual_recall_present"],
+        "right_visual_recall_present": visual_recall["right_visual_recall_present"],
         "hoop_hole_mask": torch.clamp(left_hole + right_hole, 0, 1),
         "left_hoop_hole_mask": left_hole.clamp(0, 1),
         "right_hoop_hole_mask": right_hole.clamp(0, 1),
         "locator_roi": locator_roi.clamp(0, 1),
         "locator_seed": seed.clamp(0, 1),
-        "locator_presence_seed": supplied_seed.clamp(0, 1),
+        # Downstream high-resolution hoop validation may consume this as
+        # presence evidence.  Export the source-side-associated seed, never
+        # the raw low-resolution proposal, otherwise a broad noisy seed can
+        # bypass the component checks above and authorize a false ring.
+        "locator_presence_seed": associated_seed.clamp(0, 1),
         "locator_support": support.clamp(0, 1),
         "locator_ring_support": ring_support.clamp(0, 1),
+        # Native parser-miss diagnostics.  These are inspection masks only and
+        # are never consumed as direct compositor alpha.
+        "locator_background_recall_permission": background_recall_gate.clamp(0, 1),
+        "locator_recall_seed": recall_visual_seed.clamp(0, 1),
+        "locator_recall_support": recall_visual_support.clamp(0, 1),
         "locator_parser_mask": parser_earring.clamp(0, 1),
+        "left_context": left_context.clamp(0, 1),
+        "right_context": right_context.clamp(0, 1),
         "left_lobe_anchor": left_lobe_anchor.clamp(0, 1),
         "right_lobe_anchor": right_lobe_anchor.clamp(0, 1),
     }
@@ -1045,6 +2227,15 @@ def refine_earring_instances_highres(
             "right_instance_mask": zeros,
             "left_hoop_hole_mask": zeros,
             "right_hoop_hole_mask": zeros,
+            "left_connector_mask": zeros,
+            "right_connector_mask": zeros,
+            "visual_recall_instance_mask": zeros,
+            "left_visual_recall_instance_mask": zeros,
+            "right_visual_recall_instance_mask": zeros,
+            "left_visual_recall_seed_mask": zeros,
+            "right_visual_recall_seed_mask": zeros,
+            "left_visual_recall_attachment_mask": zeros,
+            "right_visual_recall_attachment_mask": zeros,
         }
 
     def nearest(value: torch.Tensor | None) -> torch.Tensor:
@@ -1065,11 +2256,13 @@ def refine_earring_instances_highres(
     ear = nearest(source_ear_mask)
     if source_parsing is None:
         parser_earring = torch.zeros_like(reference)
+        source_background = torch.zeros_like(reference)
     else:
         parsing = ensure_mask_4d(source_parsing).to(device=source_01.device)
         if parsing.shape[-2:] != output_size:
             parsing = F.interpolate(parsing.float(), size=output_size, mode="nearest")
         parser_earring = (parsing.long() == RAW_EARRING).to(dtype=source_01.dtype)
+        source_background = (parsing.long() == 0).to(dtype=source_01.dtype)
 
     image_np = np.clip(
         source_01.detach().cpu().permute(0, 2, 3, 1).numpy() * 255.0,
@@ -1079,6 +2272,7 @@ def refine_earring_instances_highres(
     coarse_np = coarse.detach().cpu().numpy() > 0.5
     search_np = search.detach().cpu().numpy() > 0.5
     parser_np = parser_earring.detach().cpu().numpy() > 0.5
+    background_np = source_background.detach().cpu().numpy() > 0.5
     hair_np = hair.detach().cpu().numpy() > 0.5
     ear_np = ear.detach().cpu().numpy() > 0.5
     left_anchor_np = left_anchor.detach().cpu().numpy() > 0.5
@@ -1240,13 +2434,14 @@ def refine_earring_instances_highres(
         side_seed: np.ndarray,
         observed_seed: np.ndarray,
         side_search: np.ndarray,
+        side_background: np.ndarray,
         side_hair: np.ndarray,
         side_ear: np.ndarray,
         image: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         empty = np.zeros((height, width), dtype=bool)
         if not active.any():
-            return empty, empty
+            return empty, empty, empty
         # ``side_seed`` may come from a 256px detector.  It is allowed to
         # initialise GrabCut and connectivity, but it is not a source object
         # pixel.  Only the raw parser label is observed directly; every other
@@ -1255,19 +2450,18 @@ def refine_earring_instances_highres(
         observed = observed_seed.copy()
         anchor_points = np.argwhere(anchor)
         if anchor_points.size == 0:
-            seed_points = np.argwhere(seed)
-            if seed_points.size == 0:
-                return empty, empty
-            anchor_y, anchor_x = seed_points[np.argmin(seed_points[:, 0])]
-        else:
-            anchor_y, anchor_x = anchor_points.mean(axis=0)
+            # A coarse component cannot substitute for a real source lobe.
+            # Otherwise a textured background seed can establish its own local
+            # crop and later be copied back as a false earring.
+            return empty, empty, empty
+        anchor_y, anchor_x = anchor_points.mean(axis=0)
 
         y_grid, x_grid = np.ogrid[:height, :width]
         local_window = (
-            (y_grid >= anchor_y - 30.0 * scale)
-            & (y_grid <= anchor_y + 136.0 * scale)
-            & (x_grid >= anchor_x - 96.0 * scale)
-            & (x_grid <= anchor_x + 96.0 * scale)
+            (y_grid >= anchor_y - 72.0 * scale)
+            & (y_grid <= anchor_y + 176.0 * scale)
+            & (x_grid >= anchor_x - 120.0 * scale)
+            & (x_grid <= anchor_x + 120.0 * scale)
         )
         # When the parser misses an ordinary earring, bootstrap from compact
         # image evidence near the lobe.  This is still a source-instance seed,
@@ -1275,23 +2469,21 @@ def refine_earring_instances_highres(
         seed &= local_window
         observed &= local_window
         if int(seed.sum()) < max(3, int(round(0.75 * scale))):
-            seed = strict_visual_seed(
-                image,
-                local_window,
-                side_hair,
-                side_ear,
-                anchor,
-            )
-        if int(seed.sum()) < max(3, int(round(0.75 * scale))):
-            return empty, empty
+            return empty, empty, empty
 
-        local = local_window & (side_search | cv2.dilate(
-            seed.astype(np.uint8),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(31), odd(31))),
-        ).astype(bool))
+        # ``side_search`` is built at the PP resolution and is intentionally
+        # compact.  It is useful to initialise the low-resolution locator, but
+        # it cannot be the high-resolution crop boundary: a parser fragment at
+        # the lobe then limits a long pendant or a large round ornament to its
+        # upper edge before GrabCut/contour validation can inspect the body.
+        # The real-source lobe and ``seed`` already proved which side may be
+        # inspected.  Keep that bounded ear-local window available here; every
+        # eventual write pixel still has to pass the object, contour, hair and
+        # area checks below.
+        local = local_window
         ys, xs = np.where(local | seed | anchor)
         if ys.size == 0:
-            return empty, empty
+            return empty, empty, empty
         margin = odd(9)
         y0, y1 = max(0, ys.min() - margin), min(height, ys.max() + margin + 1)
         x0, x1 = max(0, xs.min() - margin), min(width, xs.max() + margin + 1)
@@ -1299,7 +2491,9 @@ def refine_earring_instances_highres(
         crop_image = image[y0:y1, x0:x1]
         crop_seed = seed[y0:y1, x0:x1]
         crop_observed = observed[y0:y1, x0:x1]
+        crop_anchor = anchor[y0:y1, x0:x1]
         crop_local = local[y0:y1, x0:x1]
+        crop_background = side_background[y0:y1, x0:x1]
         crop_hair = side_hair[y0:y1, x0:x1]
         crop_ear = side_ear[y0:y1, x0:x1]
         init = np.full(crop_seed.shape, cv2.GC_BGD, dtype=np.uint8)
@@ -1321,7 +2515,84 @@ def refine_earring_instances_highres(
             crop_ear.astype(np.uint8),
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(7), odd(7))),
         ).astype(bool)
-        init[ear_interior & ~near_seed] = cv2.GC_BGD
+
+        # A compact stud commonly sits entirely inside the semantic earlobe.
+        # Treating that whole area as background forces the native extractor to
+        # keep only the blocky 256px label-9 fragment.  Do not open the ear
+        # generally: this exception requires a source-parser observed fragment
+        # in a tight lower-lobe band, then limits native expansion to a small
+        # neighbourhood of that measured fragment.  Ear folds without label-9
+        # evidence therefore remain hard background as before.
+        interior_stud_anchor_band = (
+            cv2.dilate(
+                crop_anchor.astype(np.uint8),
+                cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (odd(23), odd(17)),
+                ),
+            ).astype(bool)
+            & crop_local
+        )
+        interior_stud_observed = (
+            crop_observed & ear_interior & interior_stud_anchor_band
+        )
+        interior_stud_min_seed = max(2, int(round(0.25 * scale * scale)))
+        interior_stud_enabled = (
+            int(interior_stud_observed.sum()) >= interior_stud_min_seed
+        )
+        interior_stud_zone = np.zeros_like(crop_local, dtype=bool)
+        if interior_stud_enabled:
+            interior_stud_zone = (
+                ear_interior
+                & interior_stud_anchor_band
+                & cv2.dilate(
+                    interior_stud_observed.astype(np.uint8),
+                    cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE,
+                        (odd(19), odd(19)),
+                    ),
+                ).astype(bool)
+                & ~crop_hair_interior
+            )
+        init[ear_interior & ~near_seed & ~interior_stud_zone] = cv2.GC_BGD
+        if interior_stud_enabled:
+            init[interior_stud_zone] = cv2.GC_PR_FGD
+
+        def is_compact_interior_stud(body: np.ndarray) -> bool:
+            """Accept only a parser-anchored, bounded earlobe stud body."""
+
+            if not interior_stud_enabled:
+                return False
+            body_area = int(body.sum())
+            if body_area < max(8, int(round(2.0 * scale * scale))):
+                return False
+            inside_area = int((body & interior_stud_zone).sum())
+            if inside_area < int(np.ceil(0.70 * body_area)):
+                return False
+            if int((body & interior_stud_observed).sum()) < interior_stud_min_seed:
+                return False
+            # A label-9 fragment is a locator, not direct RGB authority.  It
+            # must touch a native source boundary before a skin-coloured ear
+            # parser mistake can be admitted as an in-ear stud.
+            if int((body & interior_stud_zone & visual_support).sum()) < 1:
+                return False
+            points = np.argwhere(body)
+            if points.size == 0:
+                return False
+            bbox_height = int(points[:, 0].max() - points[:, 0].min() + 1)
+            bbox_width = int(points[:, 1].max() - points[:, 1].min() + 1)
+            max_stud_area = min(
+                max(
+                    int(round(320.0 * scale * scale)),
+                    int(crop_observed.sum()) * 24,
+                ),
+                int(round(0.012 * height * width)),
+            )
+            return (
+                body_area <= max_stud_area
+                and bbox_width <= max(20, int(round(48.0 * scale)))
+                and bbox_height <= max(20, int(round(48.0 * scale)))
+            )
 
         candidate = crop_seed.copy()
         if int(crop_seed.sum()) >= 3 and crop_image.shape[0] >= 3 and crop_image.shape[1] >= 3:
@@ -1340,6 +2611,13 @@ def refine_earring_instances_highres(
                 candidate = ((init == cv2.GC_FGD) | (init == cv2.GC_PR_FGD)) & crop_local
             except cv2.error:
                 candidate = crop_seed.copy()
+        # Keep GrabCut's complete foreground separate from the edge-only
+        # candidate below.  Large ornate/solid earrings often have a textured
+        # outline but a low-contrast gold or gem interior; reducing every
+        # accepted foreground pixel to an edge leaves only a thin crescent.
+        # The complete region is admitted later only after its own strict
+        # lobe, contour and area checks pass.
+        grabcut_foreground = candidate.copy()
         # GrabCut's probable foreground includes a local colour region, not
         # necessarily an object.  Admit only real source structure outside the
         # confirmed seed, so a flat source background cannot survive as a
@@ -1353,60 +2631,670 @@ def refine_earring_instances_highres(
         blurred = cv2.GaussianBlur(crop_image, (odd(9), odd(9)), 0)
         local_delta = np.abs(crop_image.astype(np.int16) - blurred.astype(np.int16)).mean(axis=2)
         delta_floor = max(5.0, float(np.percentile(local_delta[crop_local], 78)))
-        visual_support = edge_band | (local_delta >= delta_floor)
-        # Do not retain a coarse seed rectangle.  This is the critical
-        # difference between a source-instance extractor and the old
-        # lower-ear patch: parser pixels are observed; low-resolution seed
-        # pixels only propose where a real high-resolution boundary may be.
+        visual_support = edge_band & (local_delta >= delta_floor)
+        # Coarse pixels are proposals only.  They must contain measured source
+        # structure before they can seed connectivity, while parser label-9
+        # pixels remain observed source evidence.  This removes the path where
+        # an upsampled seed plus high-texture background starts a crop-sized
+        # GrabCut foreground and survives to RGB compositing.
+        structured_seed = crop_seed & visual_support
+        trusted_start = crop_observed | structured_seed
+        if int(trusted_start.sum()) < 1:
+            return empty, empty, empty
         candidate &= visual_support
-        candidate |= crop_observed
+        # Outside the ear, parser pixels remain observed object evidence.  In
+        # the ear core they only seed the native verifier above; copying an
+        # unmeasured label-9 island is how a source earlobe patch became a
+        # dark split in the target lobe.
+        candidate |= crop_observed & (~ear_interior | visual_support)
+        candidate &= (~crop_background | crop_observed)
         candidate &= (~crop_hair_interior | near_seed)
-        candidate = component_mask_connected_to_seed(candidate, crop_seed | crop_observed)
+        # Normal ear-core pixels stay forbidden.  The only expansion exception
+        # is the compact, parser-anchored earlobe-stud zone above; it still
+        # needs native edge support and later compactness checks.
+        candidate &= (~ear_interior | crop_observed | interior_stud_zone)
+        # Raw parser pixels are observed structure, but only after the caller
+        # has limited them to the source-side-associated coarse component.  An
+        # isolated parser mistake on an ear fold therefore cannot bypass the
+        # verified source-instance gate and become a direct RGB paste.
+        candidate = component_mask_connected_to_seed(candidate, trusted_start)
+
+        # A connected GrabCut foreground may supply the low-texture interior
+        # of a solid pendant.  It cannot be accepted merely because it is near
+        # an ear: require the component to be connected to independently
+        # observed/structured source pixels, bounded to a normal accessory
+        # area, and supported by a substantial image contour along its own
+        # boundary.  This keeps flat source background, ear folds and source
+        # hair from becoming a write mask while allowing an ornate disk to be
+        # restored as one real object instead of a detached edge.
+        complete_candidate = grabcut_foreground.copy()
+        complete_candidate &= (~crop_hair_interior | near_seed)
+        complete_candidate &= (~ear_interior | crop_observed | interior_stud_zone)
+        complete_candidate = component_mask_connected_to_seed(
+            complete_candidate,
+            trusted_start,
+        )
+        complete_area = int(complete_candidate.sum())
+        max_complete_area = min(
+            max(
+                int(round(512.0 * scale * scale)),
+                int(round(crop_seed.sum() * 10.0)),
+            ),
+            int(round(0.055 * height * width)),
+        )
+        boundary = cv2.morphologyEx(
+            complete_candidate.astype(np.uint8),
+            cv2.MORPH_GRADIENT,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+        ).astype(bool)
+        boundary = cv2.dilate(
+            boundary.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+        ).astype(bool)
+        boundary_area = max(1, int(boundary.sum()))
+        boundary_coverage = float((boundary & visual_support).sum()) / float(boundary_area)
+        interior_support = float((complete_candidate & visual_support).sum()) / float(max(1, complete_area))
+        expanded_ear_interior = complete_candidate & ear_interior & ~crop_observed
+        completion_valid = (
+            complete_area >= max(8, int(round(2.0 * scale * scale)))
+            and complete_area <= max_complete_area
+            and boundary_coverage >= 0.18
+            and interior_support >= 0.025
+            and (
+                not expanded_ear_interior.any()
+                or is_compact_interior_stud(complete_candidate)
+            )
+        )
+
+        def closed_solid_body_from_source() -> np.ndarray:
+            """Recover a source-supported solid ornament body from its contour.
+
+            GrabCut is intentionally seeded from the small parser instance.  That
+            is safe for studs and thin pendants, but can leave a large solid
+            medallion as a narrow rim when its centre is low-texture or has a
+            different colour.  This helper still requires that exact parser
+            instance to touch a measured closed contour; it fills only that
+            contour's source-supported interior, never the generic ear-side
+            search window.  A nested region that looks like the surrounding
+            source content is treated as a real hoop hole rather than a solid
+            ornament body.
+            """
+
+            contour_input = (edges & crop_local).astype(np.uint8)
+            contour_input = cv2.morphologyEx(
+                contour_input,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+            )
+            contours, hierarchy = cv2.findContours(
+                contour_input,
+                cv2.RETR_TREE,
+                cv2.CHAIN_APPROX_NONE,
+            )
+            if not contours:
+                return np.zeros_like(crop_local, dtype=bool)
+
+            best_body = np.zeros_like(crop_local, dtype=bool)
+            best_score = -1.0
+            seed_boundary = cv2.dilate(
+                trusted_start.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(9), odd(9))),
+            ).astype(bool)
+            local_colour = crop_image.astype(np.float32)
+            for contour_index, contour in enumerate(contours):
+                if len(contour) < 12:
+                    continue
+                contour_fill = np.zeros_like(crop_local, dtype=np.uint8)
+                cv2.drawContours(
+                    contour_fill,
+                    [contour],
+                    -1,
+                    1,
+                    thickness=-1,
+                    lineType=cv2.LINE_8,
+                )
+                contour_fill = contour_fill.astype(bool) & crop_local
+                contour_area = int(contour_fill.sum())
+                if (
+                    contour_area < max(8, int(round(2.0 * scale * scale)))
+                    or contour_area > max_complete_area
+                ):
+                    continue
+                contour_boundary = np.zeros_like(crop_local, dtype=np.uint8)
+                cv2.drawContours(
+                    contour_boundary,
+                    [contour],
+                    -1,
+                    1,
+                    thickness=1,
+                    lineType=cv2.LINE_8,
+                )
+                contour_boundary = cv2.dilate(
+                    contour_boundary,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+                ).astype(bool)
+                boundary_area = max(1, int(contour_boundary.sum()))
+                boundary_support = float(
+                    (contour_boundary & visual_support).sum()
+                ) / float(boundary_area)
+                boundary_seed_contact = int((contour_boundary & seed_boundary).sum())
+                if boundary_support < 0.22 or boundary_seed_contact < max(2, int(round(scale))):
+                    continue
+
+                # A closed inner contour is a likely hoop only when its image
+                # colour agrees with the immediately surrounding source area.
+                # Decorative inlays remain part of a solid earring because
+                # their colour is materially different from the source face or
+                # background outside the disc.
+                is_likely_hollow = False
+                if hierarchy is not None:
+                    outer_area = max(1, contour_area)
+                    for inner_index, inner_contour in enumerate(contours):
+                        if int(hierarchy[0, inner_index, 3]) != contour_index:
+                            continue
+                        inner_fill = np.zeros_like(crop_local, dtype=np.uint8)
+                        cv2.drawContours(
+                            inner_fill,
+                            [inner_contour],
+                            -1,
+                            1,
+                            thickness=-1,
+                            lineType=cv2.LINE_8,
+                        )
+                        inner_fill = inner_fill.astype(bool) & contour_fill
+                        inner_area = int(inner_fill.sum())
+                        if not (0.08 * outer_area <= inner_area <= 0.82 * outer_area):
+                            continue
+                        exterior_band = cv2.dilate(
+                            contour_fill.astype(np.uint8),
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(11), odd(11))),
+                        ).astype(bool) & ~contour_fill & crop_local
+                        if int(exterior_band.sum()) < max(12, int(round(3.0 * scale * scale))):
+                            continue
+                        inner_mean = local_colour[inner_fill].mean(axis=0)
+                        exterior_mean = local_colour[exterior_band].mean(axis=0)
+                        if float(np.linalg.norm(inner_mean - exterior_mean)) <= 46.0:
+                            is_likely_hollow = True
+                            break
+                if is_likely_hollow:
+                    continue
+
+                body = contour_fill.copy()
+                body &= (~crop_hair_interior | near_seed)
+                body &= (~ear_interior | crop_observed | interior_stud_zone)
+                body = component_mask_connected_to_seed(body, trusted_start)
+                body_area = int(body.sum())
+                if body_area < max(8, int(round(2.0 * scale * scale))):
+                    continue
+                exterior_ratio = float((body & ~ear_interior).sum()) / float(max(1, body_area))
+                if exterior_ratio < 0.60 and not is_compact_interior_stud(body):
+                    continue
+                score = float(body_area) * boundary_support
+                if score > best_score:
+                    best_score = score
+                    best_body = body
+            return best_body
+
+        def seeded_colour_body_from_source() -> np.ndarray:
+            """Follow a lobe-linked low-contrast pendant without copying its ROI.
+
+            A long solid pendant can have only one detectable rim at the lobe.
+            GrabCut then treats the rest of a low-contrast body as background,
+            and the historical edge-only fallback writes back precisely that
+            rim.  Starting from the already verified source seed, trace only a
+            connected colour region in a bounded vertical pendant corridor.
+
+            This is intentionally not a rectangle fill.  Every returned pixel
+            has to be colour-connected to the seed, stay outside source hair
+            and the ear core, remain below the same lobe corridor, and exhibit
+            either a measured image boundary or a material colour difference
+            from its exterior.  A flat source background therefore either
+            leaks beyond the strict area cap or fails the boundary test.
+            """
+
+            seed_points = np.argwhere(trusted_start)
+            anchor_points = np.argwhere(crop_anchor)
+            if seed_points.size == 0 or anchor_points.size == 0:
+                return np.zeros_like(crop_local, dtype=bool)
+
+            anchor_y, anchor_x = anchor_points.mean(axis=0)
+            y_grid, x_grid = np.ogrid[:crop_local.shape[0], :crop_local.shape[1]]
+            pendant_corridor = (
+                (y_grid >= anchor_y - 28.0 * scale)
+                & (y_grid <= anchor_y + 182.0 * scale)
+                & (x_grid >= anchor_x - 76.0 * scale)
+                & (x_grid <= anchor_x + 76.0 * scale)
+            )
+            allowed = (
+                crop_local
+                & pendant_corridor
+                & ~crop_hair_interior
+                # Permit the same compact parser-anchored in-ear stud zone as
+                # the GrabCut path, never a generic ear-core colour flood.
+                & (~ear_interior | crop_observed | interior_stud_zone)
+            )
+            if int(allowed.sum()) < max(16, int(round(4.0 * scale * scale))):
+                return np.zeros_like(crop_local, dtype=bool)
+
+            # Work in Lab space so warm metal, dark enamel and coloured gems
+            # can be compared by material colour instead of RGB channel noise.
+            lab = cv2.cvtColor(crop_image, cv2.COLOR_RGB2LAB).astype(np.float32)
+            seed_values = lab[trusted_start]
+            if seed_values.size == 0:
+                return np.zeros_like(crop_local, dtype=bool)
+            seed_centre = np.median(seed_values, axis=0)
+            seed_distance = np.linalg.norm(seed_values - seed_centre, axis=1)
+            # Parser pixels can contain a one-pixel antialiased edge.  Allow a
+            # modest robust spread, but never a permissive colour flood across
+            # a generic ear-side background.
+            colour_limit = float(
+                np.clip(
+                    np.percentile(seed_distance, 90) + 7.0,
+                    7.0,
+                    32.0,
+                )
+            )
+            colour_distance = np.linalg.norm(lab - seed_centre, axis=2)
+            colour_candidate = allowed & (colour_distance <= colour_limit)
+            colour_candidate |= trusted_start & allowed
+            body = component_mask_connected_to_seed(colour_candidate, trusted_start)
+            body_area = int(body.sum())
+            if (
+                body_area < max(8, int(round(2.0 * scale * scale)))
+                or body_area > max_complete_area
+            ):
+                return np.zeros_like(crop_local, dtype=bool)
+
+            exterior_ratio = float((body & ~ear_interior).sum()) / float(max(1, body_area))
+            if exterior_ratio < 0.60 and not is_compact_interior_stud(body):
+                return np.zeros_like(crop_local, dtype=bool)
+
+            boundary = cv2.morphologyEx(
+                body.astype(np.uint8),
+                cv2.MORPH_GRADIENT,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+            ).astype(bool)
+            boundary = cv2.dilate(
+                boundary.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(3), odd(3))),
+            ).astype(bool)
+            boundary_area = max(1, int(boundary.sum()))
+            edge_coverage = float((boundary & visual_support).sum()) / float(boundary_area)
+            outside_band = (
+                cv2.dilate(
+                    body.astype(np.uint8),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(7), odd(7))),
+                ).astype(bool)
+                & ~body
+                & crop_local
+                & ~crop_hair_interior
+                & (~ear_interior | interior_stud_zone)
+            )
+            if int(outside_band.sum()) < max(8, int(round(2.0 * scale * scale))):
+                return np.zeros_like(crop_local, dtype=bool)
+            interior_band = body & boundary
+            if int(interior_band.sum()) < 1:
+                interior_band = body
+            material_delta = float(
+                np.linalg.norm(
+                    lab[interior_band].mean(axis=0) - lab[outside_band].mean(axis=0)
+                )
+            )
+            # An image contour is the preferred proof.  For genuinely
+            # low-contrast opaque pendants, a measurable Lab material edge is
+            # sufficient, but a flat region with neither signal remains out.
+            if edge_coverage < 0.07 and material_delta < 7.0:
+                return np.zeros_like(crop_local, dtype=bool)
+
+            source_evidence = int((body & (visual_support | crop_observed)).sum())
+            if source_evidence < max(2, int(round(0.5 * scale * scale))):
+                return np.zeros_like(crop_local, dtype=bool)
+            return body
+
+        # A parser can trace only the rim of a large solid earring.  Give that
+        # measured contour one conservative chance to restore its body before
+        # accepting the historical edge-only candidate.  This remains a
+        # source-object alpha; neither the ear corridor nor its bounding box is
+        # ever copied to the output.
+        solid_body = closed_solid_body_from_source()
+        colour_body = seeded_colour_body_from_source()
+        solid_body_area = int(solid_body.sum())
+        colour_body_area = int(colour_body.sum())
+        if (
+            solid_body_area >= max(8, int(round(2.0 * scale * scale)))
+            and solid_body_area <= max_complete_area
+        ):
+            complete_candidate = solid_body
+            completion_valid = True
+        if (
+            colour_body_area >= max(8, int(round(2.0 * scale * scale)))
+            and colour_body_area <= max_complete_area
+        ):
+            # The contour-fill branch is strongest for a closed medallion;
+            # the colour-connected branch is stronger for a long low-contrast
+            # drop with only a short upper parser rim.  They may be combined
+            # only when they already describe one measured object.
+            overlap = int((solid_body & colour_body).sum())
+            if solid_body_area > 0 and overlap >= max(1, int(round(0.10 * min(solid_body_area, colour_body_area)))):
+                merged_body = solid_body | colour_body
+                if int(merged_body.sum()) <= max_complete_area:
+                    complete_candidate = merged_body
+                else:
+                    complete_candidate = colour_body
+            elif colour_body_area >= solid_body_area:
+                complete_candidate = colour_body
+            completion_valid = True
+        if completion_valid:
+            candidate = complete_candidate
 
         # GraphCut can occasionally absorb a flat background region when a
         # source parser label is tiny.  Fall back to genuine source edges plus
         # the confirmed seed rather than pasting that region over target hair.
         seed_area = max(1, int(crop_seed.sum()))
         max_area = max(int(round(96.0 * scale * scale)), int(round(seed_area * 6.0)))
+        if completion_valid:
+            # The complete-object gate above has already verified the contour
+            # and capped its area.  Do not run that accepted pendant through
+            # the historical edge-only small-object fallback.
+            max_area = max(max_area, max_complete_area)
         if int(candidate.sum()) > max_area:
             edge_band = cv2.dilate(
                 edges.astype(np.uint8),
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(5), odd(5))),
             ).astype(bool)
             candidate = component_mask_connected_to_seed(
-                (edge_band & crop_local) | crop_observed,
-                crop_seed | crop_observed,
+                (edge_band & crop_local & ~crop_background) | crop_observed,
+                trusted_start,
             )
 
         hole = enclosed_holes(candidate, crop_local)
+        # Only this narrow, source-observed lobe attachment may enter a target
+        # ear interior.  The main instance must stay outside so an ear fold,
+        # shadow, or GrabCut lobe cannot be pasted back as a black block.
+        attachment_band = cv2.dilate(
+            crop_anchor.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(9), odd(3))),
+        ).astype(bool)
+        # ``connector`` is also the final source-native authority for an
+        # accepted in-ear stud.  It remains exact object alpha: no ear ROI,
+        # parser dilation, or target-side rectangle is returned here.
+        compact_interior_stud = is_compact_interior_stud(candidate)
+        # The compact-stud verifier has already checked parser anchoring, native
+        # boundary evidence, lobe connectivity, area and bounding box.  Its
+        # authority must cover the verified *object*, not merely the overlap
+        # between that object and the source parser's ear core.  The latter is
+        # in a different frame from the target ear core and was slicing a real
+        # stud into a lobe-shaped fragment after alignment.
+        interior_stud_authority = (
+            candidate
+            if compact_interior_stud
+            else np.zeros_like(crop_local, dtype=bool)
+        )
+        connector = (
+            candidate
+            & (
+                (ear_interior & attachment_band)
+                | interior_stud_authority
+            )
+            & ~hole
+        )
         instance = np.zeros((height, width), dtype=bool)
         instance[y0:y1, x0:x1] = candidate & ~hole
         holes = np.zeros((height, width), dtype=bool)
         holes[y0:y1, x0:x1] = hole
-        return instance, holes
+        connectors = np.zeros((height, width), dtype=bool)
+        connectors[y0:y1, x0:x1] = connector
+        return instance, holes, connectors
 
     left_out = np.zeros((batch, 1, height, width), dtype=np.float32)
     right_out = np.zeros_like(left_out)
     left_hole_out = np.zeros_like(left_out)
     right_hole_out = np.zeros_like(left_out)
+    left_connector_out = np.zeros_like(left_out)
+    right_connector_out = np.zeros_like(left_out)
+
+    def split_by_lobe_side(
+        mask: np.ndarray,
+        left_anchor_mask: np.ndarray,
+        right_anchor_mask: np.ndarray,
+        *,
+        require_component_association: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Split only through real source-lobe corridors, never image halves."""
+
+        empty = np.zeros((height, width), dtype=bool)
+        left_points = np.argwhere(left_anchor_mask)
+        right_points = np.argwhere(right_anchor_mask)
+        if left_points.size == 0 and right_points.size == 0:
+            return empty, empty
+
+        y_grid, x_grid = np.ogrid[:height, :width]
+
+        def lobe_window(points: np.ndarray) -> np.ndarray:
+            if points.size == 0:
+                return np.zeros((height, width), dtype=bool)
+            anchor_y, anchor_x = points.mean(axis=0)
+            return (
+                (y_grid >= anchor_y - 72.0 * scale)
+                & (y_grid <= anchor_y + 176.0 * scale)
+                & (x_grid >= anchor_x - 120.0 * scale)
+                & (x_grid <= anchor_x + 120.0 * scale)
+            )
+
+        left_window = lobe_window(left_points)
+        right_window = lobe_window(right_points)
+        if left_points.size > 0 and right_points.size > 0:
+            left_y, left_x = left_points.mean(axis=0)
+            right_y, right_x = right_points.mean(axis=0)
+            left_region = ((y_grid - left_y) ** 2 + (x_grid - left_x) ** 2) <= (
+                (y_grid - right_y) ** 2 + (x_grid - right_x) ** 2
+            )
+            right_region = ~left_region
+        elif left_points.size > 0:
+            left_region = np.ones((height, width), dtype=bool)
+            right_region = empty
+        else:
+            left_region = empty
+            right_region = np.ones((height, width), dtype=bool)
+
+        if not require_component_association:
+            return (
+                mask & left_window & left_region,
+                mask & right_window & right_region,
+            )
+
+        def nearest_distance(component_points: np.ndarray, anchor_points: np.ndarray) -> float:
+            if component_points.size == 0 or anchor_points.size == 0:
+                return float("inf")
+            if component_points.shape[0] > 2048:
+                component_points = component_points[
+                    np.linspace(0, component_points.shape[0] - 1, 2048).astype(np.int64)
+                ]
+            if anchor_points.shape[0] > 512:
+                anchor_points = anchor_points[
+                    np.linspace(0, anchor_points.shape[0] - 1, 512).astype(np.int64)
+                ]
+            delta = component_points.astype(np.float32)[:, None, :] - anchor_points.astype(np.float32)[None, :, :]
+            return float(np.sqrt((delta * delta).sum(axis=2)).min())
+
+        component_count, labels = cv2.connectedComponents(mask.astype(np.uint8))
+        left_out = np.zeros_like(mask, dtype=bool)
+        right_out = np.zeros_like(mask, dtype=bool)
+        for component_id in range(1, component_count):
+            component = labels == component_id
+            component_points = np.argwhere(component)
+            area = max(1, int(component.sum()))
+
+            def side_score(points: np.ndarray, window: np.ndarray) -> tuple[float, bool]:
+                if points.size == 0:
+                    return 0.0, False
+                overlap = int((component & window).sum())
+                distance = nearest_distance(component_points, points)
+                associated = (
+                    overlap >= max(1, int(round(0.005 * area)))
+                    or distance <= 72.0 * scale
+                )
+                if not associated:
+                    return 0.0, False
+                return (
+                    float(overlap) / float(area)
+                    + max(0.0, 1.0 - distance / max(72.0 * scale, 1.0)),
+                    True,
+                )
+
+            left_score, left_associated = side_score(left_points, left_window)
+            right_score, right_associated = side_score(right_points, right_window)
+            if left_associated and not right_associated:
+                left_out |= component
+            elif right_associated and not left_associated:
+                right_out |= component
+            elif left_associated and right_associated:
+                if left_score > right_score:
+                    left_out |= component
+                elif right_score > left_score:
+                    right_out |= component
+                # An exact tie has no source-side proof and is intentionally
+                # discarded instead of being resolved by tensor x-coordinate.
+        return left_out, right_out
+
+    def retain_parser_components_touching_coarse(
+        raw_parser: np.ndarray,
+        accepted_coarse: np.ndarray,
+        left_anchor_mask: np.ndarray,
+        right_anchor_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Return source label-9 components tied to an accepted lobe seed.
+
+        ``accepted_coarse`` is the per-sample, ear-associated locator output.
+        Its role here is membership proof, not a final spatial crop.  In
+        particular, do not dilate it and then intersect that neighbourhood with
+        raw label 9: a nearby parser mistake would become observed RGB content
+        even though the coarse locator rejected that component.
+
+        A long pendant is often represented by two disconnected parser islands:
+        a tiny hook at the earlobe and a lower body.  Requiring every raw parser
+        component to overlap the upper island discards the body before the
+        native image refiner can inspect it.  The lower island is accepted only
+        when it lies on the same real-lobe, vertically bounded pendant rail as
+        an already accepted side.  This remains label-9 evidence rather than a
+        broad ROI copy, and components in the opposite ear or generic image
+        halves are never admitted.
+        """
+
+        if not raw_parser.any() or not accepted_coarse.any():
+            return np.zeros_like(raw_parser, dtype=bool)
+        component_count, labels = cv2.connectedComponents(raw_parser.astype(np.uint8))
+        retained = np.zeros_like(raw_parser, dtype=bool)
+        anchors = (left_anchor_mask, right_anchor_mask)
+        y_grid, x_grid = np.ogrid[:height, :width]
+
+        def side_pendant_window(anchor_mask: np.ndarray) -> tuple[np.ndarray, tuple[float, float] | None]:
+            points = np.argwhere(anchor_mask)
+            if points.size == 0:
+                return np.zeros_like(raw_parser, dtype=bool), None
+            anchor_y, anchor_x = points.mean(axis=0)
+            window = (
+                (y_grid >= anchor_y - 56.0 * scale)
+                & (y_grid <= anchor_y + 188.0 * scale)
+                & (x_grid >= anchor_x - 88.0 * scale)
+                & (x_grid <= anchor_x + 88.0 * scale)
+            )
+            return window, (float(anchor_y), float(anchor_x))
+
+        side_windows = tuple(side_pendant_window(anchor) for anchor in anchors)
+        for component_id in range(1, component_count):
+            component = labels == component_id
+            if np.any(component & accepted_coarse):
+                retained |= component
+                continue
+
+            # A separate parser island is not trusted merely because it is in
+            # the image half of an ear.  It must fit one (and only one)
+            # lobe-relative pendant rail and that side must already carry the
+            # accepted locator seed.  This lets a thin unlabeled bridge be
+            # crossed without allowing an unrelated background fragment to
+            # become source RGB authority.
+            accepted_sides: list[np.ndarray] = []
+            component_area = max(1, int(component.sum()))
+            for side_index, (window, anchor_center) in enumerate(side_windows):
+                if anchor_center is None:
+                    continue
+                if not np.any(accepted_coarse & window):
+                    continue
+                in_window = component & window
+                in_window_area = int(in_window.sum())
+                if in_window_area < max(1, int(round(0.70 * component_area))):
+                    continue
+                points = np.argwhere(in_window)
+                if points.size == 0:
+                    continue
+                anchor_y, anchor_x = anchor_center
+                centre_y, centre_x = points.mean(axis=0)
+                # A pendant hangs under the lobe and remains in its lateral
+                # corridor.  Permit a small upward hook, but reject an
+                # isolated eyebrow/temple label or a distant second object.
+                if (
+                    centre_y < anchor_y - 32.0 * scale
+                    or abs(centre_x - anchor_x) > 58.0 * scale
+                ):
+                    continue
+                accepted_sides.append(in_window)
+            if len(accepted_sides) == 1:
+                retained |= accepted_sides[0]
+        return retained
+
     for index in range(batch):
-        seed = coarse_np[index, 0] | parser_np[index, 0]
-        left_out[index, 0], left_hole_out[index, 0] = trace_side(
+        # The raw parser is only observed after direct component membership in
+        # the accepted source-side locator.  Dilation remains available inside
+        # connectivity/GrabCut as a temporary guide, never as direct RGB
+        # authority for a label-9 neighbourhood.
+        associated_parser = retain_parser_components_touching_coarse(
+            parser_np[index, 0],
+            coarse_np[index, 0],
+            left_anchor_np[index, 0],
+            right_anchor_np[index, 0],
+        )
+        left_seed, right_seed = split_by_lobe_side(
+            coarse_np[index, 0] | associated_parser,
+            left_anchor_np[index, 0], right_anchor_np[index, 0],
+            require_component_association=True,
+        )
+        left_observed, right_observed = split_by_lobe_side(
+            associated_parser,
+            left_anchor_np[index, 0], right_anchor_np[index, 0],
+            require_component_association=True,
+        )
+        left_search, right_search = split_by_lobe_side(
+            search_np[index, 0],
+            left_anchor_np[index, 0], right_anchor_np[index, 0],
+            require_component_association=False,
+        )
+        (
+            left_out[index, 0],
+            left_hole_out[index, 0],
+            left_connector_out[index, 0],
+        ) = trace_side(
             left_active_np[index, 0],
             left_anchor_np[index, 0],
-            seed,
-            parser_np[index, 0],
-            search_np[index, 0],
+            left_seed,
+            left_observed,
+            left_search,
+            background_np[index, 0],
             hair_np[index, 0],
             ear_np[index, 0],
             image_np[index],
         )
-        right_out[index, 0], right_hole_out[index, 0] = trace_side(
+        (
+            right_out[index, 0],
+            right_hole_out[index, 0],
+            right_connector_out[index, 0],
+        ) = trace_side(
             right_active_np[index, 0],
             right_anchor_np[index, 0],
-            seed,
-            parser_np[index, 0],
-            search_np[index, 0],
+            right_seed,
+            right_observed,
+            right_search,
+            background_np[index, 0],
             hair_np[index, 0],
             ear_np[index, 0],
             image_np[index],
@@ -1416,6 +3304,14 @@ def refine_earring_instances_highres(
     right_instance = torch.from_numpy(right_out).to(device=source_01.device, dtype=source_01.dtype)
     left_hole = torch.from_numpy(left_hole_out).to(device=source_01.device, dtype=source_01.dtype)
     right_hole = torch.from_numpy(right_hole_out).to(device=source_01.device, dtype=source_01.dtype)
+    left_connector = torch.from_numpy(left_connector_out).to(
+        device=source_01.device,
+        dtype=source_01.dtype,
+    )
+    right_connector = torch.from_numpy(right_connector_out).to(
+        device=source_01.device,
+        dtype=source_01.dtype,
+    )
     return {
         "instance_mask": torch.clamp(left_instance + right_instance, 0, 1),
         "hoop_hole_mask": torch.clamp(left_hole + right_hole, 0, 1),
@@ -1423,6 +3319,8 @@ def refine_earring_instances_highres(
         "right_instance_mask": right_instance,
         "left_hoop_hole_mask": left_hole,
         "right_hoop_hole_mask": right_hole,
+        "left_connector_mask": left_connector,
+        "right_connector_mask": right_connector,
     }
 
 
@@ -1710,24 +3608,537 @@ def build_elliptical_hoop_candidates(
     }
 
 
+def build_contour_hoop_instances_v5(
+    source_01: torch.Tensor,
+    search_mask: torch.Tensor,
+    left_lobe_anchor: torch.Tensor,
+    right_lobe_anchor: torch.Tensor,
+    *,
+    left_source_evidence: torch.Tensor | None = None,
+    right_source_evidence: torch.Tensor | None = None,
+    source_hair_mask: torch.Tensor | None = None,
+    source_ear_mask: torch.Tensor | None = None,
+    min_axis: float = 6.0,
+    max_axis: float = 168.0,
+    min_coverage: float = 0.42,
+) -> dict[str, torch.Tensor]:
+    """Build hoop alpha from paired source contours, never from a fitted ellipse.
+
+    The source image must provide two nested boundaries with coverage around
+    the ring.  The region between those boundaries is the only source RGB
+    write permission.  The enclosed region is exported separately, so the
+    final compositor cannot copy source hair or background through the hoop.
+    """
+
+    source_01 = normalized_to_01(source_01)
+    reference = ensure_mask_4d(search_mask).float()
+    size = tuple(reference.shape[-2:])
+    source_01 = F.interpolate(source_01, size=size, mode="bilinear", align_corners=False)
+    zeros = torch.zeros_like(reference)
+    empty = {
+        "left_elliptical_hoop": zeros,
+        "right_elliptical_hoop": zeros,
+        "left_elliptical_hoop_hole": zeros,
+        "right_elliptical_hoop_hole": zeros,
+        "left_elliptical_hoop_footprint": zeros,
+        "right_elliptical_hoop_footprint": zeros,
+        "left_elliptical_hoop_connector": zeros,
+        "right_elliptical_hoop_connector": zeros,
+    }
+    if cv2 is None:
+        return empty
+
+    search = _resize_like_mask(search_mask, reference)
+    left_evidence = _resize_like_mask(left_source_evidence, reference)
+    right_evidence = _resize_like_mask(right_source_evidence, reference)
+    # A broad search corridor is not source-earring evidence.  Callers that
+    # cannot provide a side-specific parser/strong seed therefore get no hoop
+    # completion rather than allowing an unrelated background contour through.
+    left_anchor = _resize_like_mask(left_lobe_anchor, reference)
+    right_anchor = _resize_like_mask(right_lobe_anchor, reference)
+    hair = _resize_like_mask(source_hair_mask, reference)
+    ear = _resize_like_mask(source_ear_mask, reference)
+    source_np = np.clip(
+        source_01.detach().cpu().permute(0, 2, 3, 1).numpy() * 255.0,
+        0,
+        255,
+    ).astype(np.uint8)
+    search_np = search.detach().cpu().numpy() > 0.5
+    left_evidence_np = left_evidence.detach().cpu().numpy() > 0.5
+    right_evidence_np = right_evidence.detach().cpu().numpy() > 0.5
+    hair_np = hair.detach().cpu().numpy() > 0.5
+    ear_np = ear.detach().cpu().numpy() > 0.5
+    left_anchor_np = left_anchor.detach().cpu().numpy() > 0.5
+    right_anchor_np = right_anchor.detach().cpu().numpy() > 0.5
+
+    batch, _, height, width = reference.shape
+    coordinate_scale = max(float(height), float(width)) / 256.0
+
+    def kernel(base: float, minimum: int = 3) -> int:
+        value = max(int(minimum), int(round(base * coordinate_scale)))
+        return value if value % 2 == 1 else value + 1
+
+    def filled(contour: np.ndarray) -> np.ndarray:
+        result = np.zeros((height, width), dtype=np.uint8)
+        cv2.drawContours(result, [contour], -1, 1, thickness=-1, lineType=cv2.LINE_8)
+        return result.astype(bool)
+
+    def outline(contour: np.ndarray) -> np.ndarray:
+        result = np.zeros((height, width), dtype=np.uint8)
+        cv2.drawContours(result, [contour], -1, 1, thickness=1, lineType=cv2.LINE_8)
+        return result.astype(bool)
+
+    def ellipse_shape(contour: np.ndarray) -> tuple[float, float, float, float, float] | None:
+        if len(contour) < 5:
+            return None
+        (center_x, center_y), (axis_x, axis_y), angle = cv2.fitEllipse(contour)
+        major = max(float(axis_x), float(axis_y))
+        minor = min(float(axis_x), float(axis_y))
+        if major <= 1e-6 or minor <= 1e-6:
+            return None
+        return float(center_x), float(center_y), major, minor, float(angle)
+
+    def supported_sectors(
+        boundary: np.ndarray,
+        support: np.ndarray,
+        center_x: float,
+        center_y: float,
+    ) -> tuple[float, int]:
+        points = np.argwhere(boundary)
+        if points.size == 0:
+            return 0.0, 0
+        observed = support[points[:, 0], points[:, 1]]
+        coverage = float(observed.mean())
+        if not observed.any():
+            return coverage, 0
+        observed_points = points[observed]
+        angles = np.arctan2(observed_points[:, 0] - center_y, observed_points[:, 1] - center_x)
+        sectors = np.unique(
+            np.floor((angles + np.pi) * (8.0 / (2.0 * np.pi))).astype(np.int32) % 8
+        )
+        return coverage, int(sectors.size)
+
+    def connector_from_source(
+        raw_support: np.ndarray,
+        valid: np.ndarray,
+        anchor_mask: np.ndarray,
+        outer_boundary: np.ndarray,
+    ) -> np.ndarray:
+        anchor_points = np.argwhere(anchor_mask)
+        boundary_points = np.argwhere(outer_boundary)
+        if anchor_points.size == 0 or boundary_points.size == 0:
+            return np.zeros_like(valid, dtype=bool)
+        anchor_y, anchor_x = anchor_points.mean(axis=0)
+        distances = (
+            (boundary_points[:, 0].astype(np.float32) - anchor_y) ** 2
+            + (boundary_points[:, 1].astype(np.float32) - anchor_x) ** 2
+        )
+        nearest_y, nearest_x = boundary_points[int(np.argmin(distances))]
+        if float(np.sqrt(float(distances.min()))) > 78.0 * coordinate_scale:
+            return np.zeros_like(valid, dtype=bool)
+
+        corridor = np.zeros((height, width), dtype=np.uint8)
+        cv2.line(
+            corridor,
+            (int(round(anchor_x)), int(round(anchor_y))),
+            (int(nearest_x), int(nearest_y)),
+            1,
+            thickness=kernel(5, 3),
+            lineType=cv2.LINE_8,
+        )
+        candidate = raw_support & (corridor > 0) & valid
+        if int(candidate.sum()) < max(3, int(round(2.0 * coordinate_scale))):
+            return np.zeros_like(valid, dtype=bool)
+        proxy = cv2.morphologyEx(
+            candidate.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+        )
+        component_count, labels = cv2.connectedComponents(proxy)
+        start = cv2.dilate(
+            anchor_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(9), kernel(3))),
+        ).astype(bool)
+        end = cv2.dilate(
+            outer_boundary.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(3))),
+        ).astype(bool)
+        connected = np.zeros_like(candidate, dtype=bool)
+        for label in range(1, component_count):
+            component = labels == label
+            if np.any(component & start) and np.any(component & end):
+                connected |= component
+        # The component is a connectivity proxy.  Return only observed source
+        # structure so a straight corridor can never draw a synthetic wire.
+        return candidate & connected
+
+    def trace_side(
+        image: np.ndarray,
+        base_search: np.ndarray,
+        side_evidence: np.ndarray,
+        hair_mask: np.ndarray,
+        ear_mask: np.ndarray,
+        anchor_mask: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        zero = np.zeros((height, width), dtype=np.float32)
+        anchor_points = np.argwhere(anchor_mask)
+        if anchor_points.size == 0:
+            return zero, zero, zero, zero
+        anchor_y, anchor_x = anchor_points.mean(axis=0)
+        y_grid, x_grid = np.ogrid[:height, :width]
+        local_window = (
+            # A hoop can rise well above the lobe before its lower arc reaches
+            # the dangling region.  The old -28px upper bound physically cut a
+            # legitimate ring into a short lower arc before contour validation.
+            (y_grid >= anchor_y - 96.0 * coordinate_scale)
+            & (y_grid <= anchor_y + 180.0 * coordinate_scale)
+            & (x_grid >= anchor_x - 120.0 * coordinate_scale)
+            & (x_grid <= anchor_x + 120.0 * coordinate_scale)
+        )
+        hair_core = cv2.erode(
+            hair_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(3))),
+        ).astype(bool)
+        ear_core = cv2.erode(
+            ear_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(3))),
+        ).astype(bool)
+        # The saved search mask can be narrow for a parser-missed large hoop.
+        # It is a useful preference but not a geometric clip.  The contour
+        # verifier below is the authority that makes this wider lobe corridor
+        # safe on a source image with no earring.
+        # Source evidence authorizes the geometry pass for this side.  It is a
+        # narrow parser/strong-instance seed, not the broad ear corridor.  A
+        # hoop can cross pixels a parser called hair or ear, so evidence-near
+        # pixels are retained for contour detection; unrelated hair/ear edges
+        # remain excluded.
+        evidence_near = cv2.dilate(
+            side_evidence.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(17), kernel(3))),
+        ).astype(bool)
+        # Keep this tighter band separate from ``evidence_near``.  The wide
+        # band only preserves valid contour pixels around a sparse parser arc;
+        # it must not by itself prove that a full annulus belongs to that arc.
+        evidence_boundary_band = cv2.dilate(
+            side_evidence.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(5), kernel(3))),
+        ).astype(bool)
+        search_near = cv2.dilate(
+            base_search.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(3))),
+        ).astype(bool)
+        minimum_evidence_area = max(3, int(round(1.5 * coordinate_scale * coordinate_scale)))
+        if int((side_evidence & local_window).sum()) < minimum_evidence_area:
+            return zero, zero, zero, zero
+        anchor_evidence_guard = cv2.dilate(
+            anchor_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(29), kernel(3))),
+        ).astype(bool)
+        evidence_component_count, evidence_labels = cv2.connectedComponents(
+            side_evidence.astype(np.uint8)
+        )
+        lobe_associated_evidence = np.zeros_like(side_evidence, dtype=bool)
+        for evidence_component_id in range(1, evidence_component_count):
+            evidence_component = evidence_labels == evidence_component_id
+            if np.any(evidence_component & anchor_evidence_guard):
+                lobe_associated_evidence |= evidence_component
+        lobe_evidence_boundary_band = cv2.dilate(
+            lobe_associated_evidence.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(5), kernel(3))),
+        ).astype(bool)
+        valid = local_window & ((~hair_core & ~ear_core) | evidence_near | search_near)
+        if int(valid.sum()) < max(80, int(round(24.0 * coordinate_scale * coordinate_scale))):
+            return zero, zero, zero, zero
+
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        gradient_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        gradient = np.hypot(gradient_x, gradient_y)
+        values = gradient[valid]
+        if values.size < 24:
+            return zero, zero, zero, zero
+        low = max(10, int(np.percentile(values, 48) * 0.55))
+        high = max(low + 16, int(np.percentile(values, 84)))
+        raw_edges = cv2.Canny(gray, low, min(255, high)) > 0
+        raw_edges &= valid
+        if int(raw_edges.sum()) < 20:
+            return zero, zero, zero, zero
+        raw_support = cv2.dilate(
+            raw_edges.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+        ).astype(bool)
+        contour_edges = cv2.morphologyEx(
+            raw_edges.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(3), kernel(3))),
+        )
+        contours, hierarchy = cv2.findContours(contour_edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        if len(contours) < 2 or hierarchy is None:
+            return zero, zero, zero, zero
+
+        contour_entries: list[
+            tuple[int, int, np.ndarray, np.ndarray, np.ndarray, tuple[float, float, float, float, float], float]
+        ] = []
+        for contour_index, contour in enumerate(contours):
+            if len(contour) < 12:
+                continue
+            shape = ellipse_shape(contour)
+            if shape is None:
+                continue
+            center_x, center_y, major, minor, _ = shape
+            if not (float(min_axis) <= minor <= major <= float(max_axis)):
+                continue
+            if minor / max(major, 1e-6) < 0.35:
+                continue
+            contour_fill = filled(contour)
+            area = float(contour_fill.sum())
+            if area < max(20.0, float(min_axis * min_axis) * 0.35):
+                continue
+            parent_index = int(hierarchy[0, contour_index, 3])
+            contour_entries.append(
+                (contour_index, parent_index, contour, contour_fill, outline(contour), shape, area)
+            )
+        if len(contour_entries) < 2:
+            return zero, zero, zero, zero
+
+        best_score = -1.0
+        best_alpha = None
+        best_hole = None
+        best_footprint = None
+        best_connector = None
+        for outer_entry in contour_entries:
+            (
+                outer_contour_index,
+                _,
+                _,
+                outer_fill,
+                outer_boundary,
+                outer_shape,
+                outer_area,
+            ) = outer_entry
+            outer_x, outer_y, outer_major, outer_minor, _ = outer_shape
+            for inner_entry in contour_entries:
+                (
+                    inner_contour_index,
+                    inner_parent_index,
+                    _,
+                    inner_fill,
+                    inner_boundary,
+                    inner_shape,
+                    inner_area,
+                ) = inner_entry
+                if inner_contour_index == outer_contour_index or inner_area >= outer_area * 0.82:
+                    continue
+                # An inner hole must be a direct child of its outer boundary.
+                # Arbitrary nested background/grass contours are not a hoop.
+                if inner_parent_index != outer_contour_index:
+                    continue
+                if not np.all(inner_fill <= outer_fill):
+                    continue
+                inner_x, inner_y, inner_major, inner_minor, _ = inner_shape
+                center_distance = float(np.hypot(outer_x - inner_x, outer_y - inner_y))
+                if center_distance > 0.18 * outer_major:
+                    continue
+                if abs(outer_major / max(inner_major, 1e-6) - outer_minor / max(inner_minor, 1e-6)) > 0.45:
+                    continue
+                annulus = outer_fill & ~inner_fill
+                annulus_area = float(annulus.sum())
+                if not (0.05 * outer_area <= annulus_area <= 0.78 * outer_area):
+                    continue
+                # A full nested contour is not enough on its own: the annulus
+                # needs a meaningful, same-side source-evidence contact on its
+                # measured boundary.  The old two-pixel test let a nearby grass
+                # edge or an unrelated stud authorize a complete background
+                # ring.  Keep the broad evidence band for candidate discovery,
+                # but prove ownership with this much tighter boundary band.
+                boundary = outer_boundary | inner_boundary
+                boundary_evidence = boundary & evidence_boundary_band
+                lobe_boundary_evidence = boundary & lobe_evidence_boundary_band
+                boundary_area = max(1, int(boundary.sum()))
+                boundary_contact = int(boundary_evidence.sum())
+                minimum_boundary_contact = max(
+                    int(round(6.0 * coordinate_scale)),
+                    int(np.ceil(0.045 * boundary_area)),
+                )
+                if boundary_contact < minimum_boundary_contact:
+                    continue
+                evidence_points = np.argwhere(boundary_evidence)
+                evidence_angles = np.arctan2(
+                    evidence_points[:, 0] - outer_y,
+                    evidence_points[:, 1] - outer_x,
+                )
+                evidence_sectors = np.unique(
+                    np.floor((evidence_angles + np.pi) * (8.0 / (2.0 * np.pi))).astype(np.int32) % 8
+                )
+                if evidence_sectors.size < 2:
+                    continue
+                annulus_evidence = int((annulus & evidence_boundary_band).sum())
+                if annulus_evidence < max(
+                    int(round(2.0 * coordinate_scale * coordinate_scale)),
+                    int(np.ceil(0.015 * annulus_area)),
+                    4,
+                ):
+                    continue
+                outer_coverage, outer_sectors = supported_sectors(
+                    outer_boundary, raw_support, outer_x, outer_y
+                )
+                inner_coverage, inner_sectors = supported_sectors(
+                    inner_boundary, raw_support, inner_x, inner_y
+                )
+                combined_coverage = 0.5 * (outer_coverage + inner_coverage)
+                # Callers choose a lower coverage for reflective/small hoops.
+                # Do not silently override it to 0.42 after they supplied
+                # 0.36; the nested-contour, source-evidence and lobe-link
+                # checks above remain the false-positive protection.
+                required_coverage = max(0.34, float(min_coverage))
+                required_sectors = 3 if min(outer_major, outer_minor) <= 28.0 * coordinate_scale else 4
+                if (
+                    outer_coverage < required_coverage
+                    or inner_coverage < required_coverage
+                    or outer_sectors < required_sectors
+                    or inner_sectors < required_sectors
+                ):
+                    continue
+                # Ear folds form nested contours too.  A real hoop is mostly
+                # outside the ear surface, whereas a helix-shaped false match
+                # remains inside it.
+                ear_guard = cv2.dilate(
+                    ear_mask.astype(np.uint8),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(7), kernel(3))),
+                ).astype(bool)
+                exterior_ratio = float((annulus & ~ear_guard).sum()) / max(annulus_area, 1.0)
+                if exterior_ratio < 0.45:
+                    continue
+                lobe_touch = bool(
+                    (cv2.dilate(
+                        outer_boundary.astype(np.uint8),
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel(25), kernel(3))),
+                    ) > 0)[anchor_mask].any()
+                )
+                connector = connector_from_source(raw_support, valid, anchor_mask, outer_boundary)
+                connector_requirement = max(5, int(round(3.0 * coordinate_scale)))
+                # The accepted evidence must itself belong to this lobe, or a
+                # measured source connector must link the lobe to the accepted
+                # annulus.  Do not crop the annulus by hair/ear labels here:
+                # once that proof succeeds, its complete source contour is the
+                # correct RGB object, including arcs crossing rough parser masks.
+                if (
+                    (not lobe_touch and int(connector.sum()) < connector_requirement)
+                    or (
+                        int(lobe_boundary_evidence.sum()) < minimum_boundary_contact
+                        and int(connector.sum()) < connector_requirement
+                    )
+                ):
+                    continue
+
+                # Trim only a one-pixel uncertain contour boundary.  This
+                # avoids copying the dark background halo while preserving the
+                # source ring's measured thickness and non-elliptic shape.
+                trim_kernel = np.ones((3, 3), dtype=np.uint8)
+                trimmed_outer = cv2.erode(outer_fill.astype(np.uint8), trim_kernel).astype(bool)
+                trimmed_inner = cv2.dilate(inner_fill.astype(np.uint8), trim_kernel).astype(bool)
+                # Once the source contains a valid nested contour pair, keep
+                # the measured annulus rather than clipping it by rough hair/
+                # ear parsing.  Clipping at this stage is what turned a real
+                # hoop into one short arc.  The hierarchy, per-side seed and
+                # edge coverage above are the safety checks.
+                alpha = trimmed_outer & ~trimmed_inner
+                if int(alpha.sum()) < max(8, int(round(3.0 * coordinate_scale))):
+                    alpha = annulus
+                alpha |= connector
+                hole = inner_fill & outer_fill
+                score = combined_coverage * float(outer_sectors + inner_sectors) * annulus_area
+                # Prefer candidates close to the saved ear-local search, but
+                # never require it: a complete hanging hoop can extend below
+                # a 256px proposal while still being source-verified here.
+                search_overlap = float((annulus & base_search).sum()) / max(annulus_area, 1.0)
+                score *= 0.75 + 0.25 * search_overlap
+                if score > best_score:
+                    best_score = score
+                    best_alpha = alpha
+                    best_hole = hole
+                    best_footprint = outer_fill
+                    best_connector = connector
+        if best_alpha is None:
+            return zero, zero, zero, zero
+        return (
+            best_alpha.astype(np.float32),
+            best_hole.astype(np.float32),
+            best_footprint.astype(np.float32),
+            best_connector.astype(np.float32),
+        )
+
+    left_out = np.zeros((batch, 1, height, width), dtype=np.float32)
+    right_out = np.zeros_like(left_out)
+    left_hole_out = np.zeros_like(left_out)
+    right_hole_out = np.zeros_like(left_out)
+    left_connector_out = np.zeros_like(left_out)
+    right_connector_out = np.zeros_like(left_out)
+    left_footprint_out = np.zeros_like(left_out)
+    right_footprint_out = np.zeros_like(left_out)
+    for index in range(batch):
+        (
+            left_out[index, 0],
+            left_hole_out[index, 0],
+            left_footprint_out[index, 0],
+            left_connector_out[index, 0],
+        ) = trace_side(
+            source_np[index],
+            search_np[index, 0],
+            left_evidence_np[index, 0],
+            hair_np[index, 0],
+            ear_np[index, 0],
+            left_anchor_np[index, 0],
+        )
+        (
+            right_out[index, 0],
+            right_hole_out[index, 0],
+            right_footprint_out[index, 0],
+            right_connector_out[index, 0],
+        ) = trace_side(
+            source_np[index],
+            search_np[index, 0],
+            right_evidence_np[index, 0],
+            hair_np[index, 0],
+            ear_np[index, 0],
+            right_anchor_np[index, 0],
+        )
+
+    return {
+        "left_elliptical_hoop": torch.from_numpy(left_out).to(reference.device, reference.dtype),
+        "right_elliptical_hoop": torch.from_numpy(right_out).to(reference.device, reference.dtype),
+        "left_elliptical_hoop_hole": torch.from_numpy(left_hole_out).to(reference.device, reference.dtype),
+        "right_elliptical_hoop_hole": torch.from_numpy(right_hole_out).to(reference.device, reference.dtype),
+        "left_elliptical_hoop_footprint": torch.from_numpy(left_footprint_out).to(reference.device, reference.dtype),
+        "right_elliptical_hoop_footprint": torch.from_numpy(right_footprint_out).to(reference.device, reference.dtype),
+        "left_elliptical_hoop_connector": torch.from_numpy(left_connector_out).to(reference.device, reference.dtype),
+        "right_elliptical_hoop_connector": torch.from_numpy(right_connector_out).to(reference.device, reference.dtype),
+    }
+
+
 def refine_earring_hoops_highres(
     source_01: torch.Tensor,
     search_mask: torch.Tensor,
     left_lobe_anchor: torch.Tensor,
     right_lobe_anchor: torch.Tensor,
     *,
+    left_source_evidence: torch.Tensor | None = None,
+    right_source_evidence: torch.Tensor | None = None,
     source_hair_mask: torch.Tensor | None = None,
     source_ear_mask: torch.Tensor | None = None,
     detection_size: int = 512,
     min_axis: float = 6.0,
     min_coverage: float = 0.28,
 ) -> dict[str, torch.Tensor]:
-    """Trace a validated hoop at 512px for the final RGB composite.
+    """Extract a complete hoop as a source-native annular instance.
 
-    Learned PP masks live at 256px.  Directly enlarging one of those masks
-    makes a circular wire visibly thick and flattened.  This function retains
-    the same ear-local search policy but reruns the edge-supported geometry on
-    the high-resolution source reference at a bounded work size.
+    The old path fitted one ellipse and returned only the Canny pixels that
+    happened to lie on that perimeter.  A reflective hoop therefore became a
+    short arc, while its hole came from a different synthetic ellipse.  The
+    implementation below accepts a hoop only when the source contains a pair
+    of nested, edge-supported contours.  Its RGB alpha is the real annulus
+    between those contours; the inner contour is returned as a separate hole
+    that must remain target-owned.
     """
 
     source_01 = normalized_to_01(source_01)
@@ -1752,11 +4163,17 @@ def refine_earring_hoops_highres(
         value = ensure_mask_4d(value).to(device=source_01.device, dtype=source_01.dtype)
         return F.interpolate(value, size=detect_size, mode="nearest")
 
-    candidates = build_elliptical_hoop_candidates(
+    candidates = build_contour_hoop_instances_v5(
         F.interpolate(source_01, size=detect_size, mode="bilinear", align_corners=False),
         resize_for_detection(search_mask),
         resize_for_detection(left_lobe_anchor),
         resize_for_detection(right_lobe_anchor),
+        left_source_evidence=(
+            None if left_source_evidence is None else resize_for_detection(left_source_evidence)
+        ),
+        right_source_evidence=(
+            None if right_source_evidence is None else resize_for_detection(right_source_evidence)
+        ),
         source_hair_mask=resize_for_detection(source_hair_mask),
         source_ear_mask=resize_for_detection(source_ear_mask),
         min_axis=max(4.0 * detector_scale, float(min_axis) * detector_scale),
@@ -1827,8 +4244,18 @@ def build_strong_earring_candidate(
     # lobe-to-hoop connector while rejecting the ear's own interior texture as
     # a fake accessory.
     # It remains subject to side, lobe and density checks below.
+    candidate_seed = candidate.clone()
     ear_exterior = (1.0 - erode_mask(source_ear, 7)).clamp(0, 1)
-    visual_wire = edge_support * contrast_support * ear_exterior * ear_roi
+    # Visual structure may complete an existing weak/parser proposal, but it
+    # may not start an accessory anywhere in the ear corridor.  The latter was
+    # the route by which grass, hair edges and ear folds became fake earrings.
+    visual_wire = (
+        edge_support
+        * contrast_support
+        * ear_exterior
+        * ear_roi
+        * dilate_mask(candidate_seed + parser_earring, 7)
+    )
     candidate = torch.maximum(candidate, visual_wire)
     object_evidence = candidate * torch.clamp(edge_support + chroma_support + contrast_support, 0, 1)
     # A parser-missed metal wire is often labelled background.  Do not erase it
@@ -1875,16 +4302,22 @@ def build_strong_earring_candidate(
         density = area / roi.flatten(1).sum(dim=1, keepdim=True).clamp_min(1.0)
         background_ratio = (side * background).flatten(1).sum(dim=1, keepdim=True) / area.clamp_min(1.0)
         hair_ratio = (side * hair).flatten(1).sum(dim=1, keepdim=True) / area.clamp_min(1.0)
-        near_lobe = (side * dilate_mask(anchor, 25)).flatten(1).sum(dim=1, keepdim=True) >= 1.0
+        structure_ratio = (
+            side * edge_support * contrast_support
+        ).flatten(1).sum(dim=1, keepdim=True) / area.clamp_min(1.0)
+        near_lobe = (side * dilate_mask(anchor, 17)).flatten(1).sum(dim=1, keepdim=True) >= 1.0
+        # This low-resolution candidate is only a coarse presence hint.  It
+        # cannot distinguish a metal edge from grass, foliage or a hard
+        # background edge near the lobe, so background-heavy components must
+        # not activate the generic earring branch here.  Parser-missed objects
+        # that really are labelled background are handled separately by the
+        # source-native verifier below, where their compact instance (or paired
+        # hoop contours) is measured before any RGB write is allowed.
+        background_ok = background_ratio <= 0.68
         plausible = (
             (area >= float(min_area) * area_scale)
             & (density <= float(max_roi_density))
-            # A fully parser-missed wire is commonly labelled background at
-            # every wire pixel.  Do not reject that exact case here: the small
-            # area/density, structured visual evidence, hair rejection and
-            # lobe-attachment checks above are what distinguish it from a broad
-            # lower-ear background patch.
-            & (background_ratio <= 1.0)
+            & background_ok
             & (hair_ratio <= 0.40)
             & near_lobe
         ).to(side.dtype).view(-1, 1, 1, 1)
@@ -2163,11 +4596,12 @@ def build_earring_write_masks(
 ) -> dict[str, torch.Tensor]:
     """Build independent core/completion/write masks for earring recovery.
 
-    Tier A is a verified parser, explicit object, or strong visual core.  It
-    may cross the transferred hair when connected to a visible lobe.  Tier B is
-    only a completion shell, always source-blocked and capped inside target
-    hair.  This separation prevents a broad recall ROI from becoming a source
-    patch while keeping genuine long earrings recoverable.
+    Tier A is a verified parser, explicit object, or strong visual core.  Tier B
+    is a source-blocked, lobe-connected continuation.  Both are allowed to sit
+    in front of transferred target hair once that lobe is visible: target hair
+    is a compositing layer behind a verified accessory, not evidence that the
+    accessory does not exist.  Source-background/hair/semantic blockers and
+    the later topology hole mask remain the safeguards against empty patches.
     """
 
     trusted = ensure_mask_4d(trusted_object_mask).float()
@@ -2181,9 +4615,15 @@ def build_earring_write_masks(
     semantic_block = _resize_like_mask(source_semantic_block_mask, trusted)
     active = (1.0 - _batch_gate(no_earring, trusted)).clamp(0, 1)
 
+    # ``trusted`` is already an object-supported, side-gated mask.  Do not
+    # intersect it with the compact target-ear ROI here: that ROI is a search
+    # and completion corridor, while a confirmed pendant/hoop may extend well
+    # beyond the ear shell.  Using ``visible`` for this tier silently reduced
+    # complete source instances to lobe-sized fragments before the native
+    # compositor could recover them.
     core = extract_earring_object_core(
         trusted * active,
-        visible * active,
+        trusted * active,
         anchor * active,
         connectivity_iters=connectivity_iters,
         connectivity_kernel=connectivity_kernel,
@@ -2209,18 +4649,16 @@ def build_earring_write_masks(
         bridge_dilate=bridge_dilate,
     )
 
-    completion_non_hair = completion * (1.0 - target_hair).clamp(0, 1)
-    completion_hair = completion * target_hair
-    max_overlap = max(0.0, min(0.95, float(max_target_hair_overlap)))
-    non_hair_area = completion_non_hair.flatten(1).sum(dim=1, keepdim=True)
-    hair_area = completion_hair.flatten(1).sum(dim=1, keepdim=True)
-    allowed_hair = max_overlap / max(1.0 - max_overlap, 1e-6) * non_hair_area
-    hair_scale = torch.where(
-        hair_area > 1e-6,
-        torch.minimum(torch.ones_like(hair_area), allowed_hair / hair_area.clamp_min(1e-6)),
-        torch.zeros_like(hair_area),
-    ).view(-1, 1, 1, 1)
-    completion = (completion_non_hair + completion_hair * hair_scale).clamp(0, 1)
+    # Do not cap a source-safe continuation by its overlap with *target* hair.
+    # The old ratio policy made ``allowed_hair`` zero whenever a long pendant
+    # fell wholly below an exposed lobe onto transferred hair, so the lower
+    # body disappeared while exactly the same source object was kept over a
+    # bare neck.  At this point ``completion`` has already passed source
+    # background/hair/semantic blocking and lobe connectivity; it is therefore
+    # object alpha, not an ear-side crop.  The final compositor writes this
+    # alpha after target hair, while ``hoop_hole`` below keeps hollow centres
+    # target-owned.  Keep the argument for the legacy wrapper/API contract.
+    completion = completion.clamp(0, 1)
 
     object_mask = torch.clamp(core + completion, 0, 1)
     hoop_hole = compute_earring_hole_mask(object_mask) * active
@@ -2496,9 +4934,15 @@ def align_earring_reference_to_target(
     left_roi: torch.Tensor,
     right_roi: torch.Tensor,
     *,
-    max_vertical_shift: int = 12,
-    max_horizontal_shift: int = 6,
+    target_left_roi: torch.Tensor | None = None,
+    target_right_roi: torch.Tensor | None = None,
+    max_vertical_shift: int = 0,
+    max_horizontal_shift: int = 0,
     reference_base: torch.Tensor | None = None,
+    source_left_instance_mask: torch.Tensor | None = None,
+    source_right_instance_mask: torch.Tensor | None = None,
+    source_left_hole_mask: torch.Tensor | None = None,
+    source_right_hole_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     source_01 = normalized_to_01(source_01)
     source_earring_mask = ensure_mask_4d(source_earring_mask).float()
@@ -2508,13 +4952,59 @@ def align_earring_reference_to_target(
     source_right_ear_mask = ensure_mask_4d(source_right_ear_mask).float()
     target_left_ear_mask = ensure_mask_4d(target_left_ear_mask).float()
     target_right_ear_mask = ensure_mask_4d(target_right_ear_mask).float()
+    target_left_roi = (
+        torch.ones_like(target_left_ear_mask)
+        if target_left_roi is None
+        else ensure_mask_4d(target_left_roi).float().to(target_left_ear_mask.device)
+    )
+    target_right_roi = (
+        torch.ones_like(target_right_ear_mask)
+        if target_right_roi is None
+        else ensure_mask_4d(target_right_roi).float().to(target_right_ear_mask.device)
+    )
+    if target_left_roi.shape[-2:] != target_left_ear_mask.shape[-2:]:
+        target_left_roi = F.interpolate(
+            target_left_roi,
+            size=target_left_ear_mask.shape[-2:],
+            mode="nearest",
+        )
+    if target_right_roi.shape[-2:] != target_right_ear_mask.shape[-2:]:
+        target_right_roi = F.interpolate(
+            target_right_roi,
+            size=target_right_ear_mask.shape[-2:],
+            mode="nearest",
+        )
 
-    left_ring = source_earring_mask * left_roi
-    right_ring = source_earring_mask * right_roi
+    def instance_or_roi(value: torch.Tensor | None, roi: torch.Tensor) -> torch.Tensor:
+        if value is None:
+            return source_earring_mask * roi
+        value = ensure_mask_4d(value).float().to(source_earring_mask.device)
+        if value.shape[-2:] != source_earring_mask.shape[-2:]:
+            value = F.interpolate(value, size=source_earring_mask.shape[-2:], mode="nearest")
+        return value.clamp(0, 1)
+
+    def hole_or_zero(value: torch.Tensor | None) -> torch.Tensor:
+        if value is None:
+            return torch.zeros_like(source_earring_mask)
+        value = ensure_mask_4d(value).float().to(source_earring_mask.device)
+        if value.shape[-2:] != source_earring_mask.shape[-2:]:
+            value = F.interpolate(value, size=source_earring_mask.shape[-2:], mode="nearest")
+        return value.clamp(0, 1)
+
+    # A large hoop regularly extends beyond the compact ear ROI.  Use the
+    # explicit side instance when available; the ROI remains only a fallback
+    # for legacy ordinary-earring callers.
+    left_ring = instance_or_roi(source_left_instance_mask, left_roi)
+    right_ring = instance_or_roi(source_right_instance_mask, right_roi)
+    left_hole = hole_or_zero(source_left_hole_mask)
+    right_hole = hole_or_zero(source_right_hole_mask)
     left_source_anchor = (source_left_ear_mask + left_ring).clamp(0, 1) * left_roi
     right_source_anchor = (source_right_ear_mask + right_ring).clamp(0, 1) * right_roi
-    left_target_anchor = target_left_ear_mask * left_roi
-    right_target_anchor = target_right_ear_mask * right_roi
+    # Source ROIs describe where the object was found.  They are not valid in
+    # the target frame and must not crop the target ear before its centroid is
+    # measured; doing so produced spurious shifts and duplicated earrings.
+    left_target_anchor = target_left_ear_mask * target_left_roi
+    right_target_anchor = target_right_ear_mask * target_right_roi
 
     left_src_y, left_src_x, left_src_valid = _weighted_centroid(left_source_anchor)
     left_tgt_y, left_tgt_x, left_tgt_valid = _weighted_centroid(left_target_anchor)
@@ -2535,11 +5025,15 @@ def align_earring_reference_to_target(
 
     shifted_left_mask = shift_tensor_per_batch(left_ring, left_shift_y, left_shift_x)
     shifted_right_mask = shift_tensor_per_batch(right_ring, right_shift_y, right_shift_x)
+    shifted_left_hole = shift_tensor_per_batch(left_hole, left_shift_y, left_shift_x)
+    shifted_right_hole = shift_tensor_per_batch(right_hole, right_shift_y, right_shift_x)
     shifted_left_rgb = shift_tensor_per_batch(source_01 * left_ring, left_shift_y, left_shift_x)
     shifted_right_rgb = shift_tensor_per_batch(source_01 * right_ring, right_shift_y, right_shift_x)
 
     original_ring = (left_ring + right_ring).clamp(0, 1)
     aligned_mask = (shifted_left_mask + shifted_right_mask).clamp(0, 1)
+    aligned_hole = (shifted_left_hole + shifted_right_hole).clamp(0, 1)
+    aligned_mask = aligned_mask * (1.0 - aligned_hole).clamp(0, 1)
     earring_rgb = shifted_left_rgb + shifted_right_rgb
     aligned_support = dilate_mask(aligned_mask, 3)
     if reference_base is None:
@@ -2564,6 +5058,7 @@ def align_earring_reference_to_target(
     return {
         "earring_reference": aligned_source,
         "earring_confident_mask": aligned_mask,
+        "hoop_hole_mask": aligned_hole,
         "source_earring_original_mask": original_ring,
         "source_earring_cleanup_mask": source_cleanup_mask,
         "source_left_earring_aligned_mask": shifted_left_mask,
@@ -2942,7 +5437,14 @@ class EarAnchoredQueryBuilder(nn.Module):
         source_hair_context = dilate_mask(source_hair_mask, self.source_hair_block_dilate)
         source_earring_keep = dilate_mask(source_masks["earring"], max(3, self.earring_expand // 2))
 
-        target_open_mask = (1 - target_ear_hair_context).clamp(0, 1) * (1 - hat_mask)
+        # Visibility answers only whether the target ear/lobe itself is
+        # exposed.  A one-pixel target-hair boundary often lands on the lobe
+        # after hairstyle transfer even when the hair is visibly *below* the
+        # ear.  Treat only a compact hair interior as a lobe occluder here.
+        # This keeps a real, exposed earlobe eligible for a foreground pendant
+        # while a materially hair-covered ear still remains closed.
+        target_hair_lobe_core = erode_mask(target_hair_mask, 3)
+        target_open_mask = (1 - target_hair_lobe_core).clamp(0, 1) * (1 - hat_mask)
         left_visible_roi = left_roi * target_open_mask
         right_visible_roi = right_roi * target_open_mask
         visible_ear_roi = torch.clamp(left_visible_roi + right_visible_roi, 0, 1)
@@ -2958,64 +5460,53 @@ class EarAnchoredQueryBuilder(nn.Module):
             source_side_ring: torch.Tensor,
             source_lobe_anchor: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-            side_area = side_roi.flatten(1).sum(dim=1).clamp_min(1.0)
-            visible_ratio = (visible_side_roi * side_roi).flatten(1).sum(dim=1) / side_area
-            hair_ratio = (target_ear_hair_context * side_roi).flatten(1).sum(dim=1) / side_area
-            ear_area = (target_ear_mask * side_roi).flatten(1).sum(dim=1)
+            # ``side_roi`` also contains the complete source earring corridor.
+            # It may extend far below a visible lobe, where transferred long
+            # hair is expected.  Measure target visibility only in a compact
+            # ear/lobe probe, otherwise that background hair suppresses valid
+            # long pendants and hoops.
+            compact_ear = (target_ear_mask * side_roi).clamp(0, 1)
+            visibility_probe = torch.clamp(
+                dilate_mask(compact_ear, 9),
+                0,
+                1,
+            ) * side_roi
+            visible_ear = compact_ear * target_open_mask
+            ear_area = compact_ear.flatten(1).sum(dim=1)
+            visible_ear_area = visible_ear.flatten(1).sum(dim=1)
+            probe_area = visibility_probe.flatten(1).sum(dim=1).clamp_min(1.0)
+            visible_ratio = visible_ear_area / ear_area.clamp_min(1.0)
+            hair_ratio = (
+                target_hair_mask * visibility_probe
+            ).flatten(1).sum(dim=1) / probe_area
             area_scale = float(side_roi.shape[-1] * side_roi.shape[-2]) / float(256 * 256)
 
             parser_visible = (
-                (ear_area >= float(self.min_target_ear_area) * area_scale)
-                & (visible_ratio >= max(float(self.min_target_visible_overlap), 0.05))
+                visible_ear_area >= float(self.min_target_ear_area) * area_scale
             )
-            semantic_fallback = (
-                side_roi
-                * target_masks["skin_surface"]
-                * (1.0 - target_ear_hair_context).clamp(0, 1)
-                * (1.0 - hat_mask).clamp(0, 1)
-            ).clamp(0, 1)
-            fallback_area = semantic_fallback.flatten(1).sum(dim=1)
-            fallback_visible = (
-                (visible_ratio >= max(float(self.min_target_visible_overlap), 0.08))
-                & (hair_ratio <= min(float(self.max_target_hair_overlap), 0.35))
-                & (fallback_area >= float(self.min_target_ear_area) * area_scale)
-            )
-            # A source label-9 earring is already trusted object evidence.  The
-            # transferred target may render the earlobe as generic skin or omit
-            # its ear label completely, so do not discard that side solely for
-            # a parser disagreement.  It must still be target-open and cannot
-            # pass through a hair-covered/hat-covered ear.
-            source_ring_area = (source_side_ring * side_roi).flatten(1).sum(dim=1)
-            source_ring_visible = (
-                (source_ring_area >= 2.0 * area_scale)
-                & (visible_ratio >= 0.03)
-                & (hair_ratio <= 0.55)
-            )
-            side_visible = (
-                parser_visible | fallback_visible | source_ring_visible
-            ).float().view(-1, 1, 1, 1)
-
-            # Parser lower lobe first; semantic lower-half skin is only a
-            # fallback when parser ear pixels are sparse.  The source lobe is
-            # aligned to the target frame and is a safe last resort for a
-            # parser-missed target ear when an explicit source earring exists.
+            # Target-side openness is a hard safety contract.  Generic cheek
+            # skin inside an expanded ear ROI is not proof that the target
+            # ear/lobe is visible: that fallback was reopening fully
+            # hair-covered ears and then forcing a source earring through the
+            # transferred hairstyle.  Require an actual target ear label and
+            # a lower-lobe anchor clear of *hair interior*.  A hair mask edge
+            # or hair below the lobe must not disable the full hanging
+            # accessory, which is composited as foreground later.
+            semantic_fallback = torch.zeros_like(visibility_probe)
+            fallback_visible = torch.zeros_like(parser_visible)
             target_lobe_anchor = build_earlobe_anchor(
                 target_ear_mask,
-                fallback_skin_mask=semantic_fallback,
                 ear_roi=side_roi,
                 lower_ratio=0.62,
                 dilate=3,
-            ) * (1.0 - target_ear_hair_context).clamp(0, 1)
-            source_lobe_anchor = (
-                ensure_mask_4d(source_lobe_anchor).float()
-                * side_roi
-                * (1.0 - target_ear_hair_context).clamp(0, 1)
-                * (1.0 - hat_mask).clamp(0, 1)
-            )
+            ) * target_open_mask
             target_lobe_present = (
                 target_lobe_anchor.flatten(1).sum(dim=1) >= 2.0 * area_scale
             ).view(-1, 1, 1, 1)
-            lobe_anchor = torch.where(target_lobe_present, target_lobe_anchor, source_lobe_anchor)
+            lobe_anchor = target_lobe_anchor
+            # A visible upper ear is insufficient: earrings hang from the
+            # lower lobe, and a lobe under transferred hair must stay closed.
+            side_visible = (parser_visible.view(-1, 1, 1, 1) & target_lobe_present).float()
 
             # Earring-guided downward channel.  A blind geometric box below the
             # lobe opens background/neck when there is no earring (holes) and is
@@ -3142,8 +5633,11 @@ class EarAnchoredQueryBuilder(nn.Module):
 
         source_left_parser_earring = source_left_ring
         source_right_parser_earring = source_right_ring
-        source_left_ring = source_left_ring * left_earring_valid_roi
-        source_right_ring = source_right_ring * right_earring_valid_roi
+        # Keep the complete source-native instance.  ``*_earring_valid_roi``
+        # is a target-side permission/gate, not a pixel crop: applying it here
+        # truncates hanging earrings and hoops when the target lobe is only
+        # partially visible.  Per-side visibility is applied by the V5
+        # compositor after instance extraction.
         left_presence = source_left_ring.flatten(1).amax(dim=1)
         right_presence = source_right_ring.flatten(1).amax(dim=1)
         presence_target = torch.stack(
@@ -3162,7 +5656,9 @@ class EarAnchoredQueryBuilder(nn.Module):
             dim=1,
         ).float()
 
-        source_earring_mask = source_masks["earring"] * earring_valid_roi
+        # As above, expose the full source object to downstream instance and
+        # hole handling.  The target-side gate must not become an alpha crop.
+        source_earring_mask = source_masks["earring"]
         target_ear_mask = torch.clamp(target_masks["left_ear"] + target_masks["right_ear"], 0, 1)
         target_ear_boundary = (
             dilate_mask(target_ear_mask, 5) - erode_mask(target_ear_mask, 5)

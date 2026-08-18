@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="1080" viewBox="0 0 2000 1080">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#344054"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#d96c5f"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#537fa8"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#5e9370"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #1f2937; }
+      .subtitle { font: 17px Arial, sans-serif; fill: #667085; }
+      .stage { font: 700 23px Arial, sans-serif; fill: #1f2937; }
+      .head { font: 700 20px Arial, sans-serif; fill: #1f2937; }
+      .body { font: 17px Arial, sans-serif; fill: #344054; }
+      .small { font: 15px Arial, sans-serif; fill: #475467; }
+      .tiny { font: 13px Arial, sans-serif; fill: #667085; }
+      .math { font: italic 700 19px Georgia, serif; fill: #1f2937; }
+      .flow { fill: none; stroke: #344054; stroke-width: 2.2; marker-end: url(#arrow); }
+      .redflow { fill: none; stroke: #d96c5f; stroke-width: 2.2; marker-end: url(#arrowRed); }
+      .blueflow { fill: none; stroke: #537fa8; stroke-width: 2.2; marker-end: url(#arrowBlue); }
+      .greenflow { fill: none; stroke: #5e9370; stroke-width: 2.2; marker-end: url(#arrowGreen); }
+      .dashflow { fill: none; stroke: #d96c5f; stroke-width: 1.8; stroke-dasharray: 7 5; marker-end: url(#arrowRed); }
+    </style>
+  </defs>
+
+  <rect x="10" y="10" width="1980" height="1060" rx="12" fill="#ffffff" stroke="#d0d5dd" stroke-width="2"/>
+  <text x="1000" y="50" text-anchor="middle" class="title">Region-Guided Multi-Branch Residual Cleanup (v8)</text>
+  <text x="1000" y="77" text-anchor="middle" class="subtitle">Spatial artifact localization, context-aware correction, and protected feature fusion</text>
+
+  <!-- Four aligned stages -->
+  <rect x="30" y="105" width="445" height="890" rx="9" fill="#fffafa" stroke="#df8a80" stroke-width="1.8"/>
+  <rect x="495" y="105" width="500" height="890" rx="9" fill="#f9fbfd" stroke="#7fa0bd" stroke-width="1.8"/>
+  <rect x="1015" y="105" width="550" height="890" rx="9" fill="#fffaf5" stroke="#d99b61" stroke-width="1.8"/>
+  <rect x="1585" y="105" width="385" height="890" rx="9" fill="#f8fcf9" stroke="#79a88a" stroke-width="1.8"/>
+
+  <rect x="30" y="105" width="445" height="56" rx="9" fill="#f7dfdc"/>
+  <rect x="495" y="105" width="500" height="56" rx="9" fill="#e6eef5"/>
+  <rect x="1015" y="105" width="550" height="56" rx="9" fill="#f6e4d2"/>
+  <rect x="1585" y="105" width="385" height="56" rx="9" fill="#e2f0e6"/>
+  <text x="252" y="141" text-anchor="middle" class="stage">1. Region Guidance</text>
+  <text x="745" y="141" text-anchor="middle" class="stage">2. Context Encoding</text>
+  <text x="1290" y="141" text-anchor="middle" class="stage">3. Gated Residual Heads</text>
+  <text x="1777" y="141" text-anchor="middle" class="stage">4. Protected Fusion</text>
+
+  <!-- Stage 1: external masks -->
+  <text x="252" y="192" text-anchor="middle" class="head">Semantic Inputs</text>
+  <g transform="translate(55,214)">
+    <rect x="0" y="0" width="110" height="58" rx="6" fill="#fff" stroke="#d96c5f"/>
+    <text x="55" y="25" text-anchor="middle" class="body">M<tspan baseline-shift="sub" font-size="12">src</tspan></text>
+    <text x="55" y="46" text-anchor="middle" class="tiny">source hair</text>
+    <rect x="135" y="0" width="110" height="58" rx="6" fill="#fff" stroke="#d96c5f"/>
+    <text x="190" y="25" text-anchor="middle" class="body">M<tspan baseline-shift="sub" font-size="12">tgt</tspan></text>
+    <text x="190" y="46" text-anchor="middle" class="tiny">target hair</text>
+    <rect x="270" y="0" width="110" height="58" rx="6" fill="#fff" stroke="#d96c5f"/>
+    <text x="325" y="25" text-anchor="middle" class="body">P<tspan baseline-shift="sub" font-size="12">src</tspan></text>
+    <text x="325" y="46" text-anchor="middle" class="tiny">face parsing</text>
+  </g>
+
+  <path d="M110,272 L110,302 L208,302 L208,322" class="redflow"/>
+  <path d="M245,272 L245,302 L224,302 L224,322" class="redflow"/>
+  <rect x="75" y="324" width="295" height="72" rx="7" fill="#fff" stroke="#d96c5f" stroke-width="1.5"/>
+  <text x="222" y="351" text-anchor="middle" class="head">Hair Difference</text>
+  <text x="222" y="378" text-anchor="middle" class="math">M<tspan baseline-shift="sub" font-size="12">remove</tspan> = M<tspan baseline-shift="sub" font-size="12">src</tspan> &#8857; (1 - M<tspan baseline-shift="sub" font-size="12">tgt</tspan>)</text>
+
+  <path d="M222,396 L222,424" class="redflow"/>
+  <path d="M380,272 L380,420 L350,420 L350,440" class="redflow"/>
+  <rect x="75" y="442" width="295" height="70" rx="7" fill="#fff" stroke="#d96c5f" stroke-width="1.5"/>
+  <text x="222" y="470" text-anchor="middle" class="head">Region Mask Builder</text>
+  <text x="222" y="495" text-anchor="middle" class="small">difference + parsing + morphology</text>
+
+  <!-- Seven masks -->
+  <text x="252" y="552" text-anchor="middle" class="head">Seven-Channel Mask Stack</text>
+  <g transform="translate(48,575)">
+    <g transform="translate(0,0)"><rect width="48" height="48" rx="5" fill="#f7c6c0" stroke="#d96c5f"/><text x="24" y="68" text-anchor="middle" class="tiny">Bnd</text></g>
+    <g transform="translate(58,0)"><rect width="48" height="48" rx="5" fill="#ee9c92" stroke="#d96c5f"/><text x="24" y="68" text-anchor="middle" class="tiny">Remove</text></g>
+    <g transform="translate(116,0)"><rect width="48" height="48" rx="5" fill="#b8d6aa" stroke="#72a164"/><text x="24" y="68" text-anchor="middle" class="tiny">Halo</text></g>
+    <g transform="translate(174,0)"><rect width="48" height="48" rx="5" fill="#85a9d0" stroke="#537fa8"/><text x="24" y="68" text-anchor="middle" class="tiny">Tail</text></g>
+    <g transform="translate(232,0)"><rect width="48" height="48" rx="5" fill="#e88484" stroke="#c75d5d"/><text x="24" y="68" text-anchor="middle" class="tiny">Face</text></g>
+    <g transform="translate(290,0)"><rect width="48" height="48" rx="5" fill="#efbd72" stroke="#c58a35"/><text x="24" y="68" text-anchor="middle" class="tiny">Neck</text></g>
+    <g transform="translate(348,0)"><rect width="48" height="48" rx="5" fill="#8fc19b" stroke="#5e9370"/><text x="24" y="68" text-anchor="middle" class="tiny">Protect</text></g>
+  </g>
+  <path d="M222,512 L222,565" class="redflow"/>
+
+  <rect x="93" y="688" width="260" height="77" rx="7" fill="#fff" stroke="#d96c5f" stroke-width="1.5"/>
+  <text x="223" y="717" text-anchor="middle" class="head">Region Masks M<tspan baseline-shift="sub" font-size="12">1:7</tspan></text>
+  <text x="223" y="743" text-anchor="middle" class="small">spatial artifact guidance</text>
+  <path d="M222,645 L222,678" class="redflow"/>
+
+  <rect x="74" y="821" width="296" height="93" rx="7" fill="#fff" stroke="#d96c5f" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="222" y="850" text-anchor="middle" class="head">Analytic Region Priors</text>
+  <text x="222" y="875" text-anchor="middle" class="small">shadow · face · halo</text>
+  <text x="222" y="897" text-anchor="middle" class="small">tail · neck · copy</text>
+  <path d="M222,765 L222,811" class="dashflow"/>
+
+  <!-- Stage 1 to stage 2 mask flow -->
+  <path d="M353,726 L517,726" class="redflow"/>
+
+  <!-- Stage 2: feature inputs and projector -->
+  <text x="745" y="192" text-anchor="middle" class="head">Feature Inputs</text>
+  <g transform="translate(530,214)">
+    <rect x="0" y="0" width="130" height="58" rx="6" fill="#fff" stroke="#537fa8"/>
+    <text x="65" y="25" text-anchor="middle" class="body">F<tspan baseline-shift="sub" font-size="12">base</tspan></text>
+    <text x="65" y="46" text-anchor="middle" class="tiny">base feature</text>
+    <rect x="150" y="0" width="130" height="58" rx="6" fill="#fff" stroke="#537fa8"/>
+    <text x="215" y="25" text-anchor="middle" class="body">F<tspan baseline-shift="sub" font-size="12">src</tspan></text>
+    <text x="215" y="46" text-anchor="middle" class="tiny">source feature</text>
+    <rect x="300" y="0" width="130" height="58" rx="6" fill="#fff" stroke="#537fa8"/>
+    <text x="365" y="25" text-anchor="middle" class="body">F<tspan baseline-shift="sub" font-size="12">inp</tspan></text>
+    <text x="365" y="46" text-anchor="middle" class="tiny">inpaint feature</text>
+  </g>
+
+  <path d="M595,272 L595,307 L735,307 L735,330" class="blueflow"/>
+  <path d="M745,272 L745,330" class="blueflow"/>
+  <path d="M895,272 L895,307 L755,307 L755,330" class="blueflow"/>
+  <rect x="570" y="332" width="350" height="91" rx="7" fill="#fff" stroke="#537fa8" stroke-width="1.5"/>
+  <text x="745" y="361" text-anchor="middle" class="head">Shared Feature Projector</text>
+  <rect x="635" y="378" width="220" height="27" rx="4" fill="#dbe8f2" stroke="#537fa8"/>
+  <text x="745" y="397" text-anchor="middle" class="small">1×1 Conv · 512 → 128 · GN · SiLU</text>
+
+  <path d="M745,423 L745,450" class="blueflow"/>
+  <g transform="translate(548,452)">
+    <rect x="0" y="0" width="120" height="52" rx="5" fill="#e8f0f7" stroke="#537fa8"/><text x="60" y="31" text-anchor="middle" class="body">P<tspan baseline-shift="sub" font-size="12">base</tspan></text>
+    <rect x="137" y="0" width="120" height="52" rx="5" fill="#e8f0f7" stroke="#537fa8"/><text x="197" y="31" text-anchor="middle" class="body">P<tspan baseline-shift="sub" font-size="12">src</tspan></text>
+    <rect x="274" y="0" width="120" height="52" rx="5" fill="#e8f0f7" stroke="#537fa8"/><text x="334" y="31" text-anchor="middle" class="body">P<tspan baseline-shift="sub" font-size="12">inp</tspan></text>
+  </g>
+
+  <!-- Mask encoder -->
+  <rect x="530" y="550" width="430" height="158" rx="7" fill="#fff" stroke="#d96c5f" stroke-width="1.5"/>
+  <text x="745" y="579" text-anchor="middle" class="head">Mask Encoder</text>
+  <text x="745" y="602" text-anchor="middle" class="small">Conv3×3 + GN + SiLU</text>
+  <g transform="translate(555,625)">
+    <rect x="0" y="0" width="60" height="42" rx="4" fill="#f9e2df" stroke="#d96c5f"/><text x="30" y="18" text-anchor="middle" class="tiny">Conv</text><text x="30" y="34" text-anchor="middle" class="tiny">7→32</text>
+    <path d="M62,21 L82,21" class="redflow"/>
+    <rect x="87" y="0" width="66" height="42" rx="4" fill="#f7d7d2" stroke="#d96c5f"/><text x="120" y="18" text-anchor="middle" class="tiny">Conv</text><text x="120" y="34" text-anchor="middle" class="tiny">32→32</text>
+    <path d="M155,21 L175,21" class="redflow"/>
+    <rect x="180" y="0" width="66" height="42" rx="4" fill="#f4c9c3" stroke="#d96c5f"/><text x="213" y="18" text-anchor="middle" class="tiny">Conv</text><text x="213" y="34" text-anchor="middle" class="tiny">32→64</text>
+    <path d="M248,21 L268,21" class="redflow"/>
+    <rect x="273" y="0" width="66" height="42" rx="4" fill="#efb9b1" stroke="#d96c5f"/><text x="306" y="18" text-anchor="middle" class="tiny">Conv</text><text x="306" y="34" text-anchor="middle" class="tiny">64→64</text>
+    <path d="M341,21 L360,21" class="redflow"/>
+    <rect x="365" y="0" width="42" height="42" rx="4" fill="#eaa79e" stroke="#d96c5f"/>
+    <text x="386" y="59" text-anchor="middle" class="tiny">F<tspan baseline-shift="sub" font-size="9">m</tspan></text>
+  </g>
+
+  <!-- Shadow context head -->
+  <rect x="530" y="748" width="430" height="194" rx="7" fill="#fff" stroke="#537fa8" stroke-width="1.5"/>
+  <text x="745" y="777" text-anchor="middle" class="head">Shadow Context Head</text>
+  <text x="745" y="801" text-anchor="middle" class="small">Concat [Pbase, Psrc, Pinp, Fm, RGB↓]</text>
+  <g transform="translate(565,827)">
+    <rect x="0" y="0" width="86" height="47" rx="4" fill="#dbe8f2" stroke="#537fa8"/><text x="43" y="19" text-anchor="middle" class="tiny">Conv3×3</text><text x="43" y="36" text-anchor="middle" class="tiny">451→128</text>
+    <path d="M88,23 L110,23" class="blueflow"/>
+    <rect x="115" y="0" width="82" height="47" rx="4" fill="#cbddea" stroke="#537fa8"/><text x="156" y="19" text-anchor="middle" class="tiny">Conv3×3</text><text x="156" y="36" text-anchor="middle" class="tiny">128→64</text>
+    <path d="M199,23 L221,23" class="blueflow"/>
+    <rect x="226" y="0" width="76" height="47" rx="4" fill="#b9d0e1" stroke="#537fa8"/><text x="264" y="19" text-anchor="middle" class="tiny">Conv1×1</text><text x="264" y="36" text-anchor="middle" class="tiny">64→1</text>
+    <path d="M304,23 L326,23" class="blueflow"/>
+    <rect x="331" y="0" width="64" height="47" rx="4" fill="#e8f3eb" stroke="#5e9370"/><text x="363" y="28" text-anchor="middle" class="tiny">Sigmoid</text>
+  </g>
+  <text x="745" y="920" text-anchor="middle" class="math">Shadow Map S</text>
+
+  <!-- Stage 2 to stage 3 context bus -->
+  <path d="M942,478 L1005,478 M962,646 L1005,646 M960,850 L1005,850 M1005,330 L1005,850" fill="none" stroke="#537fa8" stroke-width="2"/>
+  <path d="M1005,330 L1040,330" class="blueflow"/>
+  <text x="1000" y="316" text-anchor="end" class="tiny">Context Bus</text>
+
+  <!-- Stage 3: branch-specific contexts -->
+  <text x="1290" y="192" text-anchor="middle" class="head">Branch Contexts</text>
+  <rect x="1048" y="214" width="484" height="172" rx="7" fill="#fff" stroke="#d99b61" stroke-width="1.4"/>
+  <g transform="translate(1070,233)">
+    <rect x="0" y="0" width="18" height="18" fill="#9ac181"/><text x="30" y="15" class="small">Halo</text><text x="112" y="15" class="tiny">Pbase + Pinp + Fm + S</text>
+    <rect x="0" y="38" width="18" height="18" fill="#739bc7"/><text x="30" y="53" class="small">Tail</text><text x="112" y="53" class="tiny">Pbase + Psrc + Pinp + Fm + S</text>
+    <rect x="0" y="76" width="18" height="18" fill="#e8ae55"/><text x="30" y="91" class="small">Neck</text><text x="112" y="91" class="tiny">Pbase + Pinp + Fm + S</text>
+    <rect x="0" y="114" width="18" height="18" fill="#9e84d8"/><text x="30" y="129" class="small">Copy</text><text x="112" y="129" class="tiny">Pbase + Psrc + Fm + S</text>
+  </g>
+
+  <path d="M1290,386 L1290,418" class="flow"/>
+  <rect x="1048" y="420" width="484" height="372" rx="8" fill="#fff" stroke="#d99b61" stroke-width="1.7"/>
+  <text x="1290" y="451" text-anchor="middle" class="head">Gated Residual Head ×4</text>
+  <text x="1290" y="476" text-anchor="middle" class="small">shared architecture, branch-specific context</text>
+
+  <!-- One expanded residual head -->
+  <rect x="1080" y="512" width="128" height="70" rx="6" fill="#f9eadb" stroke="#c98747"/>
+  <text x="1144" y="538" text-anchor="middle" class="small">Conv3×3</text>
+  <text x="1144" y="562" text-anchor="middle" class="small">in → 256</text>
+  <path d="M1208,547 L1243,547" class="flow"/>
+  <rect x="1250" y="512" width="128" height="70" rx="6" fill="#f5ddc6" stroke="#c98747"/>
+  <text x="1314" y="538" text-anchor="middle" class="small">Conv3×3</text>
+  <text x="1314" y="562" text-anchor="middle" class="small">256 → 128</text>
+  <path d="M1378,547 L1406,547 L1406,518 L1430,518" class="flow"/>
+  <path d="M1406,547 L1406,624 L1430,624" class="flow"/>
+  <rect x="1436" y="487" width="72" height="62" rx="6" fill="#f9d9dc" stroke="#c75d6b"/>
+  <text x="1472" y="512" text-anchor="middle" class="tiny">1×1 Conv</text>
+  <text x="1472" y="532" text-anchor="middle" class="tiny">128→1</text>
+  <rect x="1436" y="593" width="72" height="62" rx="6" fill="#f7e0cb" stroke="#c98747"/>
+  <text x="1472" y="618" text-anchor="middle" class="tiny">1×1 Conv</text>
+  <text x="1472" y="638" text-anchor="middle" class="tiny">128→512</text>
+  <path d="M1472,549 L1472,566" class="greenflow"/>
+  <rect x="1428" y="566" width="88" height="25" rx="4" fill="#e6f2e9" stroke="#5e9370"/>
+  <text x="1472" y="583" text-anchor="middle" class="tiny">Sigmoid</text>
+  <text x="1472" y="686" text-anchor="middle" class="math">&#916;F<tspan baseline-shift="sub" font-size="11">i</tspan></text>
+  <text x="1472" y="471" text-anchor="middle" class="math">G<tspan baseline-shift="sub" font-size="11">i</tspan></text>
+  <text x="1144" y="607" text-anchor="middle" class="tiny">GN + SiLU</text>
+  <text x="1314" y="607" text-anchor="middle" class="tiny">GN + SiLU</text>
+
+  <rect x="1098" y="710" width="384" height="54" rx="6" fill="#fff7ed" stroke="#d99b61" stroke-dasharray="6 4"/>
+  <text x="1290" y="743" text-anchor="middle" class="body">Learned correction: G<tspan baseline-shift="sub" font-size="11">i</tspan> &#8857; &#916;F<tspan baseline-shift="sub" font-size="11">i</tspan></text>
+
+  <!-- Outputs to stage 4 -->
+  <path d="M1532,737 L1580,737 L1580,409 L1616,409" class="flow"/>
+  <path d="M370,867 L460,867 L460,967 L1570,967 L1570,278 L1608,278" class="dashflow"/>
+
+  <!-- Stage 4: priors and fusion -->
+  <rect x="1610" y="196" width="335" height="116" rx="7" fill="#fff" stroke="#d96c5f" stroke-width="1.4" stroke-dasharray="6 4"/>
+  <text x="1777" y="226" text-anchor="middle" class="head">Region Priors</text>
+  <text x="1777" y="252" text-anchor="middle" class="small">Pshadow + Pface</text>
+  <text x="1777" y="276" text-anchor="middle" class="small">Phalo · Ptail · Pneck · Pcopy</text>
+  <text x="1777" y="298" text-anchor="middle" class="tiny">constructed from masks and feature differences</text>
+
+  <path d="M1777,312 L1777,349" class="redflow"/>
+  <rect x="1624" y="351" width="307" height="116" rx="7" fill="#fff" stroke="#d99b61" stroke-width="1.7"/>
+  <text x="1777" y="382" text-anchor="middle" class="head">Residual Fusion</text>
+  <text x="1777" y="410" text-anchor="middle" class="math">&#916;F<tspan baseline-shift="sub" font-size="11">cleanup</tspan></text>
+  <text x="1777" y="440" text-anchor="middle" class="small">priors + gated branch corrections</text>
+
+  <!-- Protect head -->
+  <rect x="1624" y="510" width="307" height="195" rx="7" fill="#fff" stroke="#5e9370" stroke-width="1.7"/>
+  <text x="1777" y="540" text-anchor="middle" class="head">Protect Head</text>
+  <text x="1777" y="565" text-anchor="middle" class="small">Concat [Pbase, Psrc, Fm]</text>
+  <g transform="translate(1643,592)">
+    <rect x="0" y="0" width="76" height="47" rx="4" fill="#dcece1" stroke="#5e9370"/><text x="38" y="19" text-anchor="middle" class="tiny">Conv3×3</text><text x="38" y="36" text-anchor="middle" class="tiny">320→128</text>
+    <path d="M78,23 L94,23" class="greenflow"/>
+    <rect x="99" y="0" width="72" height="47" rx="4" fill="#cde2d3" stroke="#5e9370"/><text x="135" y="19" text-anchor="middle" class="tiny">Conv3×3</text><text x="135" y="36" text-anchor="middle" class="tiny">128→64</text>
+    <path d="M173,23 L189,23" class="greenflow"/>
+    <rect x="194" y="0" width="70" height="47" rx="4" fill="#bcd7c4" stroke="#5e9370"/><text x="229" y="19" text-anchor="middle" class="tiny">Conv1×1</text><text x="229" y="36" text-anchor="middle" class="tiny">64→1</text>
+  </g>
+  <rect x="1725" y="657" width="104" height="28" rx="4" fill="#e6f2e9" stroke="#5e9370"/>
+  <text x="1777" y="676" text-anchor="middle" class="small">Sigmoid → Gp</text>
+
+  <!-- Protected add: cleanup residual enters from the right, protect gate from above -->
+  <path d="M1931,409 L1950,409 L1950,752 L1802,752" class="flow"/>
+  <path d="M1777,705 L1777,720" class="greenflow"/>
+  <circle cx="1777" cy="752" r="25" fill="#fff" stroke="#5e9370" stroke-width="2"/>
+  <text x="1777" y="760" text-anchor="middle" font-family="Arial" font-size="25" font-weight="700" fill="#344054">×</text>
+  <text x="1739" y="757" text-anchor="end" class="math">1-G<tspan baseline-shift="sub" font-size="11">p</tspan></text>
+  <path d="M1777,777 L1777,810" class="greenflow"/>
+  <circle cx="1777" cy="838" r="25" fill="#fff" stroke="#344054" stroke-width="2"/>
+  <text x="1777" y="847" text-anchor="middle" font-family="Arial" font-size="28" font-weight="700" fill="#344054">+</text>
+
+  <!-- Fbase skip enters final addition -->
+  <path d="M530,243 L500,243 L500,956 L1550,956 L1550,838 L1742,838" class="blueflow"/>
+  <text x="1260" y="948" text-anchor="middle" class="small">Fbase residual skip</text>
+
+  <path d="M1777,863 L1777,882" class="greenflow"/>
+  <rect x="1640" y="884" width="274" height="76" rx="7" fill="#e8f3eb" stroke="#5e9370" stroke-width="1.7"/>
+  <text x="1777" y="913" text-anchor="middle" class="head">Clean Feature</text>
+  <text x="1777" y="942" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="12">clean</tspan></text>
+
+  <!-- Compact equations -->
+  <rect x="505" y="1012" width="1460" height="43" rx="6" fill="#fff" stroke="#98a2b3" stroke-width="1.3"/>
+  <text x="1235" y="1040" text-anchor="middle" class="math">
+    &#916;F<tspan baseline-shift="sub" font-size="11">cleanup</tspan> = P<tspan baseline-shift="sub" font-size="11">shadow</tspan> + P<tspan baseline-shift="sub" font-size="11">face</tspan> + &#931;<tspan baseline-shift="sub" font-size="11">i</tspan> G<tspan baseline-shift="sub" font-size="11">i</tspan> &#8857; M<tspan baseline-shift="sub" font-size="11">i</tspan> &#8857; (P<tspan baseline-shift="sub" font-size="11">i</tspan> + &#916;F<tspan baseline-shift="sub" font-size="11">i</tspan>)     ·     F<tspan baseline-shift="sub" font-size="11">clean</tspan> = F<tspan baseline-shift="sub" font-size="11">base</tspan> + (1-G<tspan baseline-shift="sub" font-size="11">p</tspan>) &#8857; &#916;F<tspan baseline-shift="sub" font-size="11">cleanup</tspan>
+  </text>
+</svg>

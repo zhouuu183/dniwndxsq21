@@ -12,7 +12,7 @@ from torchvision.io import ImageReadMode, read_image
 
 from models.Alignment_v8 import Alignment_v8
 from models.Blending_v5 import BlendingV5
-from models.Embedding import Embedding
+from models.Embedding_v5 import EmbeddingV5
 from models.Net import Net
 from utils.image_utils import equal_replacer
 from utils.seed import seed_setter
@@ -42,7 +42,7 @@ class HairFastV5:
             print("[HairFastV5] use_satd_v8=True but satd_checkpoint_v8 is empty; disabling SATD_v8 cleanup.")
             self.args.use_satd_v8 = False
         self.net = Net(self.args)
-        self.embed = Embedding(args, net=self.net)
+        self.embed = EmbeddingV5(args, net=self.net)
         # v5 now uses the v8 shadow-cleaned alignment path before the
         # ear-aware post-process stage.
         self.align = Alignment_v8(args, self.embed.get_e4e_embed, net=self.net)
@@ -202,10 +202,18 @@ def get_parser():
     parser.add_argument("--earring_write_connectivity_kernel", type=int, default=5)
     parser.add_argument("--earring_write_bridge_dilate", type=int, default=17)
     parser.add_argument("--earring_anchor_visible_dilate", type=int, default=3)
-    parser.add_argument("--earring_align_max_shift", type=int, default=12)
+    # Face inputs are already aligned into one canonical frame before V5 runs.
+    # Chasing noisy parser centroids moves a real source earring a second time
+    # and can produce an offset duplicate, so V5 is source-coordinate by
+    # default.  A caller can still opt in explicitly for a controlled study.
+    parser.add_argument("--earring_align_max_shift", type=int, default=0)
     parser.add_argument("--ear_fine_support_dilate", type=int, default=3)
     parser.add_argument("--earring_fine_mask_floor", type=float, default=0.18)
     parser.add_argument("--earring_fine_mask_dilate", type=int, default=5)
+    # Native source-instance compositing is the authority.  The learned branch
+    # is opt-in and, when enabled, is restricted to a tiny completion band
+    # around a measured native instance so it cannot invent a second earring.
+    parser.add_argument("--earring_learned_fallback_alpha", type=float, default=0.0)
     parser.add_argument("--earring_target_hair_override_dilate", type=int, default=1)
     parser.add_argument("--enable_source_content_gate", type=str2bool, default=True)
     parser.add_argument("--source_content_gate_dilate", type=int, default=3)
@@ -218,7 +226,7 @@ def get_parser():
     parser.add_argument("--output_face_hair_seam_preserve_dilate", type=int, default=7)
     parser.add_argument("--output_earring_keep_dilate", type=int, default=0)
     parser.add_argument("--output_preserve_blur", type=int, default=1)
-    parser.add_argument("--output_hairline_feather", type=int, default=9)
+    parser.add_argument("--output_hairline_feather", type=int, default=0)
     parser.add_argument("--hair_color_reference_strength_v8", type=float, default=0.9)
     parser.add_argument("--hair_color_low_frequency_radius_v8", type=int, default=15)
     parser.add_argument("--hair_color_low_frequency_sigma_v8", type=float, default=None)

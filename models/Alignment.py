@@ -83,8 +83,7 @@ class Alignment(nn.Module):
                                        torch.zeros_like(target_mask, device=device))
 
         if self.opts.save_all:
-            exp_name = kwargs.get('exp_name')
-            exp_name = exp_name if exp_name is not None else ""
+            exp_name = exp_name if (exp_name := kwargs.get('exp_name')) is not None else ""
             output_dir = self.opts.save_all_dir / exp_name
             if I_rot is not None:
                 save_gen_image(output_dir, 'Shape', f'{im_name2}_rotate_to_{im_name1}.png', I_rot)
@@ -160,8 +159,7 @@ class Alignment(nn.Module):
         latent_F_align = latent_F_2 + interpolation_low[2] * (latent_F_align - latent_F_2)
 
         if self.opts.save_all:
-            exp_name = kwargs.get('exp_name')
-            exp_name = exp_name if exp_name is not None else ""
+            exp_name = exp_name if (exp_name := kwargs.get('exp_name')) is not None else ""
             output_dir = self.opts.save_all_dir / exp_name
             save_gen_image(output_dir, 'Align', f'{im_name1}_{im_name2}_SEAN.png', gen1_sean)
             save_gen_image(output_dir, 'Align', f'{im_name2}_{im_name1}_SEAN.png', gen2_sean)

@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1900" height="650" viewBox="0 0 1900 650">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#344054"/>
+    </marker>
+    <marker id="arrRed" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#d56f64"/>
+    </marker>
+    <marker id="arrGreen" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#5f926f"/>
+    </marker>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #1f2937; }
+      .head { font: 700 18px Arial, sans-serif; fill: #1f2937; }
+      .body { font: 16px Arial, sans-serif; fill: #344054; }
+      .small { font: 14px Arial, sans-serif; fill: #475467; }
+      .tiny { font: 12px Arial, sans-serif; fill: #667085; }
+      .math { font: italic 700 18px Georgia, serif; fill: #1f2937; }
+      .flow { fill: none; stroke: #344054; stroke-width: 2; marker-end: url(#arr); }
+      .redflow { fill: none; stroke: #d56f64; stroke-width: 2; marker-end: url(#arrRed); }
+      .greenflow { fill: none; stroke: #5f926f; stroke-width: 2; marker-end: url(#arrGreen); }
+    </style>
+  </defs>
+
+  <rect x="10" y="10" width="1880" height="630" rx="12" fill="#fff" stroke="#d0d5dd" stroke-width="2"/>
+  <text x="950" y="46" text-anchor="middle" class="title">v8 Residual Cleanup</text>
+  <rect x="24" y="66" width="1852" height="552" rx="10" fill="#fffcfa" stroke="#df8a80" stroke-width="1.7"/>
+
+  <!-- Top: mask branch -->
+  <rect x="48" y="104" width="160" height="66" rx="7" fill="#fff" stroke="#d56f64" stroke-width="1.5"/>
+  <text x="128" y="129" text-anchor="middle" class="head">Artifact Masks</text>
+  <text x="128" y="151" text-anchor="middle" class="tiny">remove · halo · face · tail</text>
+  <path d="M208,137 L239,137" class="redflow"/>
+
+  <rect x="246" y="88" width="486" height="99" rx="8" fill="#fff" stroke="#d56f64" stroke-width="1.5"/>
+  <text x="489" y="112" text-anchor="middle" class="head">Mask Encoder</text>
+  <g transform="translate(272,126)">
+    <rect x="0" y="0" width="78" height="39" rx="4" fill="#f8dedb" stroke="#d56f64"/>
+    <text x="39" y="17" text-anchor="middle" class="tiny">3×3 Conv</text><text x="39" y="32" text-anchor="middle" class="tiny">7→32</text>
+    <path d="M80,20 L102,20" class="redflow"/>
+    <rect x="108" y="0" width="82" height="39" rx="4" fill="#f4d2ce" stroke="#d56f64"/>
+    <text x="149" y="17" text-anchor="middle" class="tiny">3×3 Conv</text><text x="149" y="32" text-anchor="middle" class="tiny">32→32</text>
+    <path d="M192,20 L214,20" class="redflow"/>
+    <rect x="220" y="0" width="82" height="39" rx="4" fill="#efc4be" stroke="#d56f64"/>
+    <text x="261" y="17" text-anchor="middle" class="tiny">3×3 Conv</text><text x="261" y="32" text-anchor="middle" class="tiny">32→64</text>
+    <path d="M304,20 L326,20" class="redflow"/>
+    <rect x="332" y="0" width="82" height="39" rx="4" fill="#eab5ad" stroke="#d56f64"/>
+    <text x="373" y="17" text-anchor="middle" class="tiny">3×3 Conv</text><text x="373" y="32" text-anchor="middle" class="tiny">64→64</text>
+  </g>
+  <text x="714" y="159" text-anchor="end" class="math">F<tspan baseline-shift="sub" font-size="10">m</tspan></text>
+
+  <!-- Middle: projected features -->
+  <rect x="48" y="265" width="190" height="70" rx="7" fill="#fff" stroke="#5b83aa" stroke-width="1.5"/>
+  <text x="143" y="290" text-anchor="middle" class="head">Feature Inputs</text>
+  <text x="143" y="315" text-anchor="middle" class="small">Fbase · Fsrc · Finp</text>
+  <path d="M238,300 L278,300" class="flow"/>
+  <rect x="285" y="256" width="300" height="88" rx="8" fill="#fff" stroke="#5b83aa" stroke-width="1.5"/>
+  <text x="435" y="282" text-anchor="middle" class="head">Feature Projection</text>
+  <rect x="330" y="298" width="210" height="29" rx="4" fill="#e3edf5" stroke="#5b83aa"/>
+  <text x="435" y="318" text-anchor="middle" class="small">1×1 Conv · 512→128</text>
+  <path d="M585,300 L625,300" class="flow"/>
+  <rect x="632" y="270" width="100" height="60" rx="6" fill="#e8f0f7" stroke="#5b83aa"/>
+  <text x="682" y="294" text-anchor="middle" class="body">Pbase</text>
+  <text x="682" y="316" text-anchor="middle" class="tiny">Psrc · Pinp</text>
+
+  <!-- Bottom: shadow context -->
+  <rect x="48" y="434" width="160" height="65" rx="7" fill="#fff" stroke="#5b83aa" stroke-width="1.5"/>
+  <text x="128" y="460" text-anchor="middle" class="head">Source RGB</text>
+  <text x="128" y="482" text-anchor="middle" class="tiny">downsampled context</text>
+  <path d="M208,466 L239,466" class="flow"/>
+  <rect x="246" y="414" width="486" height="104" rx="8" fill="#fff" stroke="#5b83aa" stroke-width="1.5"/>
+  <text x="489" y="440" text-anchor="middle" class="head">Shadow Encoder</text>
+  <text x="489" y="461" text-anchor="middle" class="tiny">+ Pbase · Psrc · Pinp · Fm</text>
+  <g transform="translate(286,472)">
+    <rect x="0" y="0" width="105" height="33" rx="4" fill="#dce8f1" stroke="#5b83aa"/>
+    <text x="52" y="21" text-anchor="middle" class="tiny">3×3 · 451→128</text>
+    <path d="M107,17 L132,17" class="flow"/>
+    <rect x="138" y="0" width="102" height="33" rx="4" fill="#cadce9" stroke="#5b83aa"/>
+    <text x="189" y="21" text-anchor="middle" class="tiny">3×3 · 128→64</text>
+    <path d="M242,17 L267,17" class="flow"/>
+    <rect x="273" y="0" width="96" height="33" rx="4" fill="#b9d0df" stroke="#5b83aa"/>
+    <text x="321" y="21" text-anchor="middle" class="tiny">1×1 · 64→1</text>
+    <path d="M371,17 L394,17" class="greenflow"/>
+    <rect x="400" y="0" width="62" height="33" rx="4" fill="#e4f0e7" stroke="#5f926f"/>
+    <text x="431" y="21" text-anchor="middle" class="tiny">Sigmoid</text>
+  </g>
+  <text x="714" y="489" text-anchor="end" class="math">S</text>
+
+  <!-- Compact context bus -->
+  <path d="M732,146 L772,146 M732,300 L772,300 M732,466 L772,466 M772,146 L772,466" fill="none" stroke="#667085" stroke-width="2"/>
+  <circle cx="772" cy="300" r="23" fill="#fff" stroke="#344054" stroke-width="2"/>
+  <text x="772" y="307" text-anchor="middle" class="head">C</text>
+  <path d="M795,300 L829,300" class="flow"/>
+
+  <!-- One expanded residual head, reused four times -->
+  <rect x="836" y="112" width="490" height="388" rx="9" fill="#fff" stroke="#d99b61" stroke-width="1.7"/>
+  <text x="1081" y="140" text-anchor="middle" class="head">Gated Residual Head ×4</text>
+  <text x="1081" y="164" text-anchor="middle" class="small">Halo · Tail · Neck · Copy</text>
+
+  <rect x="875" y="228" width="125" height="66" rx="6" fill="#f8e8d9" stroke="#c98747"/>
+  <text x="938" y="253" text-anchor="middle" class="small">3×3 Conv</text>
+  <text x="938" y="277" text-anchor="middle" class="small">in→256</text>
+  <text x="938" y="317" text-anchor="middle" class="tiny">GN + SiLU</text>
+  <path d="M1000,261 L1033,261" class="flow"/>
+  <rect x="1040" y="228" width="125" height="66" rx="6" fill="#f3dbc4" stroke="#c98747"/>
+  <text x="1103" y="253" text-anchor="middle" class="small">3×3 Conv</text>
+  <text x="1103" y="277" text-anchor="middle" class="small">256→128</text>
+  <text x="1103" y="317" text-anchor="middle" class="tiny">GN + SiLU</text>
+
+  <path d="M1165,261 L1192,261 L1192,211 L1214,211" class="flow"/>
+  <path d="M1192,261 L1192,365 L1214,365" class="flow"/>
+  <rect x="1220" y="178" width="82" height="66" rx="6" fill="#f8dade" stroke="#c75d6b"/>
+  <text x="1261" y="202" text-anchor="middle" class="tiny">1×1 Conv</text>
+  <text x="1261" y="222" text-anchor="middle" class="tiny">128→1</text>
+  <path d="M1261,244 L1261,264" class="greenflow"/>
+  <rect x="1218" y="267" width="86" height="28" rx="4" fill="#e5f1e8" stroke="#5f926f"/>
+  <text x="1261" y="286" text-anchor="middle" class="tiny">Sigmoid → Gi</text>
+
+  <rect x="1220" y="332" width="82" height="66" rx="6" fill="#f5dfca" stroke="#c98747"/>
+  <text x="1261" y="356" text-anchor="middle" class="tiny">1×1 Conv</text>
+  <text x="1261" y="376" text-anchor="middle" class="tiny">128→512</text>
+  <text x="1261" y="430" text-anchor="middle" class="math">ΔF<tspan baseline-shift="sub" font-size="10">i</tspan></text>
+
+  <rect x="923" y="444" width="316" height="38" rx="5" fill="#fff7ed" stroke="#d99b61" stroke-dasharray="6 4"/>
+  <text x="1081" y="469" text-anchor="middle" class="body">Learned correction: G<tspan baseline-shift="sub" font-size="10">i</tspan> ⊙ ΔF<tspan baseline-shift="sub" font-size="10">i</tspan></text>
+
+  <!-- Fusion and protection -->
+  <path d="M1326,300 L1363,300" class="flow"/>
+  <rect x="1370" y="166" width="210" height="103" rx="8" fill="#fff" stroke="#d99b61" stroke-width="1.6"/>
+  <text x="1475" y="196" text-anchor="middle" class="head">Residual Fusion</text>
+  <text x="1475" y="222" text-anchor="middle" class="small">+ region priors</text>
+  <text x="1475" y="250" text-anchor="middle" class="math">ΔF<tspan baseline-shift="sub" font-size="10">cleanup</tspan></text>
+
+  <rect x="1370" y="350" width="210" height="127" rx="8" fill="#fff" stroke="#5f926f" stroke-width="1.6"/>
+  <text x="1475" y="378" text-anchor="middle" class="head">Protect Head</text>
+  <text x="1475" y="399" text-anchor="middle" class="tiny">Pbase · Psrc · Fm</text>
+  <g transform="translate(1386,416)">
+    <rect x="0" y="0" width="54" height="34" rx="4" fill="#dcece1" stroke="#5f926f"/><text x="27" y="15" text-anchor="middle" class="tiny">3×3</text><text x="27" y="28" text-anchor="middle" class="tiny">320→128</text>
+    <path d="M56,17 L70,17" class="greenflow"/>
+    <rect x="75" y="0" width="54" height="34" rx="4" fill="#cce2d2" stroke="#5f926f"/><text x="102" y="15" text-anchor="middle" class="tiny">3×3</text><text x="102" y="28" text-anchor="middle" class="tiny">128→64</text>
+    <path d="M131,17 L145,17" class="greenflow"/>
+    <rect x="150" y="0" width="48" height="34" rx="4" fill="#bbd7c3" stroke="#5f926f"/><text x="174" y="15" text-anchor="middle" class="tiny">1×1</text><text x="174" y="28" text-anchor="middle" class="tiny">64→1</text>
+  </g>
+  <text x="1475" y="466" text-anchor="middle" class="tiny">Sigmoid → Gp</text>
+
+  <!-- Protected residual and skip addition -->
+  <path d="M1580,218 L1631,218 L1631,308 L1650,308" class="flow"/>
+  <path d="M1580,414 L1608,414 L1608,332 L1650,332" class="greenflow"/>
+  <circle cx="1674" cy="320" r="23" fill="#fff" stroke="#5f926f" stroke-width="2"/>
+  <text x="1674" y="328" text-anchor="middle" font-family="Arial" font-size="25" font-weight="700" fill="#344054">×</text>
+  <text x="1645" y="360" text-anchor="middle" class="math">1-G<tspan baseline-shift="sub" font-size="10">p</tspan></text>
+  <path d="M1697,320 L1724,320" class="flow"/>
+  <circle cx="1748" cy="320" r="23" fill="#fff" stroke="#344054" stroke-width="2"/>
+  <text x="1748" y="329" text-anchor="middle" font-family="Arial" font-size="27" font-weight="700" fill="#344054">+</text>
+  <path d="M1771,320 L1801,320" class="greenflow"/>
+  <rect x="1808" y="280" width="52" height="80" fill="#8fc49a" stroke="#4e855d" stroke-width="1.6"/>
+  <text x="1834" y="389" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="10">clean</tspan></text>
+
+  <!-- Fbase skip -->
+  <path d="M48,320 L36,320 L36,528 L1748,528 L1748,344" class="flow"/>
+  <text x="760" y="521" text-anchor="end" class="small">Fbase skip</text>
+
+  <!-- Formula -->
+  <rect x="819" y="540" width="820" height="49" rx="6" fill="#fff" stroke="#98a2b3" stroke-width="1.3"/>
+  <text x="1229" y="572" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="10">clean</tspan> = F<tspan baseline-shift="sub" font-size="10">base</tspan> + (1-G<tspan baseline-shift="sub" font-size="10">p</tspan>) ⊙ ΔF<tspan baseline-shift="sub" font-size="10">cleanup</tspan></text>
+</svg>

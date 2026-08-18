@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1300" height="560" viewBox="0 0 1300 560">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#344054"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#568665"/>
+    </marker>
+    <style>
+      .title { font: 700 24px Arial, sans-serif; fill: #17202d; }
+      .head { font: 700 16px Arial, sans-serif; fill: #202939; }
+      .body { font: 14px Arial, sans-serif; fill: #344054; }
+      .small { font: 12px Arial, sans-serif; fill: #475467; }
+      .tiny { font: 10.5px Arial, sans-serif; fill: #667085; }
+      .math { font: italic 700 16px Georgia, serif; fill: #202939; }
+      .flow { fill: none; stroke: #344054; stroke-width: 1.9; marker-end: url(#arrow); }
+      .line { fill: none; stroke: #667085; stroke-width: 1.7; }
+      .greenflow { fill: none; stroke: #568665; stroke-width: 1.9; marker-end: url(#arrowGreen); }
+      .tensor .back { fill: currentColor; fill-opacity: .24; stroke: currentColor; stroke-width: 1.1; }
+      .tensor .mid { fill: currentColor; fill-opacity: .46; stroke: currentColor; stroke-width: 1.1; }
+      .tensor .front { fill: currentColor; fill-opacity: .78; stroke: currentColor; stroke-width: 1.3; }
+      .single { fill-opacity: .30; stroke-width: 1.3; }
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="1284" height="544" rx="8" fill="#fff" stroke="#d6dce5" stroke-width="1.4"/>
+  <text x="650" y="34" text-anchor="middle" class="title">Region-Guided Gated Residual Cleanup</text>
+  <line x1="26" y1="49" x2="1274" y2="49" stroke="#d6dce5" stroke-width="1.1"/>
+
+  <!-- External context: deliberately compact -->
+  <rect x="28" y="176" width="132" height="48" rx="6" fill="#f8fafc" stroke="#77869a" stroke-width="1.3"/>
+  <text x="94" y="196" text-anchor="middle" class="head">Region Context</text>
+  <text x="94" y="215" text-anchor="middle" class="math">C<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <path d="M160,200 L188,200" class="flow"/>
+
+  <!-- One residual head shown in full and reused four times -->
+  <rect x="180" y="62" width="500" height="304" rx="8" fill="#fffdfb" stroke="#cf8b4e" stroke-width="1.5"/>
+  <text x="430" y="90" text-anchor="middle" class="head">Gated Residual Head &#215;4</text>
+  <text x="430" y="111" text-anchor="middle" class="small">Halo | Tail | Neck | Copy</text>
+
+  <g class="tensor" style="color:#6e7f92">
+    <rect class="back" x="211" y="161" width="40" height="68"/><rect class="mid" x="205" y="167" width="40" height="68"/><rect class="front" x="199" y="173" width="40" height="68"/>
+  </g>
+  <text x="219" y="265" text-anchor="middle" class="math">C<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+
+  <path d="M252,207 L303,207" class="flow"/>
+  <text x="278" y="181" text-anchor="middle" class="small">3x3 Conv</text>
+  <text x="278" y="196" text-anchor="middle" class="tiny">GN + SiLU</text>
+  <g class="tensor" style="color:#d49152">
+    <rect class="back" x="321" y="161" width="43" height="68"/><rect class="mid" x="315" y="167" width="43" height="68"/><rect class="front" x="309" y="173" width="43" height="68"/>
+  </g>
+  <text x="333" y="265" text-anchor="middle" class="head">256</text>
+
+  <path d="M365,207 L406,207" class="flow"/>
+  <text x="386" y="181" text-anchor="middle" class="small">3x3 Conv</text>
+  <text x="386" y="196" text-anchor="middle" class="tiny">GN + SiLU</text>
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="424" y="161" width="43" height="68"/><rect class="mid" x="418" y="167" width="43" height="68"/><rect class="front" x="412" y="173" width="43" height="68"/>
+  </g>
+  <text x="436" y="265" text-anchor="middle" class="head">128</text>
+
+  <path d="M468,207 L488,207 L488,133 L522,133" class="flow"/>
+  <text x="505" y="120" text-anchor="middle" class="tiny">1x1 Conv</text>
+  <g style="color:#568665">
+    <polygon points="530,108 538,101 570,101 562,108" fill="currentColor" fill-opacity=".15" stroke="currentColor"/>
+    <rect class="single" x="530" y="108" width="32" height="50" fill="currentColor" stroke="currentColor"/>
+  </g>
+  <text x="582" y="128" class="math">G<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <text x="582" y="146" class="tiny">Sigmoid</text>
+
+  <path d="M468,207 L488,207 L488,286 L522,286" class="flow"/>
+  <text x="505" y="273" text-anchor="middle" class="tiny">1x1 Conv</text>
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="540" y="252" width="39" height="65"/><rect class="mid" x="534" y="258" width="39" height="65"/><rect class="front" x="528" y="264" width="39" height="65"/>
+  </g>
+  <text x="587" y="284" class="math">&#916;F<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <text x="587" y="303" class="tiny">512 ch</text>
+
+  <path d="M562,133 L648,133 M579,286 L648,286 M648,133 L648,286" class="line"/>
+  <path d="M648,209 L728,209" class="flow"/>
+  <text x="430" y="346" text-anchor="middle" class="tiny">Same layers for four region-specific residual predictions</text>
+
+  <!-- Region priors and residual fusion -->
+  <rect x="742" y="67" width="160" height="44" rx="6" fill="#fff7f6" stroke="#cf6c67" stroke-width="1.3"/>
+  <text x="822" y="87" text-anchor="middle" class="head">Region Priors</text>
+  <text x="822" y="104" text-anchor="middle" class="math">R<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <path d="M822,111 L822,137" class="flow"/>
+
+  <rect x="735" y="144" width="180" height="125" rx="7" fill="#fff" stroke="#cf8b4e" stroke-width="1.5"/>
+  <text x="825" y="171" text-anchor="middle" class="head">Residual Fusion</text>
+  <text x="825" y="195" text-anchor="middle" class="small">G<tspan baseline-shift="sub" font-size="8">i</tspan> + &#916;F<tspan baseline-shift="sub" font-size="8">i</tspan> + R<tspan baseline-shift="sub" font-size="8">i</tspan></text>
+  <text x="825" y="216" text-anchor="middle" class="tiny">shadow / face priors</text>
+  <text x="825" y="246" text-anchor="middle" class="math">&#916;F<tspan baseline-shift="sub" font-size="9">cleanup</tspan></text>
+  <path d="M915,207 L943,207" class="flow"/>
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="959" y="169" width="39" height="70"/><rect class="mid" x="954" y="174" width="39" height="70"/><rect class="front" x="949" y="179" width="39" height="70"/>
+  </g>
+  <text x="970" y="265" text-anchor="middle" class="tiny">512 ch</text>
+
+  <!-- Protect head: second innovation branch -->
+  <rect x="175" y="419" width="140" height="46" rx="6" fill="#f7fbff" stroke="#5b83aa" stroke-width="1.3"/>
+  <text x="245" y="438" text-anchor="middle" class="head">Protect Context</text>
+  <text x="245" y="457" text-anchor="middle" class="math">C<tspan baseline-shift="sub" font-size="9">p</tspan></text>
+  <path d="M315,442 L344,442" class="flow"/>
+
+  <rect x="350" y="385" width="270" height="128" rx="7" fill="#fff" stroke="#568665" stroke-width="1.5"/>
+  <text x="485" y="412" text-anchor="middle" class="head">Protect Head</text>
+  <g transform="translate(370,430)">
+    <rect x="0" y="0" width="65" height="38" rx="4" fill="#e4efe7" stroke="#568665"/>
+    <text x="32" y="16" text-anchor="middle" class="tiny">3x3 Conv</text><text x="32" y="31" text-anchor="middle" class="tiny">320&#8594;128</text>
+    <path d="M67,19 L78,19" class="greenflow"/>
+    <rect x="83" y="0" width="65" height="38" rx="4" fill="#d5e7da" stroke="#568665"/>
+    <text x="115" y="16" text-anchor="middle" class="tiny">3x3 Conv</text><text x="115" y="31" text-anchor="middle" class="tiny">128&#8594;64</text>
+    <path d="M150,19 L161,19" class="greenflow"/>
+    <rect x="166" y="0" width="65" height="38" rx="4" fill="#c6dfcd" stroke="#568665"/>
+    <text x="198" y="16" text-anchor="middle" class="tiny">1x1 Conv</text><text x="198" y="31" text-anchor="middle" class="tiny">64&#8594;1</text>
+  </g>
+  <text x="485" y="494" text-anchor="middle" class="small">Sigmoid &#8594; G<tspan baseline-shift="sub" font-size="8">p</tspan></text>
+  <path d="M620,442 L638,442" class="greenflow"/>
+  <g style="color:#568665">
+    <polygon points="646,416 654,409 680,409 672,416" fill="currentColor" fill-opacity=".15" stroke="currentColor"/>
+    <rect class="single" x="646" y="416" width="26" height="52" fill="currentColor" stroke="currentColor"/>
+  </g>
+  <text x="659" y="487" text-anchor="middle" class="math">G<tspan baseline-shift="sub" font-size="9">p</tspan></text>
+
+  <rect x="690" y="485" width="126" height="40" rx="6" fill="#fff7f6" stroke="#cf6c67" stroke-width="1.3"/>
+  <text x="753" y="503" text-anchor="middle" class="head">Protect Prior</text>
+  <text x="753" y="519" text-anchor="middle" class="math">R<tspan baseline-shift="sub" font-size="9">p</tspan></text>
+  <path d="M672,442 L718,442" class="greenflow"/>
+  <path d="M753,485 L753,466" class="greenflow"/>
+  <circle cx="753" cy="442" r="22" fill="#fff" stroke="#568665" stroke-width="1.8"/>
+  <text x="753" y="450" text-anchor="middle" font-family="Arial" font-size="22" font-weight="700" fill="#344054">&#215;</text>
+  <path d="M775,442 L795,442" class="greenflow"/>
+  <g style="color:#568665">
+    <polygon points="803,416 811,409 837,409 829,416" fill="currentColor" fill-opacity=".15" stroke="currentColor"/>
+    <rect class="single" x="803" y="416" width="26" height="52" fill="currentColor" stroke="currentColor"/>
+  </g>
+  <text x="816" y="488" text-anchor="middle" class="math">P</text>
+
+  <!-- Protected residual update -->
+  <path d="M998,207 L1015,207 L1015,306 L1040,306 L1040,321" class="flow"/>
+  <path d="M837,442 L900,442 L900,343 L1018,343" class="greenflow"/>
+  <text x="951" y="334" text-anchor="middle" class="math">1-0.85P</text>
+  <circle cx="1040" cy="343" r="22" fill="#fff" stroke="#568665" stroke-width="1.8"/>
+  <text x="1040" y="351" text-anchor="middle" font-family="Arial" font-size="23" font-weight="700" fill="#344054">&#215;</text>
+  <path d="M1062,343 L1091,343" class="flow"/>
+  <circle cx="1113" cy="343" r="22" fill="#fff" stroke="#344054" stroke-width="1.8"/>
+  <text x="1113" y="352" text-anchor="middle" font-family="Arial" font-size="25" font-weight="700" fill="#344054">+</text>
+
+  <rect x="1008" y="435" width="132" height="45" rx="6" fill="#f7fbff" stroke="#5b83aa" stroke-width="1.3"/>
+  <text x="1074" y="455" text-anchor="middle" class="head">Base Feature</text>
+  <text x="1074" y="473" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="9">base</tspan></text>
+  <path d="M1074,435 L1074,402 L1113,402 L1113,365" class="flow"/>
+
+  <path d="M1135,343 L1160,343" class="greenflow"/>
+  <g class="tensor" style="color:#568665">
+    <rect class="back" x="1178" y="302" width="40" height="72"/><rect class="mid" x="1172" y="308" width="40" height="72"/><rect class="front" x="1166" y="314" width="40" height="72"/>
+  </g>
+  <text x="1190" y="410" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="9">clean</tspan></text>
+</svg>

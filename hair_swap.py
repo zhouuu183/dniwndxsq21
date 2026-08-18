@@ -14,10 +14,8 @@ from models.Alignment import Alignment
 from models.Blending import Blending
 from models.Embedding import Embedding
 from models.Net import Net
-from models.ShadowCleanup import ShadowCleanup
 from utils.image_utils import equal_replacer
 from utils.seed import seed_setter
-from utils.shadow_cleanup_masks import build_shadow_cleanup_masks
 from utils.shape_predictor import align_face
 from utils.time import bench_session
 
@@ -37,43 +35,6 @@ class HairFast:
         self.embed = Embedding(args, net=self.net)
         self.align = Alignment(args, self.embed.get_e4e_embed, net=self.net)
         self.blend = Blending(args, net=self.net)
-        self.shadow_cleanup = ShadowCleanup(args)
-
-    @staticmethod
-    def _ensure_batch(image: torch.Tensor) -> torch.Tensor:
-        if image.dim() == 3:
-            image = image.unsqueeze(0)
-        return image
-
-    def _apply_shadow_cleanup(
-        self,
-        face: torch.Tensor,
-        final_image: torch.Tensor,
-        name_to_embed,
-        align_shape,
-        **kwargs,
-    ) -> torch.Tensor:
-        use_cleanup = kwargs.get('use_shadow_cleanup', getattr(self.args, 'use_shadow_cleanup', False))
-        if not use_cleanup:
-            return final_image
-
-        cleanup_masks = build_shadow_cleanup_masks(
-            source_parsing=name_to_embed['face']['mask'],
-            target_hair_mask=align_shape['HM_X'],
-            ring_width=kwargs.get('shadow_cleanup_ring', getattr(self.args, 'shadow_cleanup_ring', 7)),
-            halo_width=kwargs.get('shadow_cleanup_halo', getattr(self.args, 'shadow_cleanup_halo', 9)),
-            protect_width=kwargs.get('shadow_cleanup_protect', getattr(self.args, 'shadow_cleanup_protect', 2)),
-        )
-
-        cleaned = self.shadow_cleanup(
-            source_image=self._ensure_batch(face.to(final_image.device)),
-            base_image=self._ensure_batch(final_image.to(self.args.device)),
-            cleanup_masks={key: value.to(final_image.device) for key, value in cleanup_masks.items()},
-            strength=kwargs.get('shadow_cleanup_strength', getattr(self.args, 'shadow_cleanup_strength', 0.75)),
-            source_blend=kwargs.get('shadow_cleanup_source_blend', getattr(self.args, 'shadow_cleanup_source_blend', 0.55)),
-            kernel_size=kwargs.get('shadow_cleanup_kernel', getattr(self.args, 'shadow_cleanup_kernel', 21)),
-        )
-        return cleaned[0]
 
     @seed_setter
     @bench_session
@@ -97,7 +58,6 @@ class HairFast:
 
         # Blending and Post Process stage
         final_image = self.blend.blend_images(align_shape, align_color, name_to_embed, **kwargs)
-        final_image = self._apply_shadow_cleanup(face, final_image, name_to_embed, align_shape, **kwargs)
         return final_image
 
     def swap(self, face_img: TImage | TPath, shape_img: TImage | TPath, color_img: TImage | TPath,
@@ -170,14 +130,6 @@ def get_parser():
     parser.add_argument('--rotate_checkpoint', type=str, default='pretrained_models/Rotate/rotate_best.pth')
     parser.add_argument('--blending_checkpoint', type=str, default='pretrained_models/Blending/checkpoint.pth')
     parser.add_argument('--pp_checkpoint', type=str, default='pretrained_models/PostProcess/pp_model.pth')
-    parser.add_argument('--use_shadow_cleanup', action='store_true')
-    parser.add_argument('--shadow_cleanup_strength', type=float, default=0.75)
-    parser.add_argument('--shadow_cleanup_source_blend', type=float, default=0.55)
-    parser.add_argument('--shadow_cleanup_kernel', type=int, default=21)
-    parser.add_argument('--shadow_cleanup_ring', type=int, default=7)
-    parser.add_argument('--shadow_cleanup_halo', type=int, default=9)
-    parser.add_argument('--shadow_cleanup_protect', type=int, default=2)
-
     return parser
 
 

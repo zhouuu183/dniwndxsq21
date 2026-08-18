@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="620" viewBox="0 0 1500 620">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#344054"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#568665"/>
+    </marker>
+    <style>
+      .title { font: 700 25px Arial, sans-serif; fill: #17202d; }
+      .head { font: 700 16px Arial, sans-serif; fill: #202939; }
+      .body { font: 14px Arial, sans-serif; fill: #344054; }
+      .small { font: 12px Arial, sans-serif; fill: #475467; }
+      .tiny { font: 10.5px Arial, sans-serif; fill: #667085; }
+      .math { font: italic 700 16px Georgia, serif; fill: #202939; }
+      .flow { fill: none; stroke: #344054; stroke-width: 1.9; marker-end: url(#arrow); }
+      .line { fill: none; stroke: #667085; stroke-width: 1.7; }
+      .greenflow { fill: none; stroke: #568665; stroke-width: 1.9; marker-end: url(#arrowGreen); }
+      .tensor .back { fill: currentColor; fill-opacity: .24; stroke: currentColor; stroke-width: 1.1; }
+      .tensor .mid { fill: currentColor; fill-opacity: .46; stroke: currentColor; stroke-width: 1.1; }
+      .tensor .front { fill: currentColor; fill-opacity: .78; stroke: currentColor; stroke-width: 1.3; }
+      .single { fill-opacity: .30; stroke-width: 1.3; }
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="1484" height="604" rx="8" fill="#fff" stroke="#d6dce5" stroke-width="1.4"/>
+  <text x="750" y="35" text-anchor="middle" class="title">v8 Region-Guided Residual Cleanup</text>
+  <line x1="26" y1="50" x2="1474" y2="50" stroke="#d6dce5" stroke-width="1.1"/>
+
+  <!-- Compact input encoders -->
+  <rect x="30" y="76" width="108" height="54" rx="6" fill="#fff7f6" stroke="#cf6c67" stroke-width="1.3"/>
+  <text x="84" y="99" text-anchor="middle" class="head">Masks</text>
+  <text x="84" y="118" text-anchor="middle" class="tiny">7 ch, 32x32</text>
+  <path d="M138,103 L157,103" class="flow"/>
+  <rect x="164" y="66" width="276" height="74" rx="7" fill="#fff" stroke="#cf6c67" stroke-width="1.3"/>
+  <text x="302" y="91" text-anchor="middle" class="head">Mask Encoder</text>
+  <rect x="187" y="104" width="230" height="24" rx="4" fill="#f7d8d5" stroke="#cf6c67"/>
+  <text x="302" y="120" text-anchor="middle" class="small">3x3 Conv: 7&#8594;32&#8594;32&#8594;64&#8594;64</text>
+  <path d="M440,103 L455,103" class="flow"/>
+  <g class="tensor" style="color:#cf625e">
+    <rect class="back" x="471" y="75" width="29" height="52"/><rect class="mid" x="466" y="80" width="29" height="52"/><rect class="front" x="461" y="85" width="29" height="52"/>
+  </g>
+  <text x="510" y="94" class="math">F<tspan baseline-shift="sub" font-size="9">m</tspan></text>
+  <text x="510" y="112" class="tiny">64 ch</text>
+
+  <rect x="30" y="174" width="108" height="104" rx="6" fill="#f7fbff" stroke="#5b83aa" stroke-width="1.3"/>
+  <text x="84" y="195" text-anchor="middle" class="head">Features</text>
+  <g class="tensor" style="color:#5b83aa">
+    <rect class="back" x="49" y="210" width="19" height="40"/><rect class="mid" x="46" y="213" width="19" height="40"/><rect class="front" x="43" y="216" width="19" height="40"/>
+    <rect class="back" x="84" y="210" width="19" height="40"/><rect class="mid" x="81" y="213" width="19" height="40"/><rect class="front" x="78" y="216" width="19" height="40"/>
+    <rect class="back" x="119" y="210" width="19" height="40"/><rect class="mid" x="116" y="213" width="19" height="40"/><rect class="front" x="113" y="216" width="19" height="40"/>
+  </g>
+  <text x="53" y="270" text-anchor="middle" class="tiny">Fbase</text>
+  <text x="88" y="270" text-anchor="middle" class="tiny">Fsrc</text>
+  <text x="123" y="270" text-anchor="middle" class="tiny">Finp</text>
+  <path d="M138,226 L157,226" class="flow"/>
+  <rect x="164" y="188" width="276" height="76" rx="7" fill="#fff" stroke="#5b83aa" stroke-width="1.3"/>
+  <text x="302" y="214" text-anchor="middle" class="head">Shared Projection</text>
+  <rect x="193" y="228" width="218" height="24" rx="4" fill="#e6eff7" stroke="#5b83aa"/>
+  <text x="302" y="244" text-anchor="middle" class="small">1x1 Conv: 512&#8594;128 | GN + SiLU</text>
+  <path d="M440,226 L453,226" class="flow"/>
+  <g class="tensor" style="color:#4f7fa7">
+    <rect class="back" x="466" y="199" width="22" height="48"/><rect class="mid" x="462" y="203" width="22" height="48"/><rect class="front" x="458" y="207" width="22" height="48"/>
+    <rect class="back" x="497" y="199" width="22" height="48"/><rect class="mid" x="493" y="203" width="22" height="48"/><rect class="front" x="489" y="207" width="22" height="48"/>
+    <rect class="back" x="528" y="199" width="22" height="48"/><rect class="mid" x="524" y="203" width="22" height="48"/><rect class="front" x="520" y="207" width="22" height="48"/>
+  </g>
+  <text x="469" y="270" text-anchor="middle" class="tiny">Pbase</text>
+  <text x="500" y="270" text-anchor="middle" class="tiny">Psrc</text>
+  <text x="531" y="270" text-anchor="middle" class="tiny">Pinp</text>
+
+  <rect x="30" y="331" width="108" height="54" rx="6" fill="#f8fafc" stroke="#68788d" stroke-width="1.3"/>
+  <text x="84" y="354" text-anchor="middle" class="head">Source RGB</text>
+  <text x="84" y="373" text-anchor="middle" class="tiny">3 ch, 32x32</text>
+  <path d="M138,358 L157,358" class="flow"/>
+  <rect x="164" y="316" width="276" height="84" rx="7" fill="#fff" stroke="#68788d" stroke-width="1.3"/>
+  <text x="302" y="341" text-anchor="middle" class="head">Shadow Encoder</text>
+  <text x="302" y="361" text-anchor="middle" class="tiny">Concat [Pbase, Psrc, Pinp, Fm, RGB] = 451 ch</text>
+  <rect x="190" y="369" width="224" height="22" rx="4" fill="#eef2f6" stroke="#68788d"/>
+  <text x="302" y="384" text-anchor="middle" class="small">3x3: 451&#8594;128&#8594;64 | 1x1: 64&#8594;1</text>
+  <path d="M440,358 L458,358" class="greenflow"/>
+  <g style="color:#568665">
+    <polygon points="466,335 474,328 500,328 492,335" fill="currentColor" fill-opacity=".15" stroke="currentColor"/>
+    <rect class="single" x="466" y="335" width="26" height="50" fill="currentColor" stroke="currentColor"/>
+  </g>
+  <text x="510" y="346" class="math">S</text>
+  <text x="510" y="382" class="tiny">Sigmoid, 1 ch</text>
+
+  <!-- Compact context bus -->
+  <path d="M475,137 L475,150 L565,150 M550,226 L565,226 M492,360 L565,360 M565,150 L565,360" class="line"/>
+  <circle cx="565" cy="226" r="20" fill="#fff" stroke="#344054" stroke-width="1.8"/>
+  <text x="565" y="232" text-anchor="middle" class="head">C</text>
+  <path d="M585,226 L628,226" class="flow"/>
+
+  <!-- Core residual head: only detailed network in the figure -->
+  <rect x="610" y="62" width="455" height="346" rx="8" fill="#fffdfb" stroke="#cf8b4e" stroke-width="1.5"/>
+  <text x="838" y="89" text-anchor="middle" class="head">Gated Residual Head &#215;4</text>
+  <text x="838" y="110" text-anchor="middle" class="small">Halo | Tail | Neck | Copy</text>
+
+  <g class="tensor" style="color:#6e7f92">
+    <rect class="back" x="648" y="177" width="40" height="68"/><rect class="mid" x="642" y="183" width="40" height="68"/><rect class="front" x="636" y="189" width="40" height="68"/>
+  </g>
+  <text x="656" y="281" text-anchor="middle" class="math">C<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <text x="656" y="299" text-anchor="middle" class="tiny">321/449 ch</text>
+  <text x="656" y="319" text-anchor="middle" class="tiny">region-specific concat</text>
+
+  <path d="M689,223 L741,223" class="flow"/>
+  <text x="715" y="198" text-anchor="middle" class="small">3x3 Conv</text>
+  <text x="715" y="213" text-anchor="middle" class="tiny">GN + SiLU</text>
+  <g class="tensor" style="color:#d49152">
+    <rect class="back" x="759" y="177" width="43" height="68"/><rect class="mid" x="753" y="183" width="43" height="68"/><rect class="front" x="747" y="189" width="43" height="68"/>
+  </g>
+  <text x="771" y="281" text-anchor="middle" class="head">256</text>
+
+  <path d="M803,223 L844,223" class="flow"/>
+  <text x="824" y="198" text-anchor="middle" class="small">3x3 Conv</text>
+  <text x="824" y="213" text-anchor="middle" class="tiny">GN + SiLU</text>
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="862" y="177" width="43" height="68"/><rect class="mid" x="856" y="183" width="43" height="68"/><rect class="front" x="850" y="189" width="43" height="68"/>
+  </g>
+  <text x="874" y="281" text-anchor="middle" class="head">128</text>
+
+  <path d="M906,223 L926,223 L926,143 L951,143" class="flow"/>
+  <text x="939" y="130" text-anchor="middle" class="tiny">1x1 Conv</text>
+  <g style="color:#568665">
+    <polygon points="959,118 967,111 999,111 991,118" fill="currentColor" fill-opacity=".15" stroke="currentColor"/>
+    <rect class="single" x="959" y="118" width="32" height="50" fill="currentColor" stroke="currentColor"/>
+  </g>
+  <text x="1011" y="138" class="math">G<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <text x="1011" y="156" class="tiny">Sigmoid</text>
+
+  <path d="M906,223 L926,223 L926,323 L951,323" class="flow"/>
+  <text x="939" y="310" text-anchor="middle" class="tiny">1x1 Conv</text>
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="969" y="288" width="39" height="65"/><rect class="mid" x="963" y="294" width="39" height="65"/><rect class="front" x="957" y="300" width="39" height="65"/>
+  </g>
+  <text x="1015" y="322" class="math">&#916;F<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <text x="1015" y="341" class="tiny">512 ch</text>
+  <text x="838" y="389" text-anchor="middle" class="tiny">Shared internal layers; C<tspan baseline-shift="sub" font-size="8">i</tspan> selects each region's inputs</text>
+
+  <!-- Folded second row: fusion and protection -->
+  <path d="M838,408 L838,444" class="flow"/>
+  <text x="850" y="425" class="tiny">G<tspan baseline-shift="sub" font-size="8">i</tspan>, &#916;F<tspan baseline-shift="sub" font-size="8">i</tspan></text>
+  <rect x="640" y="444" width="210" height="108" rx="7" fill="#fff" stroke="#cf8b4e" stroke-width="1.5"/>
+  <text x="745" y="471" text-anchor="middle" class="head">Residual Fusion</text>
+  <text x="745" y="493" text-anchor="middle" class="small">G<tspan baseline-shift="sub" font-size="8">i</tspan>, &#916;F<tspan baseline-shift="sub" font-size="8">i</tspan>, R<tspan baseline-shift="sub" font-size="8">i</tspan> + region priors</text>
+  <text x="745" y="522" text-anchor="middle" class="math">&#916;F<tspan baseline-shift="sub" font-size="9">cleanup</tspan></text>
+  <path d="M850,498 L870,498" class="flow"/>
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="886" y="462" width="37" height="67"/><rect class="mid" x="881" y="467" width="37" height="67"/><rect class="front" x="876" y="472" width="37" height="67"/>
+  </g>
+  <text x="895" y="555" text-anchor="middle" class="tiny">512 ch</text>
+
+  <rect x="940" y="431" width="190" height="134" rx="7" fill="#fff" stroke="#568665" stroke-width="1.5"/>
+  <text x="1035" y="458" text-anchor="middle" class="head">Protect Head</text>
+  <text x="1035" y="480" text-anchor="middle" class="tiny">[Pbase, Psrc, Fm] = 320 ch</text>
+  <rect x="957" y="493" width="156" height="24" rx="4" fill="#dcebe0" stroke="#568665"/>
+  <text x="1035" y="509" text-anchor="middle" class="tiny">3x3: 320&#8594;128&#8594;64 | 1x1: 64&#8594;1</text>
+  <text x="1035" y="536" text-anchor="middle" class="tiny">G<tspan baseline-shift="sub" font-size="8">p</tspan> = Sigmoid(.)</text>
+  <text x="1035" y="553" text-anchor="middle" class="tiny">P = clamp(G<tspan baseline-shift="sub" font-size="8">p</tspan> &#8857; R<tspan baseline-shift="sub" font-size="8">p</tspan>)</text>
+  <path d="M1130,498 L1143,498" class="greenflow"/>
+  <g style="color:#568665">
+    <polygon points="1151,472 1159,465 1185,465 1177,472" fill="currentColor" fill-opacity=".15" stroke="currentColor"/>
+    <rect class="single" x="1151" y="472" width="26" height="52" fill="currentColor" stroke="currentColor"/>
+  </g>
+  <text x="1164" y="544" text-anchor="middle" class="math">P</text>
+
+  <!-- Final gated update -->
+  <path d="M923,498 L923,418 L1221,418 L1221,468" class="flow"/>
+  <path d="M1185,498 L1211,498" class="greenflow"/>
+  <text x="1198" y="530" text-anchor="middle" class="math">1-0.85P</text>
+  <circle cx="1233" cy="490" r="22" fill="#fff" stroke="#568665" stroke-width="1.8"/>
+  <text x="1233" y="498" text-anchor="middle" font-family="Arial" font-size="23" font-weight="700" fill="#344054">&#215;</text>
+  <path d="M1255,490 L1280,490" class="flow"/>
+  <circle cx="1302" cy="490" r="22" fill="#fff" stroke="#344054" stroke-width="1.8"/>
+  <text x="1302" y="499" text-anchor="middle" font-family="Arial" font-size="25" font-weight="700" fill="#344054">+</text>
+  <path d="M1324,490 L1350,490" class="greenflow"/>
+  <g class="tensor" style="color:#568665">
+    <rect class="back" x="1368" y="449" width="39" height="72"/><rect class="mid" x="1362" y="455" width="39" height="72"/><rect class="front" x="1356" y="461" width="39" height="72"/>
+  </g>
+  <text x="1376" y="555" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="9">clean</tspan></text>
+
+  <!-- Base-feature skip -->
+  <path d="M43,256 L20,256 L20,587 L1302,587 L1302,512" class="flow"/>
+  <text x="560" y="579" text-anchor="end" class="small">Fbase skip</text>
+</svg>

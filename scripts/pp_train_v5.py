@@ -1,6 +1,7 @@
 import argparse
 import faulthandler
 import gc
+import json
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import random
@@ -29,6 +30,9 @@ from utils.train import WandbLogger, _LegacyUnpickler, get_fid_calc, image_grid,
 faulthandler.enable(all_threads=True)
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
+# Must match ``scripts/pp_gen_v5.py``.  Schema 18 separates the complete,
+# source-safe PP learning target from the strict source-RGB instance contract.
+PP_DATASET_SCHEMA_VERSION = 18
 PP_EXTRA_MASK_KEYS = (
     "cleanup_inner_edge",
     "revealed_skin_mask",
@@ -37,6 +41,9 @@ PP_EXTRA_MASK_KEYS = (
     "source_visible_skin_reference_mask",
     "source_skin_valid_mask",
     "earring_confident_mask",
+    "earring_instance_mask",
+    "hoop_instance_mask",
+    "hoop_hole_mask",
     "earring_highlight_mask",
     "earring_candidate_mask",
 )
@@ -66,13 +73,13 @@ VAL_COLUMNS = (
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.9")
-USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long")
-USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_mix"
+USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_instance_v18_foreground_learning")
+USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long_instance_v18_foreground_learning")
+USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_instance_v18_foreground_learning"
 
-USER_DATASET_DIR_FULL = Path("images/pp_dataset_v5_dual_full")
-USER_OUTPUT_DIR_FULL = Path("output/pp_v5_checkpoints_full")
-USER_RUN_NAME_FULL = "ear_refine_v5_dual_full"
+USER_DATASET_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v18_foreground_learning")
+USER_OUTPUT_DIR_FULL = Path("output/pp_v5_checkpoints_full_instance_v18_foreground_learning")
+USER_RUN_NAME_FULL = "ear_refine_v5_dual_full_instance_v18_foreground_learning"
 
 USER_FID_DATASET = "fid_images"
 USER_USE_FID = False
@@ -85,6 +92,9 @@ USER_NUM_WORKERS = 0
 USER_EPOCHS = 120
 USER_VAL_SIZE = 512
 USER_VAL_PREVIEW_COUNT = 50
+# Filling a small validation split with training samples runs extra full
+# inference passes, but does not contribute to validation loss or training.
+USER_VAL_SUPPLEMENT_TRAIN_PREVIEWS = False
 USER_GRAD_ACCUM_STEPS = 2
 
 USER_TRAINING_STAGE = "joint_highres"  # "ear_only", "joint_highres", or "full"
@@ -140,10 +150,16 @@ USER_EARRING_WRITE_CONNECTIVITY_ITERS = 32
 USER_EARRING_WRITE_CONNECTIVITY_KERNEL = 5
 USER_EARRING_WRITE_BRIDGE_DILATE = 17
 USER_EARRING_ANCHOR_VISIBLE_DILATE = 3
-USER_EARRING_ALIGN_MAX_SHIFT = 12
+# Training data uses the same fixed source-face coordinate system as inference.
+# A non-zero parser-centroid shift teaches duplicate/offset accessories.
+USER_EARRING_ALIGN_MAX_SHIFT = 0
 USER_EAR_FINE_SUPPORT_DILATE = 3
 USER_EARRING_FINE_MASK_FLOOR = 0.18
 USER_EARRING_FINE_MASK_DILATE = 5
+# When the native source-instance extractor rejects an uncertain edge, let the
+# trained PP branch fill only the already verified low-resolution object mask.
+# Direct source RGB still wins wherever a native instance is available.
+USER_EARRING_LEARNED_FALLBACK_ALPHA = 0.0
 USER_EARRING_LOBE_SUPPORT_SOURCE_WEIGHT = 0.0
 USER_EARRING_LOBE_SUPPORT_FINE_WEIGHT = 0.0
 USER_TARGET_HAIR_EAR_PROTECT_DILATE = 3
@@ -179,8 +195,9 @@ USER_OUTPUT_FACE_HAIR_SEAM_PRESERVE_DILATE = 7
 USER_OUTPUT_REVEALED_SKIN_PRESERVE_DILATE = 3
 USER_OUTPUT_EARRING_KEEP_DILATE = 0
 USER_OUTPUT_PRESERVE_BLUR = 1
-# Problem 3: soften the hairline hand-off (0 keeps the old hard edge).
-USER_OUTPUT_HAIRLINE_FEATHER = 9
+# Preserve the target hairline as a single authority.  Blending it with the
+# PP output makes a visible colour ring when their illumination differs.
+USER_OUTPUT_HAIRLINE_FEATHER = 0
 # Source content gate: prevent source background/neck from bleeding into the
 # target when the source has short hair or exposed ears (the v58 ear ROI is
 # geometric and can cover source background).  Restricts source-sampling to real
@@ -196,7 +213,7 @@ USER_SOURCE_CONTENT_GATE_DILATE = 3
 # runs at INFERENCE, so it degrades even the current checkpoint and is the source
 # of the airbrushed look and the seam against the real skin.  Disabled so the
 # revealed forehead keeps the generator's source-like texture like v58.
-USER_ENABLE_REVEALED_SKIN_HARMONIZE = True
+USER_ENABLE_REVEALED_SKIN_HARMONIZE = False
 USER_REVEALED_SKIN_HARMONIZE_STRENGTH = 0.9
 USER_REVEALED_SKIN_TONE_KERNEL = 15
 USER_REVEALED_SKIN_TONE_SIGMA = 7.0
@@ -249,8 +266,11 @@ USER_EARRING_MIN_REFINED_OBJECT_AREA = 2.0
 USER_ALLOW_VISUAL_EARRING_SEED = False
 USER_VISUAL_EARRING_SEED_MIN_AREA = 6.0
 USER_VISUAL_EARRING_SEED_MAX_DENSITY = 0.12
-USER_PREFER_DATASET_EARRING_REFERENCE = False
-USER_USE_DATASET_EARRING_AUX = False
+# Only contour-verified hollow hoops use the precise dataset alpha/hole.  The
+# established ordinary-earring PP path remains responsible for studs, solid
+# pendants and other non-hollow accessories.
+USER_PREFER_DATASET_EARRING_REFERENCE = True
+USER_USE_DATASET_EARRING_AUX = True
 USER_EXPAND_DATASET_EARRING_FROM_REFERENCE_DELTA = False
 USER_EARRING_VISIBLE_ROI_EXCLUDE_TARGET_HAIR = False
 USER_REFRESH_EARRING_REFERENCE = False
@@ -273,9 +293,11 @@ USER_LAMBDA_DETAIL_HIGH = 0.0
 USER_LAMBDA_DETAIL_LOW_ANCHOR = 1.5
 # Revealed skin is constrained only against neighbouring target/PP skin; the
 # loss implementation no longer copies source bang-hidden RGB/texture.
-USER_LAMBDA_REVEALED_SKIN_TEXTURE = 1.0
-USER_LAMBDA_REVEALED_SKIN_TONE = 2.0
-USER_LAMBDA_NORMAL_FACE_PRESERVE = 2.0
+# PP owns ordinary face pixels.  Do not pull them back toward smooth SATD
+# target pixels or impose a low-frequency forehead tone anchor.
+USER_LAMBDA_REVEALED_SKIN_TEXTURE = 0.0
+USER_LAMBDA_REVEALED_SKIN_TONE = 0.0
+USER_LAMBDA_NORMAL_FACE_PRESERVE = 0.0
 USER_LAMBDA_FACE_SOURCE_DARK_REJECT = 2.0
 USER_FACE_SOURCE_DARK_REJECT_MARGIN = 0.006
 USER_FACE_SOURCE_DARK_REJECT_SOURCE_THRESHOLD = 0.018
@@ -298,6 +320,7 @@ USER_LAMBDA_TARGET_EAR_GEOMETRY = 5.0
 USER_LAMBDA_NO_EARRING_NOOP = 6.0
 USER_LAMBDA_HOOP_HOLE_PRESERVE = 8.0
 USER_LAMBDA_EARRING_OBJECT_RESTORE = 3.0
+USER_LAMBDA_EARRING_FOREGROUND_RESTORE = 6.0
 USER_USE_DATASET_QUERY_MASK = False
 USER_USE_DATASET_SOURCE_EARRING_MASK = True
 USER_POSITIVE_ONLY_WARMUP_EPOCHS = 20
@@ -347,6 +370,7 @@ RESOLVED_USER_CONFIG = {
     "epochs": USER_EPOCHS,
     "test_size": USER_VAL_SIZE,
     "val_preview_count": USER_VAL_PREVIEW_COUNT,
+    "val_supplement_train_previews": USER_VAL_SUPPLEMENT_TRAIN_PREVIEWS,
     "compute_fid": USER_USE_FID,
     "use_wandb": USER_USE_WANDB,
     "checkpoint_dir": ACTIVE_OUTPUT_DIR,
@@ -406,6 +430,7 @@ RESOLVED_USER_CONFIG = {
     "ear_fine_support_dilate": USER_EAR_FINE_SUPPORT_DILATE,
     "earring_fine_mask_floor": USER_EARRING_FINE_MASK_FLOOR,
     "earring_fine_mask_dilate": USER_EARRING_FINE_MASK_DILATE,
+    "earring_learned_fallback_alpha": USER_EARRING_LEARNED_FALLBACK_ALPHA,
     "earring_lobe_support_source_weight": USER_EARRING_LOBE_SUPPORT_SOURCE_WEIGHT,
     "earring_lobe_support_fine_weight": USER_EARRING_LOBE_SUPPORT_FINE_WEIGHT,
     "target_hair_ear_protect_dilate": USER_TARGET_HAIR_EAR_PROTECT_DILATE,
@@ -528,6 +553,7 @@ RESOLVED_USER_CONFIG = {
     "no_earring_noop": USER_LAMBDA_NO_EARRING_NOOP,
     "hoop_hole_preserve": USER_LAMBDA_HOOP_HOLE_PRESERVE,
     "earring_object_restore": USER_LAMBDA_EARRING_OBJECT_RESTORE,
+    "earring_foreground_restore": USER_LAMBDA_EARRING_FOREGROUND_RESTORE,
     "use_dataset_query_mask": USER_USE_DATASET_QUERY_MASK,
     "use_dataset_source_earring_mask": USER_USE_DATASET_SOURCE_EARRING_MASK,
     "positive_only_warmup_epochs": USER_POSITIVE_ONLY_WARMUP_EPOCHS,
@@ -567,6 +593,11 @@ def build_parser(defaults):
     parser.add_argument("--epochs", type=int, default=defaults["epochs"])
     parser.add_argument("--test_size", type=int, default=defaults["test_size"])
     parser.add_argument("--val_preview_count", type=int, default=defaults["val_preview_count"])
+    parser.add_argument(
+        "--val_supplement_train_previews",
+        type=str2bool,
+        default=defaults["val_supplement_train_previews"],
+    )
     parser.add_argument("--compute_fid", type=str2bool, default=defaults["compute_fid"])
     parser.add_argument("--use_wandb", type=str2bool, default=defaults["use_wandb"])
     parser.add_argument("--checkpoint_dir", type=Path, default=defaults["checkpoint_dir"])
@@ -626,6 +657,7 @@ def build_parser(defaults):
     parser.add_argument("--ear_fine_support_dilate", type=int, default=defaults["ear_fine_support_dilate"])
     parser.add_argument("--earring_fine_mask_floor", type=float, default=defaults["earring_fine_mask_floor"])
     parser.add_argument("--earring_fine_mask_dilate", type=int, default=defaults["earring_fine_mask_dilate"])
+    parser.add_argument("--earring_learned_fallback_alpha", type=float, default=defaults["earring_learned_fallback_alpha"])
     parser.add_argument("--earring_lobe_support_source_weight", type=float, default=defaults["earring_lobe_support_source_weight"])
     parser.add_argument("--earring_lobe_support_fine_weight", type=float, default=defaults["earring_lobe_support_fine_weight"])
     parser.add_argument("--target_hair_ear_protect_dilate", type=int, default=defaults["target_hair_ear_protect_dilate"])
@@ -756,6 +788,11 @@ def build_parser(defaults):
     parser.add_argument("--no_earring_noop", type=float, default=defaults["no_earring_noop"])
     parser.add_argument("--hoop_hole_preserve", type=float, default=defaults["hoop_hole_preserve"])
     parser.add_argument("--earring_object_restore", type=float, default=defaults["earring_object_restore"])
+    parser.add_argument(
+        "--earring_foreground_restore",
+        type=float,
+        default=defaults["earring_foreground_restore"],
+    )
     parser.add_argument("--use_dataset_query_mask", type=str2bool, default=defaults["use_dataset_query_mask"])
     parser.add_argument(
         "--use_dataset_source_earring_mask",
@@ -939,6 +976,7 @@ class TrainerV5:
                 "no_earring_noop": args.no_earring_noop,
                 "hoop_hole_preserve": args.hoop_hole_preserve,
                 "earring_object_restore": args.earring_object_restore,
+                "earring_foreground_restore": args.earring_foreground_restore,
             }
             self.loss_builder = EarAwareLossBuilder(loss_weights, device=self.device)
             if args.compute_fid:
@@ -967,7 +1005,7 @@ class TrainerV5:
             self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         self.cur_iter = checkpoint.get("cur_iter", self.cur_iter)
 
-    def save_validation_images(self, files, epoch_tag):
+    def save_validation_images(self, files, epoch_tag, highres_files=None):
         if not files:
             return
 
@@ -975,12 +1013,21 @@ class TrainerV5:
         vis_dir.mkdir(parents=True, exist_ok=True)
         for old_preview in vis_dir.glob("val_*.png"):
             old_preview.unlink()
+        for old_preview in vis_dir.glob("final_highres_*.png"):
+            old_preview.unlink()
         with open(vis_dir / "columns.txt", "w", encoding="utf-8") as file:
             file.write(" | ".join(VAL_COLUMNS) + "\n")
 
         for order, preview_row in enumerate(files):
             image = image_grid(list(map(T.functional.to_pil_image, preview_row)), 1, len(preview_row))
             image.save(vis_dir / f"val_{order:03d}.png")
+        # The six-column validation sheet is intentionally 256px per sample.
+        # Keep the final native-resolution output beside it so a thin stud or
+        # wire is never judged from a downsampled thumbnail.
+        for order, image in enumerate(highres_files or []):
+            T.functional.to_pil_image(image).save(
+                vis_dir / f"final_highres_{order:03d}.png"
+            )
 
     @staticmethod
     def update_preview_buffer(buffer, sample, seen_count, max_count):
@@ -1062,7 +1109,19 @@ class TrainerV5:
         HT_E = batch["HT_E"]
         use_dataset_earring_aux = bool(getattr(self.args, "use_dataset_earring_aux", False))
         prefer_dataset_earring_reference = bool(getattr(self.args, "prefer_dataset_earring_reference", False))
-        earring_confident_mask = batch.get("earring_confident_mask") if use_dataset_earring_aux else None
+        # ``earring_instance_mask`` is the complete ordinary-or-hoop accessory
+        # label.  ``hoop_instance_mask`` is topology metadata only.  Reading
+        # the latter here trained every ordinary earring as an all-zero
+        # no-earring sample because schema-v5 stores a zero hoop tensor for
+        # every item.
+        dataset_instance_mask = batch.get("earring_learning_mask") if use_dataset_earring_aux else None
+        dataset_hole_mask = batch.get("earring_learning_hole_mask") if use_dataset_earring_aux else None
+        dataset_instance_gate = batch.get("has_earring_learning_mask") if use_dataset_earring_aux else None
+        earring_confident_mask = (
+            dataset_instance_mask
+            if torch.is_tensor(dataset_instance_mask)
+            else (batch.get("earring_confident_mask") if use_dataset_earring_aux else None)
+        )
         earring_highlight_mask = batch.get("earring_highlight_mask") if use_dataset_earring_aux else None
         if use_dataset_earring_aux:
             highlight_gate = batch.get("has_earring_highlight_mask")
@@ -1070,17 +1129,16 @@ class TrainerV5:
                 use_dataset_highlight = bool((highlight_gate.float() > 0.5).all().item())
                 if not use_dataset_highlight:
                     earring_highlight_mask = None
-        earring_reference = batch.get("earring_reference") if prefer_dataset_earring_reference else None
-        source_ear_mask = (
-            batch["source_earring_mask"]
-            if bool(getattr(self.args, "use_dataset_source_earring_mask", False))
-            else None
-        )
-        source_earring_object_mask = (
-            batch.get("source_earring_object_mask")
-            if bool(getattr(self.args, "use_dataset_source_earring_mask", False))
-            else None
-        )
+        earring_reference = batch.get("earring_learning_reference") if prefer_dataset_earring_reference else None
+        use_dataset_source_mask = bool(getattr(self.args, "use_dataset_source_earring_mask", False))
+        source_ear_mask = batch["source_earring_mask"] if use_dataset_source_mask else None
+        source_earring_object_mask = batch.get("source_earring_object_mask") if use_dataset_source_mask else None
+        if torch.is_tensor(dataset_instance_mask):
+            # The instance is narrower than the historical source_earring_mask:
+            # it contains only source accessory pixels, never its surrounding
+            # hair/background or the inner area of a hoop.
+            source_ear_mask = dataset_instance_mask
+            source_earring_object_mask = dataset_instance_mask
         cleanup_masks = {key: batch[key] for key in CLEANUP_MASK_KEYS}
 
         latent_s, latent_f, aux = self.model(
@@ -1100,8 +1158,9 @@ class TrainerV5:
             earring_supervision_mask=earring_confident_mask,
             earring_highlight_mask=earring_highlight_mask,
             earring_reference=earring_reference,
-            earring_mask_is_dataset=batch.get("has_earring_confident_mask") if use_dataset_earring_aux else None,
-            earring_reference_is_dataset=batch.get("has_earring_reference") if prefer_dataset_earring_reference else None,
+            earring_mask_is_dataset=dataset_instance_gate,
+            earring_reference_is_dataset=batch.get("has_earring_learning_reference") if prefer_dataset_earring_reference else None,
+            hoop_hole_mask=dataset_hole_mask,
             cleanup_masks=cleanup_masks,
             revealed_skin_mask=batch.get("revealed_skin_mask"),
             revealed_skin_seam_mask=batch.get("revealed_skin_seam_mask"),
@@ -1110,6 +1169,34 @@ class TrainerV5:
         )
         for key in CLEANUP_MASK_KEYS:
             aux[key] = batch[key]
+        if torch.is_tensor(dataset_instance_mask) and torch.is_tensor(dataset_instance_gate):
+            instance_gate = dataset_instance_gate.float().view(-1, 1, 1, 1) > 0.5
+            aux["earring_instance_is_dataset"] = instance_gate.float()
+            exact_instance = dataset_instance_mask.clamp(0, 1)
+            exact_hole = (
+                torch.zeros_like(exact_instance)
+                if dataset_hole_mask is None
+                else dataset_hole_mask.clamp(0, 1)
+            )
+            exact_instance = exact_instance * (1.0 - exact_hole).clamp(0, 1)
+            exact_no_earring = (
+                exact_instance.flatten(1).sum(dim=1, keepdim=True) < 1.0
+            ).to(exact_instance.dtype).view(-1, 1, 1, 1).expand_as(exact_instance)
+
+            def prefer_exact(name, value):
+                current = aux.get(name)
+                aux[name] = value if current is None else torch.where(instance_gate, value, current)
+
+            # Losses must see precisely the same object topology saved by
+            # pp_gen_v5.  In particular, a zero instance is an intentional
+            # no-earring example, not a signal to fall back to online recall.
+            prefer_exact("source_earring_mask", exact_instance)
+            prefer_exact("source_earring_object_mask", exact_instance)
+            prefer_exact("earring_confident_mask", exact_instance)
+            prefer_exact("earring_write_mask", exact_instance)
+            prefer_exact("hoop_hole_mask", exact_hole)
+            prefer_exact("no_earring_case_mask", exact_no_earring)
+            prefer_exact("no_earring_case", exact_no_earring)
         dataset_mask_gate = batch.get("has_earring_confident_mask")
         if torch.is_tensor(dataset_mask_gate):
             dataset_mask_gate = dataset_mask_gate.float().view(-1, 1, 1, 1) > 0.5
@@ -1239,9 +1326,12 @@ class TrainerV5:
 
     @torch.no_grad()
     def validate(self, epoch_tag="initial"):
+        # Losses and test-set previews always use the validation loader.  The
+        # optional train loader only provides extra images for inspection.
         self.model.to(self.device).eval()
         val_losses = {}
         preview_files = []
+        highres_preview_files = []
         preview_count = max(0, int(getattr(self.args, "val_preview_count", 20)))
         preview_seen = 0
         to_299 = T.Resize((299, 299))
@@ -1279,6 +1369,10 @@ class TrainerV5:
                     preview_seen,
                     preview_count,
                 )
+                if len(highres_preview_files) < preview_count:
+                    highres_preview_files.append(
+                        ((gen_im_F[idx] + 1) / 2).detach().cpu().clamp(0, 1)
+                    )
 
             del source, target, target_mask, HT_E, gen_im_W, F_w, gen_im_F, latent_f, aux
             del gen_w_256, gen_f_256
@@ -1289,7 +1383,11 @@ class TrainerV5:
         # Training samples below only supplement the user-facing preview images.
         missing_preview_count = preview_count - len(preview_files)
         train_preview_files = []
-        if missing_preview_count > 0 and self.train_preview_dataloader is not None:
+        if (
+            bool(getattr(self.args, "val_supplement_train_previews", False))
+            and missing_preview_count > 0
+            and self.train_preview_dataloader is not None
+        ):
             for batch in tqdm(self.train_preview_dataloader, desc="Supplement train previews", leave=False):
                 source, target, target_mask, HT_E, gen_im_W, F_w, gen_im_F, latent_f, aux, batch = self._run_model(batch)
                 gen_w_256 = self.downsample_256((gen_im_W + 1) / 2).clip(0, 1)
@@ -1356,7 +1454,11 @@ class TrainerV5:
             self.logger.log_scalars({f"val {key}": value})
 
         if preview_files:
-            self.save_validation_images(preview_files, epoch_tag)
+            self.save_validation_images(
+                preview_files,
+                epoch_tag,
+                highres_files=highres_preview_files,
+            )
             images_to_log = [
                 image_grid(list(map(T.functional.to_pil_image, preview_row)), 1, len(preview_row))
                 for preview_row in preview_files
@@ -1471,11 +1573,12 @@ class PPDatasetV5(Dataset):
         if self.is_test or random.random() <= 0.5:
             return sample
 
-        keys_to_flip = ["source", "shape_reference", "color_reference", "target", "earring_reference", "target_mask", "HT_E", "source_hair_mask", "target_hair_mask",
+        keys_to_flip = ["source", "shape_reference", "color_reference", "target", "earring_reference", "earring_learning_reference", "target_mask", "HT_E", "source_hair_mask", "target_hair_mask",
                         "source_earring_mask", "target_earring_mask", "query_mask", "ear_roi",
                         "visible_ear_roi", "earring_valid_roi", "target_covered_ear_block_mask",
                         "source_hair_block_mask", "source_earring_object_mask", "source_earring_seed_mask",
-                        "earring_search_mask", *CLEANUP_MASK_KEYS, *PP_EXTRA_MASK_KEYS]
+                        "earring_search_mask", "earring_learning_mask", "earring_learning_hole_mask",
+                        *CLEANUP_MASK_KEYS, *PP_EXTRA_MASK_KEYS]
         for key in keys_to_flip:
             if key in sample:
                 sample[key] = T.functional.hflip(sample[key])
@@ -1511,6 +1614,24 @@ class PPDatasetV5(Dataset):
             ),
             "source_earring_mask": item["source_earring_mask"].clone(),
             "source_earring_object_mask": item.get("source_earring_object_mask", item["source_earring_mask"]).clone(),
+            "earring_instance_mask": item.get(
+                "earring_instance_mask",
+                item.get("earring_confident_mask", item["source_earring_mask"]),
+            ).clone(),
+            "earring_learning_mask": item.get(
+                "earring_learning_mask",
+                item.get("earring_write_mask", item["source_earring_mask"]),
+            ).clone(),
+            "earring_learning_hole_mask": item.get(
+                "earring_learning_hole_mask",
+                item.get("hoop_hole_mask", torch.zeros_like(fallback_mask)),
+            ).clone(),
+            "earring_learning_reference": item.get(
+                "earring_learning_reference",
+                item.get("earring_reference", item["target"]),
+            ).clone(),
+            "hoop_instance_mask": item.get("hoop_instance_mask", torch.zeros_like(fallback_mask)).clone(),
+            "hoop_hole_mask": item.get("hoop_hole_mask", torch.zeros_like(fallback_mask)).clone(),
             "source_earring_seed_mask": item.get("source_earring_seed_mask", item["source_earring_mask"]).clone(),
             "target_earring_mask": item["target_earring_mask"].clone(),
             "query_mask": item["query_mask"].clone(),
@@ -1538,6 +1659,34 @@ class PPDatasetV5(Dataset):
                 1.0 if item_has_nonempty_mask(item, mask_key) else 0.0,
                 dtype=torch.float32,
             )
+        # Unlike the older confidence flag, these flags mean that the field is
+        # present in the dataset schema, even when the alpha is deliberately
+        # all-zero for a no-earring sample.  That distinction prevents online
+        # recall from inventing an accessory during supervision.
+        sample["has_earring_instance_mask"] = torch.tensor(
+            1.0 if torch.is_tensor(item.get("earring_instance_mask")) else 0.0,
+            dtype=torch.float32,
+        )
+        sample["has_earring_learning_mask"] = torch.tensor(
+            1.0 if torch.is_tensor(item.get("earring_learning_mask")) else 0.0,
+            dtype=torch.float32,
+        )
+        sample["has_earring_learning_reference"] = torch.tensor(
+            1.0 if torch.is_tensor(item.get("earring_learning_reference")) else 0.0,
+            dtype=torch.float32,
+        )
+        # Unlike the all-earring schema flag above, a hoop flag means that this
+        # sample actually contains a hollow topology.  Every sample stores a
+        # zero tensor for collation, so field presence would incorrectly turn
+        # ordinary earrings into hoop examples.
+        sample["has_hoop_instance_mask"] = torch.tensor(
+            1.0 if item_has_nonempty_mask(item, "hoop_instance_mask") else 0.0,
+            dtype=torch.float32,
+        )
+        sample["has_hoop_hole_mask"] = torch.tensor(
+            1.0 if item_has_nonempty_mask(item, "hoop_hole_mask") else 0.0,
+            dtype=torch.float32,
+        )
         if self.include_preview_references:
             embedded_shape = item.get("shape_reference")
             embedded_color = item.get("color_reference")
@@ -1564,6 +1713,23 @@ class PPDatasetV5(Dataset):
 
 
 def build_dataset_index(dataset_dir: Path, query_area_threshold: float):
+    config_path = dataset_dir / "dataset_config.json"
+    if not config_path.is_file():
+        raise RuntimeError(
+            f"PP dataset metadata is missing: {config_path}. Regenerate the complete V5 dataset."
+        )
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            schema_version = json.load(handle).get("schema_version")
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Cannot read PP dataset metadata: {config_path}. Regenerate the complete V5 dataset."
+        ) from error
+    if schema_version != PP_DATASET_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"PP dataset schema {schema_version!r} is incompatible with V5 instance supervision "
+            f"schema {PP_DATASET_SCHEMA_VERSION}. Regenerate the complete dataset in a fresh directory."
+        )
     files = sorted(dataset_dir.glob("pp_part_*.dataset"))
     if not files:
         raise FileNotFoundError(f"No pp_part_*.dataset files were found under {dataset_dir}")
@@ -1603,7 +1769,12 @@ def item_visible_earring_area(item) -> float:
         return 0.0
     visible = visible.float()
     area = 0.0
-    for key in ("source_earring_object_mask", "source_earring_mask", "earring_confident_mask"):
+    for key in (
+        "source_earring_object_mask",
+        "source_earring_mask",
+        "earring_confident_mask",
+        "earring_learning_mask",
+    ):
         value = item.get(key)
         if torch.is_tensor(value):
             area = max(area, float((value.float() * visible).sum().item()))
@@ -1614,6 +1785,7 @@ def is_positive_hint(item, query_area_threshold: float) -> bool:
     has_earring_seed = bool(
         item["source_earring_mask"].sum().item() > 0
         or item_has_nonempty_mask(item, "source_earring_object_mask")
+        or item_has_nonempty_mask(item, "earring_learning_mask")
         or item["target_earring_mask"].sum().item() > 0
         or item_has_nonempty_mask(item, "earring_confident_mask")
         or item_has_nonempty_mask(item, "earring_highlight_mask")
@@ -1739,7 +1911,11 @@ def main(args):
         **build_dataloader_kwargs(args, shuffle=False, drop_last=False),
     )
     train_preview_dataloader = None
-    if max(0, int(args.val_preview_count)) > len(test_dataset) and len(train_indices) > 0:
+    if (
+        bool(args.val_supplement_train_previews)
+        and max(0, int(args.val_preview_count)) > len(test_dataset)
+        and len(train_indices) > 0
+    ):
         train_preview_dataset = PPDatasetV5(
             dataset_index,
             train_indices,

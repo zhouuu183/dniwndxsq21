@@ -114,6 +114,20 @@ def get_parser_v8():
     parser.add_argument("--satd_blend_v8", type=float, default=0.28)
     parser.add_argument("--satd_boundary_v8", type=int, default=8)
     parser.add_argument("--eq8_reference_blend_v8", type=float, default=0.0)
+    parser.add_argument("--v8_color_completion", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--v8_color_target_progress", type=float, default=0.88)
+    parser.add_argument("--v8_color_chroma_gain", type=float, default=0.75)
+    parser.add_argument("--v8_color_luma_gain", type=float, default=0.20)
+    parser.add_argument("--v8_color_max_chroma_shift", type=float, default=0.075)
+    parser.add_argument("--v8_color_max_luma_shift", type=float, default=0.035)
+    parser.add_argument("--v8_color_vivid_boost", type=float, default=1.0)
+    parser.add_argument("--v8_color_highlight_chroma_gain", type=float, default=0.85)
+    parser.add_argument("--v8_color_highlight_luma_gain", type=float, default=0.35)
+    parser.add_argument("--v8_color_global_palette_lock", type=float, default=0.95)
+    parser.add_argument("--v8_color_texture_preserve", type=float, default=0.35)
+    parser.add_argument("--v8_color_edge_width", type=int, default=3)
+    parser.add_argument("--v8_pp_hair_guard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--v8_save_color_debug", action="store_true")
     return parser
 
 

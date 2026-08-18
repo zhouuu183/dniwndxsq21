@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="430" viewBox="0 0 1080 430">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L10,4 L0,8 Z" fill="#344054"/></marker>
+    <style>
+      .title { font: 700 25px Arial, sans-serif; fill: #17202d; }
+      .head { font: 700 16px Arial, sans-serif; fill: #202939; }
+      .body { font: 14px Arial, sans-serif; fill: #344054; }
+      .small { font: 12px Arial, sans-serif; fill: #667085; }
+      .math { font: italic 700 17px Georgia, serif; fill: #202939; }
+      .flow { fill:none; stroke:#344054; stroke-width:2; marker-end:url(#arrow); }
+      .dash { fill:none; stroke:#98a2b3; stroke-width:1.3; stroke-dasharray:6 5; }
+      .tensor .back { fill:currentColor; fill-opacity:.22; stroke:currentColor; stroke-width:1.1; }
+      .tensor .mid { fill:currentColor; fill-opacity:.45; stroke:currentColor; stroke-width:1.1; }
+      .tensor .front { fill:currentColor; fill-opacity:.78; stroke:currentColor; stroke-width:1.3; }
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="1064" height="414" rx="9" fill="#fff" stroke="#d6dce5" stroke-width="1.5"/>
+  <text x="540" y="36" text-anchor="middle" class="title">Feature Encoding</text>
+  <text x="540" y="57" text-anchor="middle" class="small">Encode face details and hair structure into the aligned StyleGAN2 feature</text>
+
+  <!-- Inputs -->
+  <rect x="34" y="91" width="185" height="72" rx="7" fill="#fff8f6" stroke="#cf6c67" stroke-width="1.4"/>
+  <text x="126" y="119" text-anchor="middle" class="head">Face Detail Regions</text>
+  <text x="126" y="142" text-anchor="middle" class="body">Eyes · Skin · Lips</text>
+  <rect x="34" y="260" width="185" height="72" rx="7" fill="#f7fbff" stroke="#5b83aa" stroke-width="1.4"/>
+  <text x="126" y="288" text-anchor="middle" class="head">Target Hair Region</text>
+  <text x="126" y="311" text-anchor="middle" class="body">shape / texture source</text>
+
+  <!-- Shared feature encoder -->
+  <rect x="258" y="83" width="240" height="270" rx="8" class="dash"/>
+  <text x="378" y="109" text-anchor="middle" class="head">Shared Feature Encoder</text>
+  <text x="378" y="130" text-anchor="middle" class="small">same encoder, two feature streams</text>
+  <path d="M219,127 L258,127" class="flow"/>
+  <path d="M219,296 L258,296" class="flow"/>
+  <rect x="290" y="153" width="176" height="48" rx="5" fill="#f8fafc" stroke="#7d899a"/>
+  <text x="378" y="174" text-anchor="middle" class="body">Encoder Backbone</text>
+  <text x="378" y="191" text-anchor="middle" class="small">feature extraction</text>
+  <path d="M378,201 L378,226" class="flow"/>
+  <g class="tensor" style="color:#cf625e">
+    <rect class="back" x="296" y="235" width="28" height="55"/><rect class="mid" x="291" y="240" width="28" height="55"/><rect class="front" x="286" y="245" width="28" height="55"/>
+  </g>
+  <text x="335" y="267" class="math">F<tspan baseline-shift="sub" font-size="9">face</tspan></text>
+  <text x="335" y="286" class="small">face feature</text>
+  <g class="tensor" style="color:#5b83aa">
+    <rect class="back" x="394" y="235" width="28" height="55"/><rect class="mid" x="389" y="240" width="28" height="55"/><rect class="front" x="384" y="245" width="28" height="55"/>
+  </g>
+  <text x="432" y="267" class="math">F<tspan baseline-shift="sub" font-size="9">hair</tspan></text>
+  <text x="432" y="286" class="small">hair feature</text>
+  <path d="M350,226 L350,216 L325,216 L325,235" class="flow"/>
+  <path d="M406,216 L406,235" class="flow"/>
+
+  <!-- Mask-guided merge -->
+  <path d="M314,273 L533,273" class="flow"/>
+  <path d="M412,273 L533,273" class="flow"/>
+  <rect x="528" y="154" width="205" height="190" rx="8" fill="#fff" stroke="#5b83aa" stroke-width="1.5"/>
+  <text x="630" y="181" text-anchor="middle" class="head">Mask-Guided Merge</text>
+  <text x="630" y="205" text-anchor="middle" class="small">select face and hair regions</text>
+  <rect x="558" y="224" width="145" height="34" rx="4" fill="#e7eff7" stroke="#5b83aa"/>
+  <text x="630" y="246" text-anchor="middle" class="small">Fface ⊙ M<tspan baseline-shift="sub" font-size="8">t</tspan></text>
+  <rect x="558" y="274" width="145" height="34" rx="4" fill="#e7eff7" stroke="#5b83aa"/>
+  <text x="630" y="296" text-anchor="middle" class="small">Fhair ⊙ (1−M<tspan baseline-shift="sub" font-size="8">t</tspan>)</text>
+  <rect x="558" y="316" width="145" height="20" rx="3" fill="#f8fafc" stroke="#98a2b3"/>
+  <text x="630" y="331" text-anchor="middle" class="small">Concatenate</text>
+  <rect x="476" y="363" width="104" height="35" rx="6" fill="#fff8f6" stroke="#cf6c67" stroke-width="1.2"/>
+  <text x="528" y="385" text-anchor="middle" class="small">Target Mask M<tspan baseline-shift="sub" font-size="8">t</tspan></text>
+  <path d="M580,380 L610,380 L610,344" class="flow"/>
+
+  <!-- FeatureiResNet -->
+  <path d="M733,249 L767,249" class="flow"/>
+  <rect x="762" y="107" width="165" height="238" rx="8" fill="#fffdfb" stroke="#cf8b4e" stroke-width="1.5"/>
+  <text x="844" y="135" text-anchor="middle" class="head">FeatureiResNet</text>
+  <text x="844" y="156" text-anchor="middle" class="small">residual feature encoder</text>
+  <rect x="785" y="177" width="119" height="35" rx="4" fill="#f8e8d9" stroke="#cf8b4e"/>
+  <text x="844" y="199" text-anchor="middle" class="small">ResBlock ×2 · 1024</text>
+  <path d="M844,212 L844,225" class="flow"/>
+  <rect x="785" y="228" width="119" height="35" rx="4" fill="#f3dbc4" stroke="#cf8b4e"/>
+  <text x="844" y="250" text-anchor="middle" class="small">ResBlock ×2 · 768</text>
+  <path d="M844,263 L844,276" class="flow"/>
+  <rect x="785" y="279" width="119" height="35" rx="4" fill="#edcba9" stroke="#cf8b4e"/>
+  <text x="844" y="301" text-anchor="middle" class="small">ResBlock ×2 · 512</text>
+
+  <path d="M927,249 L945,249" class="flow"/>
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="955" y="206" width="37" height="70"/><rect class="mid" x="950" y="211" width="37" height="70"/><rect class="front" x="945" y="216" width="37" height="70"/>
+  </g>
+  <text x="1001" y="244" class="math">F<tspan baseline-shift="sub" font-size="10">base</tspan></text>
+  <text x="1001" y="265" class="small">512 × 32²</text>
+  <text x="950" y="329" text-anchor="middle" class="small">Aligned StyleGAN2 feature</text>
+</svg>

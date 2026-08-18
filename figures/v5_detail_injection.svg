@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1360" height="520" viewBox="0 0 1360 520">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L10,4 L0,8 Z" fill="#344054"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L10,4 L0,8 Z" fill="#568665"/></marker>
+    <style>
+      .title { font: 700 25px Arial, sans-serif; fill: #17202d; }
+      .head { font: 700 16px Arial, sans-serif; fill: #202939; }
+      .body { font: 14px Arial, sans-serif; fill: #344054; }
+      .small { font: 12px Arial, sans-serif; fill: #667085; }
+      .tiny { font: 10.5px Arial, sans-serif; fill: #667085; }
+      .math { font: italic 700 16px Georgia, serif; fill: #202939; }
+      .flow { fill:none; stroke:#344054; stroke-width:2; marker-end:url(#arrow); }
+      .greenflow { fill:none; stroke:#568665; stroke-width:2; marker-end:url(#arrowGreen); }
+      .tensor .back { fill:currentColor; fill-opacity:.22; stroke:currentColor; stroke-width:1.1; }
+      .tensor .mid { fill:currentColor; fill-opacity:.45; stroke:currentColor; stroke-width:1.1; }
+      .tensor .front { fill:currentColor; fill-opacity:.78; stroke:currentColor; stroke-width:1.3; }
+      .single { fill-opacity:.30; stroke-width:1.3; }
+    </style>
+  </defs>
+
+  <rect x="8" y="8" width="1344" height="504" rx="9" fill="#fff" stroke="#d6dce5" stroke-width="1.5"/>
+  <text x="680" y="36" text-anchor="middle" class="title">Detail Injection</text>
+  <text x="680" y="57" text-anchor="middle" class="small">Mask-controlled residual injection of facial and earring details into StyleGAN2 features</text>
+
+  <!-- External inputs -->
+  <g class="tensor" style="color:#c98243">
+    <rect class="back" x="31" y="104" width="36" height="68"/><rect class="mid" x="26" y="109" width="36" height="68"/><rect class="front" x="21" y="114" width="36" height="68"/>
+  </g>
+  <text x="75" y="137" class="math">F<tspan baseline-shift="sub" font-size="9">base</tspan></text>
+  <text x="75" y="157" class="small">base feature</text>
+  <text x="75" y="174" class="tiny">512 ch</text>
+  <path d="M91,148 L135,148" class="flow"/>
+
+  <g class="tensor" style="color:#5b83aa">
+    <rect class="back" x="31" y="235" width="31" height="60"/><rect class="mid" x="26" y="240" width="31" height="60"/><rect class="front" x="21" y="245" width="31" height="60"/>
+  </g>
+  <text x="75" y="264" class="math">P</text>
+  <text x="75" y="283" class="small">detail prior</text>
+  <text x="75" y="300" class="tiny">128 ch</text>
+  <path d="M91,273 L135,273" class="flow"/>
+
+  <g style="color:#568665">
+    <polygon points="42,380 50,373 78,373 70,380" fill="currentColor" fill-opacity=".16" stroke="currentColor"/>
+    <rect class="single" x="42" y="380" width="28" height="58" fill="currentColor" stroke="currentColor"/>
+  </g>
+  <text x="85" y="405" class="math">M<tspan baseline-shift="sub" font-size="9">fine</tspan></text>
+  <text x="85" y="425" class="small">fine detail mask</text>
+  <path d="M104,406 L135,406" class="greenflow"/>
+
+  <!-- 64x64 unit -->
+  <rect x="136" y="78" width="400" height="363" rx="8" fill="#fffdfb" stroke="#cf8b4e" stroke-width="1.5"/>
+  <text x="336" y="106" text-anchor="middle" class="head">64×64 Injection Unit</text>
+  <text x="336" y="126" text-anchor="middle" class="small">base: 512 ch · prior: 128 ch</text>
+
+  <rect x="164" y="153" width="122" height="38" rx="4" fill="#e7eff7" stroke="#5b83aa"/>
+  <text x="225" y="169" text-anchor="middle" class="tiny">1×1 Conv</text><text x="225" y="183" text-anchor="middle" class="tiny">128→512</text>
+  <text x="305" y="177" class="small">Pproj</text>
+  <path d="M286,172 L329,172" class="flow"/>
+
+  <g class="tensor" style="color:#5b83aa">
+    <rect class="back" x="337" y="147" width="25" height="48"/><rect class="mid" x="333" y="151" width="25" height="48"/><rect class="front" x="329" y="155" width="25" height="48"/>
+  </g>
+  <text x="369" y="178" class="tiny">Pproj</text>
+  <path d="M355,179 L400,179" class="flow"/>
+  <path d="M91,148 L112,148 L112,222 L400,222" class="flow"/>
+  <circle cx="413" cy="200" r="20" fill="#fff" stroke="#344054" stroke-width="1.7"/>
+  <text x="413" y="207" text-anchor="middle" class="head">C</text>
+  <text x="413" y="238" text-anchor="middle" class="tiny">Concat</text>
+  <path d="M433,200 L460,200" class="flow"/>
+  <rect x="460" y="170" width="58" height="60" rx="4" fill="#f8e8d9" stroke="#cf8b4e"/>
+  <text x="489" y="195" text-anchor="middle" class="tiny">3×3 Conv</text><text x="489" y="212" text-anchor="middle" class="tiny">+ SiLU</text>
+  <path d="M518,200 L540,200" class="flow"/>
+  <rect x="540" y="170" width="58" height="60" rx="4" fill="#f3dbc4" stroke="#cf8b4e"/>
+  <text x="569" y="195" text-anchor="middle" class="tiny">1×1 Conv</text><text x="569" y="212" text-anchor="middle" class="tiny">ΔF64</text>
+  <path d="M569,230 L569,276 L493,276" class="flow"/>
+  <path d="M104,406 L120,406 L120,314 L493,314" class="greenflow"/>
+  <text x="489" y="266" text-anchor="middle" class="tiny">M64</text>
+  <circle cx="472" cy="294" r="19" fill="#fff" stroke="#568665" stroke-width="1.7"/>
+  <text x="472" y="301" text-anchor="middle" font-family="Arial" font-size="21" font-weight="700">×</text>
+  <path d="M491,294 L548,294" class="greenflow"/>
+  <path d="M112,148 L112,356 L548,356 L548,313" class="flow"/>
+  <circle cx="568" cy="294" r="19" fill="#fff" stroke="#344054" stroke-width="1.7"/>
+  <text x="568" y="301" text-anchor="middle" font-family="Arial" font-size="23" font-weight="700">+</text>
+  <g class="tensor" style="color:#568665">
+    <rect class="back" x="592" y="255" width="31" height="58"/><rect class="mid" x="587" y="260" width="31" height="58"/><rect class="front" x="582" y="265" width="31" height="58"/>
+  </g>
+  <text x="630" y="291" class="math">F<tspan baseline-shift="sub" font-size="9">64</tspan></text>
+  <text x="630" y="310" class="tiny">Fbase + M64⊙ΔF64</text>
+
+  <!-- StyleGAN2 transition -->
+  <path d="M652,294 L686,294" class="flow"/>
+  <rect x="684" y="254" width="108" height="80" rx="7" fill="#f7fbff" stroke="#5b83aa" stroke-width="1.4"/>
+  <text x="738" y="280" text-anchor="middle" class="head">StyleGAN2</text>
+  <text x="738" y="300" text-anchor="middle" class="small">feature block</text>
+  <text x="738" y="318" text-anchor="middle" class="tiny">64²→128²</text>
+
+  <!-- 128x128 unit -->
+  <path d="M792,294 L820,294 L820,270 L840,270" class="flow"/>
+  <rect x="822" y="78" width="313" height="363" rx="8" fill="#fffdfb" stroke="#cf8b4e" stroke-width="1.5"/>
+  <text x="978" y="106" text-anchor="middle" class="head">128×128 Injection Unit</text>
+  <text x="978" y="126" text-anchor="middle" class="small">same gated fusion at a finer scale</text>
+  <g class="tensor" style="color:#5b83aa">
+    <rect class="back" x="850" y="132" width="24" height="42"/><rect class="mid" x="845" y="137" width="24" height="42"/><rect class="front" x="840" y="142" width="24" height="42"/>
+  </g>
+  <text x="878" y="158" class="tiny">Resize(P)</text>
+  <path d="M874,163 L900,163" class="flow"/>
+  <rect x="900" y="136" width="84" height="54" rx="4" fill="#f8e8d9" stroke="#cf8b4e"/>
+  <text x="942" y="158" text-anchor="middle" class="tiny">1×1 Conv</text><text x="942" y="176" text-anchor="middle" class="tiny">128→256</text>
+  <path d="M984,163 L1025,195" class="flow"/>
+  <g class="tensor" style="color:#568665">
+    <rect class="back" x="850" y="235" width="27" height="52"/><rect class="mid" x="845" y="240" width="27" height="52"/><rect class="front" x="840" y="245" width="27" height="52"/>
+  </g>
+  <text x="881" y="272" class="math">F<tspan baseline-shift="sub" font-size="9">128</tspan></text>
+  <path d="M867,270 L1000,270 L1000,216 L1025,199" class="flow"/>
+  <circle cx="1044" cy="195" r="19" fill="#fff" stroke="#344054" stroke-width="1.7"/>
+  <text x="1044" y="202" text-anchor="middle" class="head">C</text>
+  <path d="M1063,195 L1080,195" class="flow"/>
+  <rect x="1080" y="166" width="38" height="58" rx="4" fill="#f3dbc4" stroke="#cf8b4e"/>
+  <text x="1099" y="190" text-anchor="middle" class="tiny">3×3</text><text x="1099" y="207" text-anchor="middle" class="tiny">+1×1</text>
+  <path d="M1099,224 L1099,276 L1025,276" class="flow"/>
+  <path d="M104,406 L120,406 L120,346 L1025,346" class="greenflow"/>
+  <text x="1025" y="267" text-anchor="middle" class="tiny">M128</text>
+  <circle cx="1004" cy="294" r="19" fill="#fff" stroke="#568665" stroke-width="1.7"/>
+  <text x="1004" y="301" text-anchor="middle" font-family="Arial" font-size="21" font-weight="700">×</text>
+  <path d="M1023,294 L1080,294" class="greenflow"/>
+  <path d="M867,270 L867,356 L1080,356 L1080,313" class="flow"/>
+  <circle cx="1100" cy="294" r="19" fill="#fff" stroke="#344054" stroke-width="1.7"/>
+  <text x="1100" y="301" text-anchor="middle" font-family="Arial" font-size="23" font-weight="700">+</text>
+  <g class="tensor" style="color:#568665">
+    <rect class="back" x="1121" y="255" width="31" height="58"/><rect class="mid" x="1116" y="260" width="31" height="58"/><rect class="front" x="1111" y="265" width="31" height="58"/>
+  </g>
+  <text x="1148" y="349" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="9">128,out</tspan></text>
+
+  <path d="M1135,294 L1152,294" class="greenflow"/>
+  <rect x="1151" y="252" width="1" height="1" fill="none"/>
+  <text x="1148" y="369" text-anchor="middle" class="small">injected detail feature</text>
+  <path d="M1170,294 L1200,294" class="flow"/>
+  <rect x="1196" y="254" width="118" height="80" rx="7" fill="#f7fbff" stroke="#5b83aa" stroke-width="1.4"/>
+  <text x="1255" y="280" text-anchor="middle" class="head">StyleGAN2</text>
+  <text x="1255" y="300" text-anchor="middle" class="small">final synthesis</text>
+  <text x="1255" y="318" text-anchor="middle" class="tiny">Final Result</text>
+
+  <rect x="295" y="460" width="770" height="35" rx="5" fill="#fbfcfe" stroke="#aab4c3" stroke-width="1.1"/>
+  <text x="680" y="483" text-anchor="middle" class="math">Fout = Fbase + Mfine ⊙ ΔF</text>
+</svg>

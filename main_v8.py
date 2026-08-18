@@ -31,7 +31,7 @@ def main(model_args, args):
         color_path = args.input_dir / file_3
 
         base_name = "_".join([path.stem for path in (face_path, shape_path, color_path)])
-        exp_name = base_name if model_args.save_all else None
+        exp_name = base_name if (model_args.save_all or model_args.v8_save_color_debug) else None
 
         if isinstance(exp, str) or args.result_path is None:
             os.makedirs(args.output_dir, exist_ok=True)

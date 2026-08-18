@@ -5,7 +5,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import inspect
 import json
 import sys
-import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
-from torchvision.utils import save_image
 from tqdm.auto import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -25,11 +24,17 @@ from models.ear_modules_v5 import (
     HairMaskExtractorV5,
     RAW_EAR_SURFACE_LABELS,
     RAW_EARRING,
+    RAW_HAIR,
     align_earring_reference_to_target,
     build_earring_highlight_mask,
     build_earring_search_mask,
     build_earring_write_masks,
+    build_source_earring_instance_masks_v5,
     build_strong_earring_candidate,
+    compute_earring_hole_mask,
+    dilate_mask,
+    refine_earring_instances_highres,
+    refine_earring_hoops_highres,
     expand_valid_roi_by_completion,
     build_revealed_skin_mask,
     build_weak_earring_masks,
@@ -43,7 +48,10 @@ from utils.image_utils import list_image_files
 from utils.train import seed_everything
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
-DATASET_CONFIG_SCHEMA_VERSION = 3
+# Schema 18 keeps two separate accessory contracts.  The learned PP branch
+# receives a source-safe, lobe-connected complete object target; the strict
+# native instance remains available for final source-RGB compositing only.
+DATASET_CONFIG_SCHEMA_VERSION = 18
 DATASET_POLICY_FILES = (
     "scripts/pp_gen_v5.py",
     "hair_swap_v5.py",
@@ -68,16 +76,23 @@ PP_EXTRA_MASK_KEYS = (
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_FACE_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/mix_ear/")  #"/hf_h/images/FFHQ_short_long/"   hf_h/images/mix_ear/   HairFastGAN/images/ear/
-USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ_short/")  #"images/FFHQ_short_long"  HairFastGAN/images/FFHQ_short/   hf_h/images/FFHQ_short_long/
-USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long8.9")
-USER_DATASET_SIZE_SMALL = 0  # 0 means use every source image.
-USER_CHUNK_SIZE_SMALL = 130
+USER_FACE_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/ear/")
+USER_DONOR_GALLERY_DIR_SMALL = Path("/root/shared-nvme/HairFastGAN/images/mix_ear/")
+# Keep regenerated data separate from the previous policy-locked directory.
+# ``validate_pp_dataset_resume`` intentionally refuses to mix those parts.
+USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_instance_v18_foreground_learning")
+# 0 means exactly one experiment per source image.  Set --size explicitly if
+# deliberate repeated sampling is wanted; do not silently expand a small
+# accessory gallery back to the old 500-render workload.
+USER_DATASET_SIZE_SMALL = 0
+# Chunk size now controls checkpoint frequency only.  Render/mask work streams
+# one mask batch at a time, so this does not retain a whole chunk in memory.
+USER_CHUNK_SIZE_SMALL = 256
 USER_MASK_BATCH_SIZE_SMALL = 8
 
 USER_FACE_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
 USER_DONOR_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
-USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v5_dual_full")
+USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v18_foreground_learning")
 USER_DATASET_SIZE_FULL = 10_000
 USER_CHUNK_SIZE_FULL = 256
 USER_MASK_BATCH_SIZE_FULL = 16
@@ -148,7 +163,9 @@ USER_EARRING_WRITE_CONNECTIVITY_ITERS = 32
 USER_EARRING_WRITE_CONNECTIVITY_KERNEL = 5
 USER_EARRING_WRITE_BRIDGE_DILATE = 17
 USER_EARRING_ANCHOR_VISIBLE_DILATE = 3
-USER_EARRING_ALIGN_MAX_SHIFT = 12
+# Source identity geometry is preserved by HairFast.  Default to no spatial
+# movement so the target compositor cannot leave a second shifted earring.
+USER_EARRING_ALIGN_MAX_SHIFT = 0
 USER_EARRING_FINE_MASK_FLOOR = 0.18
 USER_EARRING_FINE_MASK_DILATE = 5
 # ============================================================================
@@ -459,6 +476,28 @@ def load_image(path):
         return T.functional.to_tensor(image.convert("RGB"))
 
 
+def png_roundtrip_tensor(image):
+    """Match the old save-PNG/reload path without an on-disk round trip."""
+
+    if not torch.is_tensor(image):
+        raise TypeError("Expected an RGB tensor for the in-memory PNG round trip.")
+    if image.ndim != 3 or image.size(0) != 3:
+        raise ValueError(f"Expected RGB [3,H,W], got {tuple(image.shape)}.")
+    # torchvision.utils.save_image stores 8-bit PNG values with nearest integer
+    # rounding.  Preserve that legacy target distribution while avoiding a
+    # synchronous encode, write, decode, and second CPU allocation per sample.
+    return (
+        image.detach()
+        .to(device="cpu", dtype=torch.float32)
+        .clamp(0, 1)
+        .mul(255)
+        .add(0.5)
+        .clamp(0, 255)
+        .to(torch.uint8)
+        .to(torch.float32)
+        .div(255)
+    )
+
 def ceil_div(value, divisor):
     return (value + divisor - 1) // divisor
 
@@ -468,6 +507,55 @@ def count_dataset_parts(total_items, chunk_size, batch_size):
     for start in range(0, total_items, chunk_size):
         total_parts += ceil_div(min(chunk_size, total_items - start), batch_size)
     return total_parts
+
+
+def identity_key(name: str) -> str:
+    """Return the per-person key used for source/donor exclusion."""
+
+    # FFHQ_3000 has one image per identity, so the filename stem is the stable
+    # identity key.  The key is shared across separate gallery roots, which also
+    # prevents a same-named source and donor when both roots point to one folder.
+    return Path(str(name)).stem.casefold()
+
+
+def sample_distinct_triplets(face_images, donor_images, size: int):
+    """Sample triplets with three different identity keys per experiment."""
+
+    face_images = list(face_images)
+    donor_images = list(donor_images)
+    if size <= 0:
+        raise ValueError("Triplet sample size must be positive")
+
+    donor_by_identity = {}
+    for name in donor_images:
+        donor_by_identity.setdefault(identity_key(name), []).append(name)
+    if len(donor_by_identity) < 3:
+        raise ValueError(
+            "The donor gallery must contain at least three distinct identity "
+            "keys for source/shape/color separation."
+        )
+
+    sources = np.random.choice(
+        face_images,
+        size=size,
+        replace=size > len(face_images),
+    )
+    identity_keys = np.array(sorted(donor_by_identity), dtype=object)
+    experiments = []
+    for source_name in sources:
+        source_identity = identity_key(source_name)
+        allowed_shape_ids = identity_keys[identity_keys != source_identity]
+        shape_identity = str(np.random.choice(allowed_shape_ids))
+        allowed_color_ids = allowed_shape_ids[allowed_shape_ids != shape_identity]
+        color_identity = str(np.random.choice(allowed_color_ids))
+        shape_name = donor_by_identity[shape_identity][
+            int(np.random.randint(len(donor_by_identity[shape_identity])))
+        ]
+        color_name = donor_by_identity[color_identity][
+            int(np.random.randint(len(donor_by_identity[color_identity])))
+        ]
+        experiments.append((str(source_name), str(shape_name), str(color_name)))
+    return experiments
 
 
 def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing, source_01, args):
@@ -582,7 +670,12 @@ def build_dataset_earring_policy_masks(query_info, weak_earring, source_parsing,
         resize_or_zero(query_info.get("left_lobe_anchor")) * left_active * left_roi
         + resize_or_zero(query_info.get("right_lobe_anchor")) * right_active * right_roi
     ).clamp(0, 1)
-    earlobe_anchor = earlobe_anchor * (1.0 - target_hair_occlusion).clamp(0, 1) * active
+    # The query builder already closes a lobe only when target-hair *interior*
+    # covers it.  ``target_hair_occlusion`` is deliberately broader: it also
+    # contains hair below the exposed lobe.  Applying it to this connectivity
+    # anchor made generated labels zero out a verified long earring exactly
+    # when its lower body should be restored in front of that transferred hair.
+    earlobe_anchor = earlobe_anchor * active
     trusted_left, trusted_right = assign_components_to_ear_sides(
         selected_object,
         left_roi,
@@ -678,6 +771,19 @@ class RenderedPairDataset(Dataset):
         self.dataset_path = Path(dataset_path)
         self.face_gallery_root = Path(face_gallery_root)
         self.donor_gallery_root = Path(donor_gallery_root)
+        self.uses_in_memory_tensors = any(
+            any(
+                torch.is_tensor(item.get(key))
+                for key in (
+                    "source_full",
+                    "shape_reference_full",
+                    "color_reference_full",
+                    "target_full",
+                    "pre_reference_color_full",
+                )
+            )
+            for item in experiments
+        )
 
     def __len__(self):
         return len(self.experiments)
@@ -693,18 +799,37 @@ class RenderedPairDataset(Dataset):
             else target_path
         )
         _, shape_name, color_name = item["triplet"]
+        source_full = item.get("source_full")
+        if not torch.is_tensor(source_full):
+            source_full = load_image(source_path)
+        shape_reference_full = item.get("shape_reference_full")
+        if not torch.is_tensor(shape_reference_full):
+            shape_reference_full = load_image(self.donor_gallery_root / shape_name)
+        color_reference_full = item.get("color_reference_full")
+        if not torch.is_tensor(color_reference_full):
+            color_reference_full = load_image(self.donor_gallery_root / color_name)
+        target_full = item.get("target_full")
+        if not torch.is_tensor(target_full):
+            target_full = load_image(target_path)
+        pre_reference_color_full = item.get("pre_reference_color_full")
+        if not torch.is_tensor(pre_reference_color_full):
+            pre_reference_color_full = (
+                load_image(pre_reference_path)
+                if pre_reference_name is not None
+                else target_full
+            )
         return {
             "source_path": str(source_path),
             "shape_reference_path": str(self.donor_gallery_root / shape_name),
             "color_reference_path": str(self.donor_gallery_root / color_name),
-            "source_full": load_image(source_path),
+            "source_full": source_full,
             # Dataset parts must be self-contained.  Previewing them on a
             # training machine with a different gallery mount used to silently
             # replace both references with the target image.
-            "shape_reference_full": load_image(self.donor_gallery_root / shape_name),
-            "color_reference_full": load_image(self.donor_gallery_root / color_name),
-            "target_full": load_image(target_path),
-            "pre_reference_color_full": load_image(pre_reference_path),
+            "shape_reference_full": shape_reference_full,
+            "color_reference_full": color_reference_full,
+            "target_full": target_full,
+            "pre_reference_color_full": pre_reference_color_full,
             "cleanup_masks": item.get("cleanup_masks", {}),
             "target_hair_mask_override": item.get("target_hair_mask"),
         }
@@ -791,7 +916,12 @@ class DatasetItemBatchBuilder:
                 "target_hair_mask_override": torch.stack(
                     [
                         item.get(
-                            "target_hair_mask",
+                            # RenderedPairDataset normalizes the stage output
+                            # under this explicit name.  Reading the old key
+                            # silently replaced every streamed sample with an
+                            # all-zero override, so the label builder reparsed
+                            # a stale hair topology around exposed earlobes.
+                            "target_hair_mask_override",
                             torch.zeros(1, 256, 256),
                         )
                         for item in batch_items
@@ -816,7 +946,10 @@ class DatasetItemBatchBuilder:
     @torch.no_grad()
     def iter_batches(self, experiments, dataset_path, face_gallery_root, donor_gallery_root):
         dataset = RenderedPairDataset(experiments, dataset_path, face_gallery_root, donor_gallery_root)
-        if self.args.io_num_workers <= 0:
+        # Large CPU tensors are already resident for streamed render groups.
+        # Sending them through DataLoader worker processes copies them and is
+        # slower than building the one local batch directly.
+        if self.args.io_num_workers <= 0 or dataset.uses_in_memory_tensors:
             batch_iterator = self._iter_single_process_batches(dataset)
         else:
             dataloader = DataLoader(
@@ -879,7 +1012,20 @@ class DatasetItemBatchBuilder:
                 ).clamp(0, 1)
             target_mask = (1 - source_hair_d) * (1 - target_hair_d)
 
-            source_parsing = self.parsing_helper.parse(source_256, out_size=(256, 256))
+            # One source parser pass must serve both PP-resolution conditioning
+            # and native earring-instance extraction.  Parsing the 256px source
+            # and enlarging its labels permanently loses a small stud or the
+            # lower half of a pendant before the native verifier starts.
+            source_native_size = tuple(source_full.shape[-2:])
+            source_parsing_full = self.parsing_helper.parse(
+                source_full,
+                out_size=source_native_size,
+            )
+            source_parsing = F.interpolate(
+                source_parsing_full.float(),
+                size=source_256.shape[-2:],
+                mode="nearest",
+            ).long()
             target_parsing = self.parsing_helper.parse(target_256, out_size=(256, 256))
             query_info = self.query_builder(source_parsing, target_parsing, source_hair_d, target_hair_d)
             source_hair_block_mask = query_info.get("source_hair_block_mask")
@@ -920,8 +1066,293 @@ class DatasetItemBatchBuilder:
                 source_hair_block_mask,
             )
             earring_search_mask = earring_policy["earring_search_mask"]
-            source_earring_mask = earring_policy["earring_write_mask"]
-            active_earring_case = earring_policy["active"]
+            # Dataset supervision must use the same source-instance contract as
+            # final V5 inference.  The older ``earring_write_mask`` is a
+            # low-resolution *permission* region; using it as a label taught
+            # the PP model that ear-side background was an accessory and that
+            # a partially parsed hoop was a solid blob.
+            reliable_source_seed = torch.maximum(
+                earring_policy.get("source_parser_earring_mask", torch.zeros_like(earring_search_mask)),
+                earring_policy.get("strong_earring_candidate_core", torch.zeros_like(earring_search_mask)),
+            )
+            # Final V5 inference extracts ordinary instances and hoop evidence
+            # in source-native coordinates.  Doing this first at 256px taught
+            # the model that a thin wire, a small stud or the lower part of a
+            # long pendant simply did not exist.  Keep the high-resolution
+            # contract here, then reduce only the verified object alpha/RGB
+            # label that PP is trained to consume.
+            source_hair_full = parsing_label_mask(
+                source_parsing_full,
+                (RAW_HAIR,),
+            )
+            reliable_source_seed_full = F.interpolate(
+                reliable_source_seed.float(),
+                size=source_native_size,
+                mode="nearest",
+            )
+            source_instances_full = build_source_earring_instance_masks_v5(
+                source_full,
+                source_parsing_full,
+                source_hair_mask=source_hair_full,
+                source_seed_mask=reliable_source_seed_full,
+            )
+
+            # Ordinary earrings need the same source-native refinement as the
+            # final V5 compositor.  Schema 11 only used ``instance_mask`` here;
+            # when the parser saw a lobe fragment or a thin contour, PP was
+            # trained to reproduce that fragment even though inference could
+            # later verify the complete pendant/solid ornament at high
+            # resolution.  Refine before downsampling so the training target
+            # and final RGB authority describe the same object.
+            source_ear_surface_full = parsing_label_mask(
+                source_parsing_full,
+                RAW_EAR_SURFACE_LABELS,
+            )
+            accepted_presence_seed_full = source_instances_full.get(
+                "locator_presence_seed",
+                torch.zeros_like(source_instances_full["instance_mask"]),
+            )
+            left_bootstrap_seed_full = (
+                accepted_presence_seed_full
+                * source_instances_full["left_context"]
+            )
+            right_bootstrap_seed_full = (
+                accepted_presence_seed_full
+                * source_instances_full["right_context"]
+            )
+            # Match final inference: a source-lobe-associated low-resolution
+            # seed may start high-resolution inspection even if parser labels
+            # only the earlobe-side fragment.  It is never stored as object
+            # alpha; the high-resolution extractor must verify the actual
+            # source pixels before this dataset gets a positive target.
+            left_native_active = (
+                torch.clamp(
+                    source_instances_full["left_instance_mask"]
+                    + left_bootstrap_seed_full,
+                    0,
+                    1,
+                ).flatten(1).sum(
+                    dim=1,
+                    keepdim=True,
+                ) >= 1.0
+            ).to(source_full.dtype).view(-1, 1, 1, 1)
+            right_native_active = (
+                torch.clamp(
+                    source_instances_full["right_instance_mask"]
+                    + right_bootstrap_seed_full,
+                    0,
+                    1,
+                ).flatten(1).sum(
+                    dim=1,
+                    keepdim=True,
+                ) >= 1.0
+            ).to(source_full.dtype).view(-1, 1, 1, 1)
+            native_regular_refined_full = refine_earring_instances_highres(
+                source_full,
+                source_parsing_full,
+                torch.clamp(
+                    source_instances_full["instance_mask"]
+                    + accepted_presence_seed_full,
+                    0,
+                    1,
+                ),
+                source_instances_full["locator_roi"],
+                source_instances_full["left_lobe_anchor"],
+                source_instances_full["right_lobe_anchor"],
+                left_native_active,
+                right_native_active,
+                source_hair_mask=source_hair_full,
+                source_ear_mask=source_ear_surface_full,
+            )
+            source_instances_full["left_instance_mask"] = torch.clamp(
+                source_instances_full["left_instance_mask"]
+                + native_regular_refined_full["left_instance_mask"],
+                0,
+                1,
+            )
+            source_instances_full["right_instance_mask"] = torch.clamp(
+                source_instances_full["right_instance_mask"]
+                + native_regular_refined_full["right_instance_mask"],
+                0,
+                1,
+            )
+            source_instances_full["instance_mask"] = torch.clamp(
+                source_instances_full["left_instance_mask"]
+                + source_instances_full["right_instance_mask"],
+                0,
+                1,
+            )
+
+            def source_instance_to_256(value):
+                if value.shape[-2:] == (1, 1):
+                    return value.to(dtype=source_256.dtype)
+                # A verified source object can be thinner than one 256px
+                # sampling interval.  Nearest sampling may select only its
+                # background neighbour and turn a real stud/wire into an empty
+                # training target.  Occupancy pooling preserves one positive
+                # PP pixel for each native cell containing actual jewellery;
+                # it never opens unverified surroundings.
+                if (
+                    value.shape[-2] >= source_256.shape[-2]
+                    and value.shape[-1] >= source_256.shape[-1]
+                ):
+                    return F.adaptive_max_pool2d(
+                        value.float(),
+                        output_size=source_256.shape[-2:],
+                    ).to(dtype=source_256.dtype)
+                return F.interpolate(
+                    value.float(),
+                    size=source_256.shape[-2:],
+                    mode="nearest",
+                ).to(dtype=source_256.dtype)
+
+            source_instances_256 = {
+                key: source_instance_to_256(value)
+                for key, value in source_instances_full.items()
+            }
+            source_earring_mask = source_instances_256["instance_mask"]
+            left_source_instance = source_instances_256["left_instance_mask"]
+            right_source_instance = source_instances_256["right_instance_mask"]
+            left_regular_hole = source_instance_to_256(
+                native_regular_refined_full["left_hoop_hole_mask"]
+            )
+            right_regular_hole = source_instance_to_256(
+                native_regular_refined_full["right_hoop_hole_mask"]
+            )
+            active_earring_case = (
+                source_earring_mask.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+
+            # Use the same source-native annulus extractor as final V5
+            # inference.  A hoop verifier is never a presence detector: each
+            # side first needs parser evidence or a native closed-loop visual
+            # seed.  The low-resolution strong proposal is a locator hint, not
+            # authority for a background contour.
+            source_ear_mask = source_ear_surface_full
+            native_zero = torch.zeros_like(
+                source_instances_full["left_parser_instance_mask"]
+            )
+            # The visual-recall helper exposes a separate closed-loop seed for
+            # the contour verifier.  Ordinary recall alpha/attachment evidence
+            # must stay on the ordinary-instance path and cannot authorize a
+            # synthetic hoop search.
+            left_visual_recall_hoop_seed = source_instances_full.get(
+                "left_visual_recall_hoop_seed_mask",
+                native_zero,
+            )
+            right_visual_recall_hoop_seed = source_instances_full.get(
+                "right_visual_recall_hoop_seed_mask",
+                native_zero,
+            )
+            left_hoop_evidence = torch.clamp(
+                source_instances_full["left_parser_instance_mask"]
+                + left_visual_recall_hoop_seed,
+                0,
+                1,
+            )
+            right_hoop_evidence = torch.clamp(
+                source_instances_full["right_parser_instance_mask"]
+                + right_visual_recall_hoop_seed,
+                0,
+                1,
+            )
+            hoop_instances_full = refine_earring_hoops_highres(
+                source_full,
+                source_instances_full["locator_ring_support"],
+                source_instances_full["left_lobe_anchor"],
+                source_instances_full["right_lobe_anchor"],
+                left_source_evidence=left_hoop_evidence,
+                right_source_evidence=right_hoop_evidence,
+                source_hair_mask=source_hair_full,
+                source_ear_mask=source_ear_mask,
+                detection_size=max(source_full.shape[-2:]),
+                min_axis=4.0,
+                min_coverage=0.36,
+            )
+            hoop_instances = {
+                key: resize_mask(value, source_earring_mask.shape[-2:])
+                for key, value in hoop_instances_full.items()
+            }
+            def side_is_open(mask):
+                mask = torch.zeros_like(source_earring_mask) if mask is None else mask
+                return (
+                    mask.flatten(1).amax(dim=1, keepdim=True) > 0.5
+                ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+
+            # A target side is a visibility decision, not a source-coordinate
+            # clip.  Multiplying a full source hoop by a target ear shell cut
+            # the outer arc back to a short fragment in the generated labels.
+            left_open = side_is_open(
+                query_info.get("left_target_side_open", query_info.get("left_side_active"))
+            )
+            right_open = side_is_open(
+                query_info.get("right_target_side_open", query_info.get("right_side_active"))
+            )
+
+            def ordinary_body_overrides_hoop(
+                ordinary: torch.Tensor,
+                footprint: torch.Tensor,
+            ) -> torch.Tensor:
+                """Do not train a verified solid ornament as a hollow hoop."""
+
+                footprint_area = footprint.flatten(1).sum(dim=1, keepdim=True)
+                ordinary_inside = (ordinary * footprint).flatten(1).sum(
+                    dim=1,
+                    keepdim=True,
+                )
+                coverage = ordinary_inside / footprint_area.clamp_min(1.0)
+                ordinary_hole = compute_earring_hole_mask(dilate_mask(ordinary, 3))
+                hole_coverage = (ordinary_hole * footprint).flatten(1).sum(
+                    dim=1,
+                    keepdim=True,
+                ) / footprint_area.clamp_min(1.0)
+                return (
+                    (footprint_area >= 12.0)
+                    & (coverage >= 0.62)
+                    & (hole_coverage <= 0.08)
+                ).to(ordinary.dtype).view(-1, 1, 1, 1)
+
+            left_regular_is_solid = ordinary_body_overrides_hoop(
+                left_source_instance,
+                hoop_instances["left_elliptical_hoop_footprint"],
+            )
+            right_regular_is_solid = ordinary_body_overrides_hoop(
+                right_source_instance,
+                hoop_instances["right_elliptical_hoop_footprint"],
+            )
+            left_hoop_instance = (
+                hoop_instances["left_elliptical_hoop"]
+                * left_open
+                * (1.0 - left_regular_is_solid)
+            )
+            right_hoop_instance = (
+                hoop_instances["right_elliptical_hoop"]
+                * right_open
+                * (1.0 - right_regular_is_solid)
+            )
+            left_hoop_hole = (
+                hoop_instances["left_elliptical_hoop_hole"]
+                * left_open
+                * (1.0 - left_regular_is_solid)
+            )
+            right_hoop_hole = (
+                hoop_instances["right_elliptical_hoop_hole"]
+                * right_open
+                * (1.0 - right_regular_is_solid)
+            )
+            source_hoop_instance = torch.clamp(left_hoop_instance + right_hoop_instance, 0, 1)
+            source_hoop_hole = torch.clamp(left_hoop_hole + right_hoop_hole, 0, 1)
+            hoop_present = (
+                source_hoop_instance.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+            active_earring_case = torch.maximum(active_earring_case, hoop_present)
+            no_earring_case = (1.0 - active_earring_case).clamp(0, 1).expand_as(source_earring_mask)
+            earring_search_mask = torch.clamp(
+                earring_search_mask
+                + dilate_mask(source_earring_mask + source_hoop_instance, 3),
+                0,
+                1,
+            ) * active_earring_case
             earring_valid_roi = earring_valid_roi * active_earring_case
 
             # Per-side visibility gating: replace pixel-wise multiply (which clips
@@ -943,22 +1374,87 @@ class DatasetItemBatchBuilder:
                 left_visible = left_earring_valid_roi.flatten(1).sum(dim=1, keepdim=True) >= min_visible_area
                 right_visible = right_earring_valid_roi.flatten(1).sum(dim=1, keepdim=True) >= min_visible_area
 
-                left_mask, right_mask = assign_components_to_ear_sides(
-                    source_earring_mask,
-                    query_info["left_ear_roi"],
-                    query_info["right_ear_roi"],
-                    query_info.get("left_lobe_anchor"),
-                    query_info.get("right_lobe_anchor"),
-                )
-
                 # Gate by visibility (scalar decision per side, not pixel-wise multiply)
-                left_mask = left_mask * left_visible.view(-1, 1, 1, 1).float()
-                right_mask = right_mask * right_visible.view(-1, 1, 1, 1).float()
+                left_mask = left_source_instance * left_visible.view(-1, 1, 1, 1).float()
+                right_mask = right_source_instance * right_visible.view(-1, 1, 1, 1).float()
+                left_regular_hole = left_regular_hole * left_visible.view(-1, 1, 1, 1).float()
+                right_regular_hole = right_regular_hole * right_visible.view(-1, 1, 1, 1).float()
+                left_hoop_instance = left_hoop_instance * left_visible.view(-1, 1, 1, 1).float()
+                right_hoop_instance = right_hoop_instance * right_visible.view(-1, 1, 1, 1).float()
+                left_hoop_hole = left_hoop_hole * left_visible.view(-1, 1, 1, 1).float()
+                right_hoop_hole = right_hoop_hole * right_visible.view(-1, 1, 1, 1).float()
 
-                source_earring_mask = torch.clamp(left_mask + right_mask, 0, 1)
+                source_earring_mask = torch.clamp(
+                    left_mask + right_mask + left_hoop_instance + right_hoop_instance,
+                    0,
+                    1,
+                ) * (
+                    1.0
+                    - torch.clamp(
+                        left_regular_hole
+                        + right_regular_hole
+                        + left_hoop_hole
+                        + right_hoop_hole,
+                        0,
+                        1,
+                    )
+                ).clamp(0, 1)
+            else:
+                left_mask, right_mask = left_source_instance, right_source_instance
+                source_earring_mask = torch.clamp(
+                    left_mask + right_mask + left_hoop_instance + right_hoop_instance,
+                    0,
+                    1,
+                ) * (
+                    1.0
+                    - torch.clamp(
+                        left_regular_hole
+                        + right_regular_hole
+                        + left_hoop_hole
+                        + right_hoop_hole,
+                        0,
+                        1,
+                    )
+                ).clamp(0, 1)
+            # The contour-verified hoop owns that ear.  Keeping a simultaneous
+            # ordinary parser arc on the same side taught a double/thick ring
+            # even though final inference correctly selects one instance.
+            left_hoop_present = (
+                left_hoop_instance.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+            right_hoop_present = (
+                right_hoop_instance.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+            left_mask = left_mask * (1.0 - left_hoop_present)
+            right_mask = right_mask * (1.0 - right_hoop_present)
+            left_regular_hole = left_regular_hole * (1.0 - left_hoop_present)
+            right_regular_hole = right_regular_hole * (1.0 - right_hoop_present)
+            source_earring_mask = torch.clamp(
+                left_mask + right_mask + left_hoop_instance + right_hoop_instance,
+                0,
+                1,
+            ) * (
+                1.0
+                - torch.clamp(
+                    left_regular_hole
+                    + right_regular_hole
+                    + left_hoop_hole
+                    + right_hoop_hole,
+                    0,
+                    1,
+                )
+            ).clamp(0, 1)
+            # A source accessory on a target-covered side is intentionally not
+            # a recovery target.  Store this post-visibility truth so a zero
+            # output alpha is not supervised as an inconsistent positive.
+            active_earring_case = (
+                source_earring_mask.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+            no_earring_case = (1.0 - active_earring_case).clamp(0, 1).expand_as(source_earring_mask)
+            earring_valid_roi = earring_valid_roi * active_earring_case
             align_info = align_earring_reference_to_target(
                 source_256,
-                source_earring_mask,
+                torch.clamp(left_mask + right_mask, 0, 1),
                 query_info["source_left_ear_mask"],
                 query_info["source_right_ear_mask"],
                 query_info["target_left_ear_mask"],
@@ -966,36 +1462,61 @@ class DatasetItemBatchBuilder:
                 query_info["left_ear_roi"],
                 query_info["right_ear_roi"],
                 max_vertical_shift=self.args.earring_align_max_shift,
-                max_horizontal_shift=max(1, self.args.earring_align_max_shift // 2),
+                max_horizontal_shift=max(0, self.args.earring_align_max_shift // 2),
                 reference_base=target_256,
+                source_left_instance_mask=left_mask,
+                source_right_instance_mask=right_mask,
+                source_left_hole_mask=left_regular_hole,
+                source_right_hole_mask=right_regular_hole,
             )
-            # Alignment can move a valid source object onto target hair. Re-run
-            # the narrow target gate after the shift so aligned supervision also
-            # obeys the target-hair overlap bound.
-            aligned_candidate = align_info["earring_confident_mask"] * active_earring_case
-            aligned_masks = build_earring_write_masks(
-                aligned_candidate,
-                torch.zeros_like(aligned_candidate),
-                earring_valid_roi,
-                query_info["target_ear_hair_occlusion_mask"],
-                earring_policy["earlobe_anchor_mask"],
-                no_earring=earring_policy["no_earring_case_mask"],
-                max_target_hair_overlap=self.args.earring_write_max_target_hair_overlap,
-                source_block_dilate=1,
-                write_dilate=1,
-                connectivity_iters=self.args.earring_write_connectivity_iters,
-                connectivity_kernel=self.args.earring_write_connectivity_kernel,
-                bridge_dilate=self.args.earring_write_bridge_dilate,
+            # Keep a separate aligned topology label for a contour-verified
+            # hollow hoop.  Ordinary earrings deliberately continue through
+            # the established PP write-mask path instead of being reduced to
+            # an instance alpha.
+            hoop_align_info = align_earring_reference_to_target(
+                source_256,
+                torch.clamp(left_hoop_instance + right_hoop_instance, 0, 1),
+                query_info["source_left_ear_mask"],
+                query_info["source_right_ear_mask"],
+                query_info["target_left_ear_mask"],
+                query_info["target_right_ear_mask"],
+                query_info["left_ear_roi"],
+                query_info["right_ear_roi"],
+                max_vertical_shift=self.args.earring_align_max_shift,
+                max_horizontal_shift=max(0, self.args.earring_align_max_shift // 2),
+                reference_base=target_256,
+                source_left_instance_mask=left_hoop_instance,
+                source_right_instance_mask=right_hoop_instance,
+                source_left_hole_mask=left_hoop_hole,
+                source_right_hole_mask=right_hoop_hole,
+            )
+            # The target-side visibility decision was already made per ear.
+            # Do not reapply a pixel-wise target-hair/ear shell here: that
+            # creates labels where a complete hoop becomes a short arc and a
+            # normal pendant loses its lower half.  The instance extractor,
+            # not a broad target-hair mask, owns source RGB permission.
+            normal_earring_mask = align_info["earring_confident_mask"] * active_earring_case
+            aligned_regular_hole = align_info["hoop_hole_mask"] * active_earring_case
+            aligned_hoop_instance = hoop_align_info["earring_confident_mask"] * active_earring_case
+            aligned_hoop_hole = hoop_align_info["hoop_hole_mask"] * active_earring_case
+            aligned_hole = torch.clamp(
+                aligned_regular_hole + aligned_hoop_hole,
+                0,
+                1,
             )
             earring_confident_mask = (
-                aligned_masks["write_mask"]
-                * (1.0 - aligned_masks["hoop_hole_mask"]).clamp(0, 1)
+                torch.maximum(normal_earring_mask, aligned_hoop_instance)
+                * (1.0 - aligned_hole).clamp(0, 1)
                 * active_earring_case
             ).clamp(0, 1)
             align_info["earring_confident_mask"] = earring_confident_mask
+            aligned_reference = (
+                target_256 * (1.0 - normal_earring_mask)
+                + align_info["earring_reference"] * normal_earring_mask
+            ).clamp(0, 1)
             align_info["earring_reference"] = (
-                target_256 * (1.0 - earring_confident_mask)
-                + align_info["earring_reference"] * earring_confident_mask
+                aligned_reference * (1.0 - aligned_hoop_instance)
+                + hoop_align_info["earring_reference"] * aligned_hoop_instance
             ).clamp(0, 1)
             source_earring_mask = earring_confident_mask
             earring_highlight_mask = build_earring_highlight_mask(
@@ -1003,6 +1524,17 @@ class DatasetItemBatchBuilder:
                 earring_confident_mask,
                 query_info["query_mask"],
             )
+            # Keep PP supervision separate from the strict native instance used
+            # by the final source-RGB compositor.  The write mask is already
+            # source-blocked, lobe-connected and side-gated, so it preserves a
+            # genuine pendant in front of target hair without authorizing a
+            # source hair/background crop.
+            earring_learning_mask = earring_policy["earring_write_mask"]
+            earring_learning_hole = earring_policy["hoop_hole_mask"]
+            earring_learning_reference = (
+                target_256 * (1.0 - earring_learning_mask)
+                + source_256 * earring_learning_mask
+            ).clamp(0, 1)
             revealed_info = build_revealed_skin_mask(
                 cleanup_masks,
                 target_parsing,
@@ -1036,6 +1568,11 @@ class DatasetItemBatchBuilder:
                     "source_hair_block_mask": source_hair_block_mask[idx].cpu(),
                     "source_earring_mask": source_earring_mask[idx].cpu(),
                     "source_earring_object_mask": source_earring_mask[idx].cpu(),
+                    "earring_instance_mask": earring_confident_mask[idx].cpu(),
+                    "earring_learning_mask": earring_learning_mask[idx].cpu(),
+                    "earring_learning_reference": earring_learning_reference[idx].cpu(),
+                    "earring_learning_hole_mask": earring_learning_hole[idx].cpu(),
+                    "hoop_instance_mask": aligned_hoop_instance[idx].cpu(),
                     "source_earring_seed_mask": earring_policy["source_parser_earring_mask"][idx].cpu(),
                     "target_earring_mask": query_info["target_earring_mask"][idx].cpu(),
                     "earring_reference": align_info["earring_reference"][idx].cpu(),
@@ -1043,15 +1580,19 @@ class DatasetItemBatchBuilder:
                     "earring_search_mask": earring_search_mask[idx].cpu(),
                     "earring_write_mask": source_earring_mask[idx].cpu(),
                     "earring_visible_segment_mask": earring_policy["earring_visible_segment_mask"][idx].cpu(),
-                    "earring_core_mask": aligned_masks["core_mask"][idx].cpu(),
-                    "earring_completion_mask": aligned_masks["completion_mask"][idx].cpu(),
-                    "earring_object_mask": aligned_masks["earring_object_mask"][idx].cpu(),
-                    "earring_filled_mask": aligned_masks["earring_filled_mask"][idx].cpu(),
-                    "hoop_hole_mask": aligned_masks["hoop_hole_mask"][idx].cpu(),
+                    # These masks are produced by the dataset policy at 256px.
+                    # ``aligned_masks`` was removed when native-resolution
+                    # instance extraction was added; keep the serialized
+                    # fields sourced from the policy that created them.
+                    "earring_core_mask": earring_policy["earring_core_mask"][idx].cpu(),
+                    "earring_completion_mask": earring_policy["earring_completion_mask"][idx].cpu(),
+                    "earring_object_mask": earring_policy["earring_object_mask"][idx].cpu(),
+                    "earring_filled_mask": earring_policy["earring_filled_mask"][idx].cpu(),
+                    "hoop_hole_mask": aligned_hole[idx].cpu(),
                     "strong_earring_candidate_core": earring_policy["strong_earring_candidate_core"][idx].cpu(),
                     "left_strong_candidate": earring_policy["left_strong_candidate"][idx].cpu(),
                     "right_strong_candidate": earring_policy["right_strong_candidate"][idx].cpu(),
-                    "no_earring_case_mask": earring_policy["no_earring_case_mask"][idx].cpu(),
+                    "no_earring_case_mask": no_earring_case[idx].cpu(),
                     "target_hair_ear_bridge_mask": earring_policy["target_hair_ear_bridge_mask"][idx].cpu(),
                     "ear_roi": query_info["ear_roi"][idx].cpu(),
                     "visible_ear_roi": visible_ear_roi[idx].cpu(),
@@ -1084,7 +1625,7 @@ class DatasetItemBatchBuilder:
             del source_hair_d, target_hair_d, target_hair_e, target_mask
             del source_parsing, target_parsing, query_info, cleanup_masks
             del weak_earring, earring_policy, earring_search_mask, source_earring_mask
-            del align_info, earring_confident_mask, earring_highlight_mask, revealed_info
+            del align_info, hoop_align_info, earring_confident_mask, earring_highlight_mask, revealed_info
             if self.device == "cuda":
                 torch.cuda.empty_cache()
 
@@ -1333,19 +1874,19 @@ def main(args):
     resolved_size = args.size if args.size > 0 else len(face_images)
     if resolved_size <= 0:
         raise ValueError("Resolved experiment size must be positive")
+    if resolved_size > len(face_images):
+        print(
+            f"Source gallery has {len(face_images)} images; sampling {resolved_size} "
+            "experiments with replacement, matching the legacy generator."
+        )
 
     print(
         f"Using dataset_profile={args.dataset_profile}, source_dir={args.face_gallery_dir}, "
         f"donor_dir={args.donor_gallery_dir}, size={resolved_size}"
     )
 
-    face_replace = resolved_size > len(face_images)
-    donor_replace = (2 * resolved_size) > len(donor_images)
-    face = np.random.choice(face_images, size=resolved_size, replace=face_replace)
-    shape, color = np.array_split(np.random.choice(donor_images, size=2 * resolved_size, replace=donor_replace), 2)
-
     experiments = []
-    for exp in zip(face, shape, color):
+    for exp in sample_distinct_triplets(face_images, donor_images, resolved_size):
         stem_names = [Path(name).stem for name in exp]
         experiments.append(
             {
@@ -1362,11 +1903,10 @@ def main(args):
         f"io_num_workers={args.io_num_workers})."
     )
 
-    # Resume state.  A chunk is atomic: its .dataset parts are only written after
-    # the whole chunk renders, so a mid-chunk crash leaves no partial parts and we
-    # can safely restart that chunk from its start.  Completed chunk starts and the
-    # running part index are persisted in gen_progress.json.  Delete that file to
-    # regenerate from scratch.
+    # Resume state.  Each part is saved through an atomic replace, and a chunk is
+    # marked complete only after every one of its parts is present.  If a process
+    # stops mid-chunk, restart safely re-renders that chunk and overwrites its
+    # deterministic part numbers.  Delete this file to regenerate from scratch.
     progress = load_progress(args.output)
     completed_left = set(int(value) for value in progress["completed_left"])
     part_idx = int(progress["next_part_idx"])
@@ -1384,10 +1924,20 @@ def main(args):
             continue
 
         batch_experiments = experiments[left:right]
-        rendered_experiments = []
         skipped_in_chunk = 0
-        with tempfile.TemporaryDirectory() as temp_dir:
-            for item in tqdm(batch_experiments, desc=f"Render chunk {left}:{right}"):
+        chunk_started_at = time.perf_counter()
+        # Keep only one mask batch of full-resolution source/donor images in
+        # memory.  The old workflow rendered the complete chunk, wrote target
+        # PNGs to a temporary directory, then re-opened every input and target.
+        for group_left in range(0, len(batch_experiments), args.mask_batch_size):
+            group_right = min(group_left + args.mask_batch_size, len(batch_experiments))
+            rendered_experiments = []
+            render_started_at = time.perf_counter()
+            for item in tqdm(
+                batch_experiments[group_left:group_right],
+                desc=f"Render chunk {left + group_left}:{left + group_right}",
+                leave=False,
+            ):
                 im1, im2, im3 = item["triplet"]
                 triplet_stems = {Path(im1).stem, Path(im2).stem, Path(im3).stem}
                 # Skip triplets referencing a known-corrupted image without retry.
@@ -1395,10 +1945,15 @@ def main(args):
                     skipped_in_chunk += 1
                     continue
                 try:
+                    # Load once and reuse the exact float tensors for both the
+                    # HairFast render and the dataset-label builder.
+                    source_full = load_image(args.face_gallery_dir / im1)
+                    shape_reference_full = load_image(args.donor_gallery_dir / im2)
+                    color_reference_full = load_image(args.donor_gallery_dir / im3)
                     result = hair_fast(
-                        args.face_gallery_dir / im1,
-                        args.donor_gallery_dir / im2,
-                        args.donor_gallery_dir / im3,
+                        source_full,
+                        shape_reference_full,
+                        color_reference_full,
                         return_stage="color_before_pp",
                         stop_before_pp=True,
                     )
@@ -1415,30 +1970,50 @@ def main(args):
                     pre_reference_color,
                     target_hair_mask,
                 ) = unpack_color_before_pp_stage(result)
-                item["cleanup_masks"] = cleanup_masks
-                if target_hair_mask is not None:
-                    item["target_hair_mask"] = target_hair_mask
-                save_image(image, os.path.join(temp_dir, item["target_name"]))
+                # The target used to be serialized to a temporary 8-bit PNG
+                # and read back.  Preserve that numerical distribution in RAM
+                # while avoiding the PNG encode/decode and filesystem latency.
+                target_full = png_roundtrip_tensor(image)
                 if torch.is_tensor(pre_reference_color):
-                    item["pre_reference_color_name"] = f"pre_{item['target_name']}"
-                    save_image(
-                        pre_reference_color,
-                        os.path.join(temp_dir, item["pre_reference_color_name"]),
-                    )
-                # Only successfully-rendered triplets go to the mask builder, so it
-                # never tries to load a target that was skipped.
-                rendered_experiments.append(item)
+                    pre_reference_color_full = png_roundtrip_tensor(pre_reference_color)
+                else:
+                    pre_reference_color_full = target_full
+                rendered_item = {
+                    **item,
+                    "source_full": source_full,
+                    "shape_reference_full": shape_reference_full,
+                    "color_reference_full": color_reference_full,
+                    "target_full": target_full,
+                    "pre_reference_color_full": pre_reference_color_full,
+                    "cleanup_masks": cleanup_masks,
+                }
+                if target_hair_mask is not None:
+                    rendered_item["target_hair_mask"] = target_hair_mask
+                # Only successfully-rendered triplets go to the mask builder.
+                rendered_experiments.append(rendered_item)
 
+            render_seconds = time.perf_counter() - render_started_at
+            label_started_at = time.perf_counter()
             if rendered_experiments:
                 for dataset_items in item_batch_builder.iter_batches(
                     rendered_experiments,
-                    temp_dir,
+                    args.output,
                     args.face_gallery_dir,
                     args.donor_gallery_dir,
                 ):
-                    torch.save(dataset_items, args.output / f"pp_part_{part_idx}.dataset")
-                    print(f"Saved {args.output / f'pp_part_{part_idx}.dataset'}")
+                    part_path = args.output / f"pp_part_{part_idx}.dataset"
+                    temporary_path = part_path.with_name(f"{part_path.name}.tmp")
+                    torch.save(dataset_items, temporary_path)
+                    os.replace(temporary_path, part_path)
+                    print(f"Saved {part_path}")
                     part_idx += 1
+            label_seconds = time.perf_counter() - label_started_at
+            print(
+                f"Chunk {left}:{right}, group {left + group_left}:{left + group_right}: "
+                f"rendered {len(rendered_experiments)}, render {render_seconds:.1f}s, "
+                f"labels {label_seconds:.1f}s."
+            )
+            del rendered_experiments
 
         # Chunk finished (all parts on disk): checkpoint the resume state.
         completed_left.add(left)
@@ -1448,11 +2023,17 @@ def main(args):
         save_progress(args.output, progress)
         if skipped_in_chunk:
             print(f"Chunk {left}:{right} done, skipped {skipped_in_chunk} corrupted triplet(s).")
+        else:
+            print(f"Chunk {left}:{right} completed in {time.perf_counter() - chunk_started_at:.1f}s.")
 
         left = right
         right = min(len(experiments), right + args.chunk_size)
 
-    print(f"Generation complete: {part_idx - 1} dataset parts, {len(corrupted)} corrupted images skipped.")
+    print(
+        f"Generation complete: scheduled {len(experiments)} experiments, "
+        f"wrote {part_idx - 1} dataset parts, "
+        f"{len(corrupted)} corrupted images skipped."
+    )
 
 
 if __name__ == "__main__":

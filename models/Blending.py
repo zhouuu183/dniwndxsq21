@@ -4,8 +4,6 @@ from torch import nn
 from models.Encoders import ClipBlendingModel, PostProcessModel
 from models.Net import Net
 from utils.bicubic import BicubicDownSample
-from utils.blending_checkpoint_v8 import validate_blending_checkpoint_policy_v8
-from utils.hair_color_match_v8 import match_hair_color_lab_v8
 from utils.image_utils import DilateErosion
 from utils.save_utils import save_gen_image, save_latents
 
@@ -15,8 +13,6 @@ class Blending(nn.Module):
     Module for transferring the desired hair color and post processing
     """
 
-    requires_blending_checkpoint_policy_v8 = False
-
     def __init__(self, opts, net=None):
         super().__init__()
         self.opts = opts
@@ -25,34 +21,13 @@ class Blending(nn.Module):
         else:
             self.net = net
 
-        blending_checkpoint = torch.load(self.opts.blending_checkpoint, map_location="cpu")
-        if self.requires_blending_checkpoint_policy_v8:
-            self.blending_color_policy_v8 = validate_blending_checkpoint_policy_v8(
-                blending_checkpoint,
-                self.opts,
-                checkpoint_path=self.opts.blending_checkpoint,
-            )
+        blending_checkpoint = torch.load(self.opts.blending_checkpoint)
         self.blending_encoder = ClipBlendingModel(blending_checkpoint.get('clip', "ViT-B/32"))
-        blending_load = self.blending_encoder.load_state_dict(
-            blending_checkpoint['model_state_dict'], strict=False
-        )
-        if blending_load.missing_keys or blending_load.unexpected_keys:
-            print(
-                "[Blending] checkpoint mismatch: "
-                f"missing={len(blending_load.missing_keys)}, "
-                f"unexpected={len(blending_load.unexpected_keys)}"
-            )
+        self.blending_encoder.load_state_dict(blending_checkpoint['model_state_dict'], strict=False)
         self.blending_encoder.to(self.opts.device).eval()
-        blend_strength_override = float(getattr(self.opts, "blend_color_strength_v8", 0.0) or 0.0)
-        if blend_strength_override > 0:
-            self.blend_color_strength = blend_strength_override
-        else:
-            self.blend_color_strength = float(blending_checkpoint.get("blend_color_strength", 1.0))
 
         self.post_process = PostProcessModel().to(self.opts.device).eval()
-        self.post_process.load_state_dict(
-            torch.load(self.opts.pp_checkpoint, map_location="cpu")['model_state_dict']
-        )
+        self.post_process.load_state_dict(torch.load(self.opts.pp_checkpoint)['model_state_dict'])
 
         self.dilate_erosion = DilateErosion(dilate_erosion=self.opts.smooth, device=self.opts.device)
         self.downsample_256 = BicubicDownSample(factor=4)
@@ -79,13 +54,7 @@ class Blending(nn.Module):
 
         # Blending
         if I_1 is not I_3 or I_1 is not I_2:
-            S_blend_6_18_raw = self.blending_encoder(
-                latent_S_1[:, 6:],
-                latent_S_3[:, 6:],
-                I_1 * target_mask,
-                I_3 * HM_3E,
-            )
-            S_blend_6_18 = latent_S_1[:, 6:] + self.blend_color_strength * (S_blend_6_18_raw - latent_S_1[:, 6:])
+            S_blend_6_18 = self.blending_encoder(latent_S_1[:, 6:], latent_S_3[:, 6:], I_1 * target_mask, I_3 * HM_3E)
             S_blend = torch.cat((latent_S_1[:, :6], S_blend_6_18), dim=1)
         else:
             S_blend = latent_S_1
@@ -98,30 +67,15 @@ class Blending(nn.Module):
         S_final, F_final = self.post_process(I_1, I_blend_256)
         I_final, _ = self.net.generator([S_final], input_is_latent=True, return_latents=False,
                                          start_layer=5, end_layer=8, layer_in=F_final)
-        I_final_01 = ((I_final + 1) / 2).clamp(0, 1)
-        if not getattr(self.opts, "disable_exact_hair_color_match_v8", False):
-            I_final_01 = match_hair_color_lab_v8(
-                I_final_01,
-                I_3,
-                HM_X,
-                HM_3E,
-                strength=float(getattr(self.opts, "exact_hair_color_strength_v8", 1.0)),
-                chroma_strength=float(getattr(self.opts, "exact_hair_color_chroma_strength_v8", 1.0)),
-                luma_strength=float(getattr(self.opts, "exact_hair_color_luma_strength_v8", 1.0)),
-                std_strength=float(getattr(self.opts, "exact_hair_color_std_strength_v8", 1.0)),
-                alpha_blur_radius=int(getattr(self.opts, "exact_hair_color_alpha_blur_v8", 5)),
-            )
-
-        I_final_to_save = I_final_01 * 2 - 1
 
         if self.opts.save_all:
-            exp_name = kwargs.get('exp_name')
-            exp_name = exp_name if exp_name is not None else ""
+            exp_name = exp_name if (exp_name := kwargs.get('exp_name')) is not None else ""
             output_dir = self.opts.save_all_dir / exp_name
             save_gen_image(output_dir, 'Blending', 'blending.png', I_blend)
             save_latents(output_dir, 'Blending', 'blending.npz', S_blend=S_blend)
 
-            save_gen_image(output_dir, 'Final', 'final.png', I_final_to_save)
+            save_gen_image(output_dir, 'Final', 'final.png', I_final)
             save_latents(output_dir, 'Final', 'final.npz', S_final=S_final, F_final=F_final)
 
-        return I_final_01[0]
+        final_image = ((I_final[0] + 1) / 2).clip(0, 1)
+        return final_image

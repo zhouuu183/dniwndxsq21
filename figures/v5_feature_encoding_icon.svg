@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="220" height="90" viewBox="0 0 220 90" role="img" aria-labelledby="title desc">
+  <title id="title">Feature Encoding</title>
+  <desc id="desc">A compact sequence of blue convolutional feature blocks.</desc>
+
+  <!-- Spatial size decreases from left to right. -->
+  <g stroke="#3d5f8a" stroke-width="1.25" stroke-linejoin="round">
+    <rect x="8" y="17" width="31" height="62" fill="#b8cce6"/>
+    <polygon points="8,17 18,7 49,7 39,17" fill="#dce7f3"/>
+    <polygon points="39,17 49,7 49,69 39,79" fill="#86a6cb"/>
+  </g>
+
+  <!-- Block 2 -->
+  <g stroke="#3d5f8a" stroke-width="1.25" stroke-linejoin="round">
+    <rect x="59" y="27" width="27" height="52" fill="#b3c8e3"/>
+    <polygon points="59,27 69,17 96,17 86,27" fill="#d8e5f2"/>
+    <polygon points="86,27 96,17 96,69 86,79" fill="#7fa1c8"/>
+  </g>
+
+  <!-- Block 3 -->
+  <g stroke="#3d5f8a" stroke-width="1.25" stroke-linejoin="round">
+    <rect x="109" y="37" width="23" height="42" fill="#aec5e1"/>
+    <polygon points="109,37 119,27 142,27 132,37" fill="#d5e3f1"/>
+    <polygon points="132,37 142,27 142,69 132,79" fill="#789bc4"/>
+  </g>
+
+  <!-- Block 4 -->
+  <g stroke="#3d5f8a" stroke-width="1.25" stroke-linejoin="round">
+    <rect x="152" y="47" width="19" height="32" fill="#a8c1df"/>
+    <polygon points="152,47 161,38 180,38 171,47" fill="#d1e0ef"/>
+    <polygon points="171,47 180,38 180,70 171,79" fill="#7195c0"/>
+  </g>
+
+  <!-- More encoder layers -->
+  <g fill="#354f73">
+    <circle cx="193" cy="64" r="2.1"/>
+    <circle cx="202" cy="64" r="2.1"/>
+    <circle cx="211" cy="64" r="2.1"/>
+  </g>
+</svg>

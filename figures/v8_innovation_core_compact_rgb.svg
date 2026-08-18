@@ -1,0 +1,195 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="1260" height="650" viewBox="0 0 1260 650" role="img" aria-labelledby="title desc">
+  <title id="title">Mismatch-Guided Residual Cleanup</title>
+  <desc id="desc">Source and target RGB images provide hair masks and aligned features. Mismatch guidance drives four gated residual heads, residual fusion, and a protection gate. A protected residual update produces a clean feature that is decoded by StyleGAN2 into a clean RGB result.</desc>
+
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#344054"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#4f759b"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3.5 L0,7 Z" fill="#4f8060"/>
+    </marker>
+    <clipPath id="sourceClip"><rect x="25" y="74" width="82" height="82" rx="3"/></clipPath>
+    <clipPath id="targetClip"><rect x="122" y="74" width="82" height="82" rx="3"/></clipPath>
+    <clipPath id="resultClip"><rect x="1153" y="327" width="82" height="82" rx="3"/></clipPath>
+    <style>
+      .title { font: 700 23px Arial, sans-serif; fill: #17202d; }
+      .head { font: 700 15px Arial, sans-serif; fill: #202939; }
+      .body { font: 13px Arial, sans-serif; fill: #344054; }
+      .small { font: 12px Arial, sans-serif; fill: #475467; }
+      .tiny { font: 10.5px Arial, sans-serif; fill: #667085; }
+      .math { font-family: "Cambria Math", Cambria, "Times New Roman", serif; font-size: 14px; font-style: italic; font-weight: 700; fill: #202939; }
+      .flow { fill: none; stroke: #344054; stroke-width: 1.8; marker-end: url(#arrow); }
+      .blueflow { fill: none; stroke: #4f759b; stroke-width: 1.7; marker-end: url(#arrowBlue); }
+      .blueguide { fill: none; stroke: #4f759b; stroke-width: 1.45; stroke-dasharray: 5 4; marker-end: url(#arrowBlue); }
+      .greenflow { fill: none; stroke: #4f8060; stroke-width: 1.8; marker-end: url(#arrowGreen); }
+      .skip { fill: none; stroke: #6b7280; stroke-width: 1.45; marker-end: url(#arrow); }
+      .tensor .back { fill: currentColor; fill-opacity: .19; stroke: currentColor; stroke-width: 1; }
+      .tensor .mid { fill: currentColor; fill-opacity: .43; stroke: currentColor; stroke-width: 1; }
+      .tensor .front { fill: currentColor; fill-opacity: .76; stroke: currentColor; stroke-width: 1.2; }
+    </style>
+  </defs>
+
+  <rect x="6" y="6" width="1248" height="638" rx="7" fill="#fff" stroke="#d3dae4" stroke-width="1.3"/>
+  <text x="630" y="37" text-anchor="middle" class="title">Mismatch-Guided Residual Cleanup</text>
+  <line x1="24" y1="53" x2="1236" y2="53" stroke="#dce1e8"/>
+
+  <!-- RGB inputs: real images are kept visible so the transformation is immediately legible. -->
+  <text x="66" y="68" text-anchor="middle" class="head">Source RGB</text>
+  <image x="25" y="74" width="82" height="82" preserveAspectRatio="xMidYMid slice"
+         href="v8_rgb_source.png" xlink:href="v8_rgb_source.png" clip-path="url(#sourceClip)"/>
+  <rect x="25" y="74" width="82" height="82" rx="3" fill="none" stroke="#4f759b" stroke-width="1.3"/>
+
+  <text x="163" y="68" text-anchor="middle" class="head">Target RGB</text>
+  <image x="122" y="74" width="82" height="82" preserveAspectRatio="xMidYMid slice"
+         href="v8_rgb_target.png" xlink:href="v8_rgb_target.png" clip-path="url(#targetClip)"/>
+  <rect x="122" y="74" width="82" height="82" rx="3" fill="none" stroke="#4f759b" stroke-width="1.3"/>
+
+  <!-- Parsing-derived hair masks. -->
+  <path d="M66 156 V192" class="blueflow"/>
+  <path d="M163 156 V192" class="blueflow"/>
+  <rect x="38" y="194" width="56" height="56" rx="3" fill="#101828" stroke="#4f759b" stroke-width="1.1"/>
+  <path d="M47 242 C47 214 54 201 66 199 C80 201 87 214 87 242 L77 242 C78 225 76 211 66 207 C57 211 57 227 58 242 Z" fill="#fff"/>
+  <rect x="135" y="194" width="56" height="56" rx="3" fill="#101828" stroke="#4f759b" stroke-width="1.1"/>
+  <path d="M142 238 C142 213 150 202 163 200 C177 202 185 213 184 237 C178 231 175 219 163 213 C152 218 149 229 148 240 Z" fill="#fff"/>
+  <text x="66" y="268" text-anchor="middle" class="tiny">Source Hair</text>
+  <text x="163" y="268" text-anchor="middle" class="tiny">Target Hair</text>
+
+  <path d="M94 222 H232" class="blueflow"/>
+  <path d="M191 237 H215 V222 H232" class="blueflow"/>
+  <rect x="235" y="188" width="176" height="76" rx="5" fill="#eef5fb" stroke="#4f759b" stroke-width="1.35"/>
+  <text x="323" y="215" text-anchor="middle" class="head">Mismatch Guidance</text>
+  <text x="323" y="239" text-anchor="middle" class="math">M<tspan baseline-shift="sub" font-size="9">&#916;</tspan>, R<tspan baseline-shift="sub" font-size="9">i</tspan>, M<tspan baseline-shift="sub" font-size="9">s</tspan></text>
+  <text x="323" y="256" text-anchor="middle" class="tiny">parsing-derived priors</text>
+
+  <!-- One compact guidance bus supplies the residual heads, regional fusion, and local update. -->
+  <path d="M411 226 H893 V314" class="blueguide"/>
+  <path d="M335 264 V306" class="blueguide"/>
+  <path d="M696 226 V321" class="blueguide"/>
+  <text x="535" y="218" text-anchor="middle" class="tiny">region priors</text>
+
+  <!-- Feature inputs are tensors, therefore represented as stacked feature maps. -->
+  <rect x="24" y="320" width="158" height="126" rx="6" fill="#f8fafc" stroke="#7a899b" stroke-width="1.25"/>
+  <text x="103" y="345" text-anchor="middle" class="head">Feature Inputs</text>
+  <g class="tensor" style="color:#738397">
+    <rect class="back" x="44" y="365" width="38" height="52"/>
+    <rect class="mid" x="39" y="370" width="38" height="52"/>
+    <rect class="front" x="34" y="375" width="38" height="52"/>
+  </g>
+  <g class="tensor" style="color:#5f86a8">
+    <rect class="back" x="94" y="365" width="38" height="52"/>
+    <rect class="mid" x="89" y="370" width="38" height="52"/>
+    <rect class="front" x="84" y="375" width="38" height="52"/>
+  </g>
+  <g class="tensor" style="color:#7c978b">
+    <rect class="back" x="144" y="365" width="28" height="52"/>
+    <rect class="mid" x="139" y="370" width="28" height="52"/>
+    <rect class="front" x="134" y="375" width="28" height="52"/>
+  </g>
+  <text x="103" y="438" text-anchor="middle" class="tiny">Fbase &#183; Fsrc &#183; Finpaint</text>
+
+  <path d="M182 383 H215" class="flow"/>
+
+  <!-- Main innovation: one expanded residual-head topology denotes four parallel heads. -->
+  <rect x="218" y="307" width="374" height="174" rx="6" fill="#fffaf5" stroke="#c98243" stroke-width="1.5"/>
+  <text x="405" y="334" text-anchor="middle" class="head">Gated Residual Heads &#215;4</text>
+  <text x="405" y="352" text-anchor="middle" class="tiny">one head shown; four region-specific parameter sets</text>
+
+  <g class="tensor" style="color:#758497">
+    <rect class="back" x="245" y="371" width="31" height="48"/>
+    <rect class="mid" x="241" y="375" width="31" height="48"/>
+    <rect class="front" x="237" y="379" width="31" height="48"/>
+  </g>
+  <text x="253" y="448" text-anchor="middle" class="math">C<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <path d="M276 399 H294" class="flow"/>
+
+  <rect x="297" y="373" width="76" height="52" rx="4" fill="#f7dfca" stroke="#c98243"/>
+  <text x="335" y="394" text-anchor="middle" class="small">3&#215;3 Conv</text>
+  <text x="335" y="414" text-anchor="middle" class="tiny">256, GN + SiLU</text>
+  <path d="M373 399 H395" class="flow"/>
+
+  <rect x="398" y="373" width="76" height="52" rx="4" fill="#f2cfad" stroke="#c98243"/>
+  <text x="436" y="394" text-anchor="middle" class="small">3&#215;3 Conv</text>
+  <text x="436" y="414" text-anchor="middle" class="tiny">128, GN + SiLU</text>
+
+  <path d="M474 399 H492 V371 H510" class="flow"/>
+  <path d="M474 399 H492 V435 H510" class="flow"/>
+  <rect x="513" y="353" width="64" height="40" rx="4" fill="#e2eee5" stroke="#4f8060"/>
+  <text x="545" y="369" text-anchor="middle" class="tiny">1&#215;1 Gate</text>
+  <text x="545" y="385" text-anchor="middle" class="math">G<tspan baseline-shift="sub" font-size="8">i</tspan></text>
+  <rect x="513" y="417" width="64" height="40" rx="4" fill="#f2cfad" stroke="#c98243"/>
+  <text x="545" y="433" text-anchor="middle" class="tiny">1&#215;1 Residual</text>
+  <text x="545" y="450" text-anchor="middle" class="math">&#916;F<tspan baseline-shift="sub" font-size="8">i</tspan></text>
+
+  <path d="M577 373 H608 V367 H622" class="flow"/>
+  <path d="M577 437 H608 V407 H622" class="flow"/>
+
+  <!-- Gated regional fusion. -->
+  <rect x="625" y="321" width="151" height="123" rx="6" fill="#fffaf5" stroke="#c98243" stroke-width="1.45"/>
+  <text x="700.5" y="347" text-anchor="middle" class="head">Residual Fusion</text>
+  <text x="700.5" y="376" text-anchor="middle" class="math">&#931;<tspan baseline-shift="sub" font-size="9">i</tspan> &#955;<tspan baseline-shift="sub" font-size="9">i</tspan> G<tspan baseline-shift="sub" font-size="9">i</tspan> &#x2299; R<tspan baseline-shift="sub" font-size="9">i</tspan> &#x2299; &#916;F<tspan baseline-shift="sub" font-size="9">i</tspan></text>
+  <line x1="648" y1="391" x2="753" y2="391" stroke="#e3b98f"/>
+  <text x="700.5" y="420" text-anchor="middle" class="math">&#916;F<tspan baseline-shift="sub" font-size="9">cleanup</tspan></text>
+  <path d="M776 383 H811" class="flow"/>
+
+  <!-- Protected residual update: the main flow stays horizontal. -->
+  <rect x="814" y="314" width="166" height="137" rx="6" fill="#f7fbf8" stroke="#4f8060" stroke-width="1.5"/>
+  <text x="897" y="341" text-anchor="middle" class="head">Protected Update</text>
+  <text x="897" y="371" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="9">clean</tspan> = F<tspan baseline-shift="sub" font-size="9">base</tspan> +</text>
+  <text x="897" y="398" text-anchor="middle" class="math">&#945; M<tspan baseline-shift="sub" font-size="9">s</tspan> &#x2299; (1 - 0.85P)</text>
+  <text x="897" y="424" text-anchor="middle" class="math">&#x2299; &#916;F<tspan baseline-shift="sub" font-size="9">cleanup</tspan></text>
+
+  <path d="M980 383 H997" class="greenflow"/>
+  <g class="tensor" style="color:#4f8060">
+    <rect class="back" x="1015" y="349" width="33" height="58"/>
+    <rect class="mid" x="1010" y="354" width="33" height="58"/>
+    <rect class="front" x="1005" y="359" width="33" height="58"/>
+  </g>
+  <text x="1021" y="439" text-anchor="middle" class="math">F<tspan baseline-shift="sub" font-size="9">clean</tspan></text>
+
+  <path d="M1048 383 H1060" class="greenflow"/>
+  <rect x="1063" y="346" width="70" height="74" rx="5" fill="#f2f4f7" stroke="#596579" stroke-width="1.3"/>
+  <text x="1098" y="376" text-anchor="middle" class="head">StyleGAN2</text>
+  <text x="1098" y="399" text-anchor="middle" class="small">Decode</text>
+  <path d="M1133 383 H1147" class="greenflow"/>
+
+  <!-- Real RGB output closes the visual input-output loop. -->
+  <text x="1194" y="316" text-anchor="middle" class="head">Clean Result</text>
+  <image x="1153" y="327" width="82" height="82" preserveAspectRatio="xMidYMid slice"
+         href="v8_rgb_clean.png" xlink:href="v8_rgb_clean.png" clip-path="url(#resultClip)"/>
+  <rect x="1153" y="327" width="82" height="82" rx="3" fill="none" stroke="#4f8060" stroke-width="1.5"/>
+  <text x="1194" y="430" text-anchor="middle" class="tiny">RGB output</text>
+
+  <!-- Short lower branch: origin of the protection signal and the base-feature skip are explicit. -->
+  <path d="M323 264 V288 H198 V528 H594" class="blueguide"/>
+  <text x="365" y="520" text-anchor="middle" class="tiny">mask context</text>
+  <path d="M103 446 V551 H594" class="skip"/>
+  <text x="362" y="544" text-anchor="middle" class="tiny">Fbase + Fsrc</text>
+
+  <rect x="597" y="500" width="179" height="83" rx="6" fill="#f2f8f4" stroke="#4f8060" stroke-width="1.4"/>
+  <text x="686.5" y="526" text-anchor="middle" class="head">Protect Gate</text>
+  <text x="686.5" y="550" text-anchor="middle" class="small">Base + Source + Mask</text>
+  <text x="686.5" y="574" text-anchor="middle" class="math">P = G<tspan baseline-shift="sub" font-size="9">p</tspan> &#x2299; R<tspan baseline-shift="sub" font-size="9">p</tspan></text>
+  <path d="M776 541 H847 V451" class="greenflow"/>
+  <text x="807" y="532" text-anchor="middle" class="math">P</text>
+
+  <path d="M103 446 V609 H944 V451" class="skip"/>
+  <text x="496" y="601" text-anchor="middle" class="tiny">Fbase skip connection</text>
+
+  <!-- Compact visual legend. -->
+  <g transform="translate(1005,523)">
+    <rect x="0" y="0" width="28" height="28" fill="#eef5fb" stroke="#4f759b"/>
+    <text x="38" y="19" class="tiny">mask / image</text>
+    <g class="tensor" style="color:#758497" transform="translate(116,0)">
+      <rect class="back" x="8" y="0" width="24" height="28"/>
+      <rect class="mid" x="4" y="4" width="24" height="28"/>
+      <rect class="front" x="0" y="8" width="24" height="28"/>
+    </g>
+    <text x="155" y="19" class="tiny">feature map</text>
+  </g>
+</svg>

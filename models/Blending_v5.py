@@ -103,7 +103,10 @@ class BlendingV5(Blending_v8):
             min_target_visible_overlap=pp_policy_value("min_target_visible_overlap", 0.10),
             min_target_ear_area=pp_value("min_target_ear_area", 8.0),
             earring_channel_down=pp_value("earring_channel_down", 32),
-            earring_align_max_shift=pp_value("earring_align_max_shift", 12),
+            # HairFast keeps the source face in the same image frame.  Moving
+            # a recovered earring to chase two noisy parser centroids creates
+            # a second earring; zero is the correct default contract.
+            earring_align_max_shift=pp_value("earring_align_max_shift", 0),
             ear_blur_kernel=pp_value("ear_blur_kernel", 11),
             ear_blur_sigma=pp_value("ear_blur_sigma", 3.0),
             ear_mask_hidden=pp_value("ear_mask_hidden", 32),
@@ -156,7 +159,18 @@ class BlendingV5(Blending_v8):
             # earring object.  This policy must not be inherited from an old
             # PP checkpoint that allowed the decoder to redraw the face.
             enable_direct_earring_restore=True,
-            enable_direct_face_skin_restore=True,
+            # The learned PP output may fill a verified low-resolution
+            # ordinary-earring mask only where native source extraction has
+            # no confident instance.  This is a V5 runtime policy, never an
+            # old-checkpoint default.
+            earring_learned_fallback_alpha=pp_policy_value(
+                "earring_learned_fallback_alpha",
+                0.0,
+            ),
+            # Face detail is produced by the PP path itself.  The final
+            # compositor keeps target authority only for transferred hair and
+            # occlusion, matching the forehead-repair pipeline.
+            enable_direct_face_skin_restore=False,
             output_target_hair_preserve_dilate=pp_policy_value(
                 "output_target_hair_preserve_dilate", 5
             ),
@@ -166,8 +180,11 @@ class BlendingV5(Blending_v8):
             ),
             output_earring_keep_dilate=pp_policy_value("output_earring_keep_dilate", 0),
             output_preserve_blur=pp_policy_value("output_preserve_blur", 1),
-            output_hairline_feather=pp_policy_value("output_hairline_feather", 9),
-            enable_revealed_skin_harmonize=pp_policy_value("enable_revealed_skin_harmonize", True),
+            # A feather mixes the PP image and the target-authoritative hair
+            # at the parser hairline.  Those images can have different colour
+            # statistics, which presents as a coloured ring around the face.
+            output_hairline_feather=pp_policy_value("output_hairline_feather", 0),
+            enable_revealed_skin_harmonize=pp_policy_value("enable_revealed_skin_harmonize", False),
             revealed_skin_harmonize_strength=pp_policy_value("revealed_skin_harmonize_strength", 0.9),
             revealed_skin_tone_kernel=pp_policy_value("revealed_skin_tone_kernel", 15),
             revealed_skin_tone_sigma=pp_policy_value("revealed_skin_tone_sigma", 7.0),
@@ -502,8 +519,14 @@ class BlendingV5(Blending_v8):
             # I_1 is the 256px encoder tensor; using it here made thin metal
             # hoops fade before the final high-resolution composite even when
             # their write mask was accepted.
-            earring_reference=name_to_embed["face"].get("image_1024"),
-            source_face_reference=name_to_embed["face"].get("image_1024"),
+            earring_reference=name_to_embed["face"].get(
+                "image_v5_native",
+                name_to_embed["face"].get("image_1024"),
+            ),
+            source_face_reference=name_to_embed["face"].get(
+                "image_v5_native",
+                name_to_embed["face"].get("image_1024"),
+            ),
             cleanup_masks=cleanup_masks,
         )
         I_final, _ = self.post_process.render_refined(self.net.generator, S_final, F_final, aux)
@@ -526,6 +549,11 @@ class BlendingV5(Blending_v8):
         )
         for key in (
             "earring_write_mask",
+            # The final V5 compositor may recover a thin hoop/wire outside a
+            # sparse 256px write mask.  Keep that verified high-resolution
+            # alpha (and its target-owned hole) out of the final colour pass.
+            "output_source_earring_composite_mask",
+            "output_highres_earring_hole",
             "output_face_target_authority_mask",
             "output_direct_face_skin_restore_mask",
         ):
@@ -601,6 +629,13 @@ class BlendingV5(Blending_v8):
                     "earring_detail_reference.png",
                     aux["detail_reference_01"] * 2 - 1,
                 )
+            if aux.get("output_source_earring_native_reference") is not None:
+                save_gen_image(
+                    output_dir,
+                    "PostProcessV5",
+                    "earring_native_reference.png",
+                    aux["output_source_earring_native_reference"] * 2 - 1,
+                )
             for mask_name in (
                 "source_earring_mask",
                 "source_left_parser_earring",
@@ -658,11 +693,15 @@ class BlendingV5(Blending_v8):
                 "earring_fine_floor_support",
                 "output_source_earring_composite_mask",
                 "output_v5_earring_edit_mask",
+                "output_source_earring_native_reference_gate",
+                "output_source_earring_native_parse_earring",
+                "output_source_earring_native_parse_is_fullres",
                 "output_source_earring_presence_gate",
                 "output_highres_earring_instance",
                 "output_highres_earring_hole",
                 "output_highres_earring_refined_instance",
                 "output_highres_earring_refined_hole",
+                "output_highres_earring_interior_authority",
                 "output_highres_earring_geometry_seed",
                 "output_highres_earring_geometry_hole",
                 "output_highres_earring_geometry_footprint",
@@ -672,6 +711,9 @@ class BlendingV5(Blending_v8):
                 "output_source_earring_locator_ring_support",
                 "output_source_earring_locator_parser",
                 "output_source_earring_locator_presence_seed",
+                "output_source_earring_native_instance",
+                "output_source_earring_native_parser_instance",
+                "output_source_earring_native_visual_recall",
                 "output_highres_earring_output_refine_enabled",
                 "output_highres_hoop_trace",
                 "output_highres_hoop_hole",

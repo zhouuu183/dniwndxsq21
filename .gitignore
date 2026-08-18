@@ -12,3 +12,6 @@ env/
 *.zip
 *.tar
 *.tar.gz
+
+# Local browser automation profiles. They can contain caches and credentials.
+.edge-*/

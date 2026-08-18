@@ -10,6 +10,7 @@ import io
 from typing import Any
 import re
 import uuid
+import inspect
 
 weight_dic = {'afhqwild.pt': 'https://drive.google.com/file/d/14OnzO4QWaAytKXVqcfWo_o2MzoR4ygnr/view?usp=sharing',
               'afhqdog.pt': 'https://drive.google.com/file/d/16v6jPtKVlvq8rg2Sdi3-R9qZEVDgvvEA/view?usp=sharing',
@@ -27,8 +28,21 @@ def download_weight(weight_path):
             "gdown is required only when a pretrained weight must be downloaded; "
             "place the weight locally or install gdown."
         ) from error
-    gdown.download(weight_dic[os.path.basename(weight_path)],
-                   output=weight_path, fuzzy=True)
+    url = weight_dic[os.path.basename(weight_path)]
+    download_params = inspect.signature(gdown.download).parameters
+    if "fuzzy" in download_params:
+        # Newer gdown versions can parse a Drive sharing URL directly.
+        gdown.download(url, output=weight_path, fuzzy=True)
+        return
+
+    # Older gdown releases reject ``fuzzy`` and expect a file id for Drive
+    # links.  All entries in weight_dic use the /file/d/<id>/view form.
+    match = re.search(r"/d/([^/]+)", url)
+    if match and "id" in download_params:
+        gdown.download(id=match.group(1), output=weight_path)
+    else:
+        # Keep a useful fallback for non-Drive URLs or unusual old releases.
+        gdown.download(url, output=weight_path)
 
 
 def is_url(obj: Any) -> bool:

@@ -106,10 +106,19 @@ def build_v58_earring_keep_mask(
     size: tuple[int, int],
     template: torch.Tensor,
 ) -> torch.Tensor:
-    """Return v58's confident earring pixels inside its visibility gate."""
+    """Return target-hair override pixels for a verified earring instance.
+
+    Online proposals remain restricted to the compact target-ear visibility
+    corridor.  A generated-dataset instance, however, is already a complete
+    source-native object aligned to that exposed side.  Cropping it by the
+    corridor made the target-hair preservation objective win everywhere below
+    the earlobe, teaching long earrings as a short edge fragment.  Dataset
+    authority therefore keeps the full solid/pendant instance in front of
+    target hair while a separately stored hoop hole stays target-owned.
+    """
     confident = aux.get("earring_confident_mask")
     valid_roi = aux.get("earring_valid_roi", aux.get("visible_ear_roi"))
-    if confident is None or valid_roi is None:
+    if confident is None:
         return torch.zeros(
             template.size(0),
             1,
@@ -118,7 +127,32 @@ def build_v58_earring_keep_mask(
             device=template.device,
             dtype=template.dtype,
         )
-    return (resize_mask(confident, size) * resize_mask(valid_roi, size)).clamp(0, 1)
+    confident = resize_mask(confident, size)
+    dataset_authority = aux.get("earring_instance_is_dataset")
+    if dataset_authority is None:
+        if valid_roi is None:
+            return torch.zeros_like(confident)
+        keep = confident * resize_mask(valid_roi, size)
+    else:
+        authority = ensure_mask_4d(dataset_authority).to(
+            device=template.device,
+            dtype=template.dtype,
+        )
+        if authority.shape[0] != template.shape[0]:
+            authority = torch.zeros_like(confident[:, :, :1, :1])
+        elif authority.shape[-2:] != (1, 1):
+            authority = F.interpolate(authority, size=(1, 1), mode="nearest")
+        authority = (authority > 0.5).to(dtype=template.dtype)
+        online_keep = (
+            torch.zeros_like(confident)
+            if valid_roi is None
+            else confident * resize_mask(valid_roi, size)
+        )
+        keep = confident * authority + online_keep * (1.0 - authority)
+    hole = aux.get("hoop_hole_mask")
+    if hole is not None:
+        keep = keep * (1.0 - resize_mask(hole, size)).clamp(0, 1)
+    return keep.clamp(0, 1)
 
 
 def build_safe_earring_edit_mask(
@@ -543,6 +577,14 @@ class EarAwareLossBuilder(LossBuilderMulti):
         presence_target = aux.get("presence_target")
         visible_ear_roi = aux.get("visible_ear_roi")
         earring_valid_roi = aux.get("earring_valid_roi", visible_ear_roi)
+        dataset_instance_authority = aux.get("earring_instance_is_dataset")
+        if dataset_instance_authority is not None:
+            dataset_instance_authority = ensure_mask_4d(dataset_instance_authority).to(
+                device=query_mask.device,
+                dtype=query_mask.dtype,
+            )
+            if dataset_instance_authority.shape[0] != query_mask.shape[0]:
+                dataset_instance_authority = None
         source_hair_block_mask = aux.get("source_hair_block_mask")
         target_earring_suppress_mask = aux.get("target_earring_suppress_mask")
         target_ear_hair_occlusion_mask = aux.get("target_ear_hair_occlusion_mask")
@@ -556,35 +598,30 @@ class EarAwareLossBuilder(LossBuilderMulti):
         if earring_valid_roi is not None:
             earring_valid_roi = resize_mask(earring_valid_roi, query_mask.shape[-2:])
 
-            # Conservative gating: check if the EARLOBE region (lower 40% of the
-            # ear ROI) is heavily covered by target hair.  Earrings hang from the
-            # earlobe, so if the lobe is occluded, earring recovery should be
-            # suppressed.  But if the upper ear is covered while the lobe remains
-            # visible (common with long hair that drapes behind the ear), earring
-            # recovery should proceed.  This fixes the 2% edge-case where long
-            # hair grazes the ear boundary: we now suppress recovery ONLY when the
-            # actual earlobe (not the whole ear) is occluded, preventing gaps below
-            # the ear while still recovering earrings in "long hair, visible lobe"
-            # cases.
-            target_hair = aux.get("HM_target")
-            if target_hair is not None:
-                target_hair_resized = resize_mask(target_hair, earring_valid_roi.shape[-2:])
-                # Isolate the lower 40% of the ear ROI (the earlobe region)
-                h = earring_valid_roi.shape[-2]
-                earlobe_start = int(h * 0.60)
-                earlobe_roi = torch.zeros_like(earring_valid_roi)
-                earlobe_roi[..., earlobe_start:, :] = earring_valid_roi[..., earlobe_start:, :]
-
-                hair_in_lobe = (target_hair_resized * earlobe_roi).sum(dim=(-2, -1), keepdim=True)
-                lobe_area = earlobe_roi.sum(dim=(-2, -1), keepdim=True).clamp(min=1.0)
-                lobe_coverage = hair_in_lobe / lobe_area
-                # If >50% of the earlobe is covered by target hair, suppress recovery
-                suppress = (lobe_coverage > 0.50).float()
-                earring_valid_roi = earring_valid_roi * (1.0 - suppress)
+            # The query builder already computes a per-side target ear/lobe
+            # visibility decision.  Re-estimating an "earlobe" from the lower
+            # 40% of the entire tensor can disagree with that decision on
+            # crops/profile faces and silently erase a valid long-earring
+            # label.  Keep this loss aligned with the explicit side gate used
+            # by dataset generation and final inference.
 
             query_mask = ensure_mask_4d(query_mask).float() * earring_valid_roi
-            source_ear_mask = ensure_mask_4d(source_ear_mask).float() * earring_valid_roi
-            earring_confident_mask = ensure_mask_4d(earring_confident_mask).float() * earring_valid_roi
+            source_ear_mask = ensure_mask_4d(source_ear_mask).float()
+            earring_confident_mask = ensure_mask_4d(earring_confident_mask).float()
+            if dataset_instance_authority is None:
+                source_ear_mask = source_ear_mask * earring_valid_roi
+                earring_confident_mask = earring_confident_mask * earring_valid_roi
+            else:
+                authority = dataset_instance_authority.expand_as(earring_valid_roi).clamp(0, 1)
+                # A saved ring can extend beyond the compact ear ROI.  Dataset
+                # authority keeps the complete object while legacy batches
+                # retain the historical visible-ear clipping.
+                source_ear_mask = source_ear_mask * (
+                    authority + earring_valid_roi * (1.0 - authority)
+                ).clamp(0, 1)
+                earring_confident_mask = earring_confident_mask * (
+                    authority + earring_valid_roi * (1.0 - authority)
+                ).clamp(0, 1)
             if earring_highlight_mask is not None:
                 earring_highlight_mask = ensure_mask_4d(earring_highlight_mask).float() * earring_valid_roi
 
@@ -838,6 +875,10 @@ class EarAwareLossBuilder(LossBuilderMulti):
         hoop_hole_mask = aux.get("hoop_hole_mask")
         if hoop_hole_mask is not None:
             hoop_hole_mask = resize_mask(hoop_hole_mask, gen_F_256_01.shape[-2:])
+            # An inner hoop region belongs to the already transferred target,
+            # never to source-object reconstruction.
+            earring_write_mask = earring_write_mask * (1.0 - hoop_hole_mask).clamp(0, 1)
+            earring_confident_mask = earring_confident_mask * (1.0 - hoop_hole_mask).clamp(0, 1)
         no_earring_case = aux.get("no_earring_case_mask", aux.get("no_earring_case"))
         if no_earring_case is not None:
             no_earring_case = resize_mask(no_earring_case, gen_F_256_01.shape[-2:])
@@ -882,6 +923,29 @@ class EarAwareLossBuilder(LossBuilderMulti):
                     high_pass_filter(gen_F_256_01),
                     high_pass_filter(earring_reference),
                     earring_write_mask,
+                )
+            )
+        foreground_restore_weight = self.losses_dict.get(
+            "earring_foreground_restore",
+            0.0,
+        )
+        target_hair_for_earring = aux.get("target_hair_mask")
+        if foreground_restore_weight > 0 and target_hair_for_earring is not None:
+            # The source-native instance is explicitly in front of target hair
+            # in these pixels.  This removes the old conflict where the broad
+            # target-hair preservation term taught a long pendant to disappear
+            # below the exposed lobe.  Hoop centres are already removed from
+            # ``earring_write_mask`` above and remain target-owned.
+            foreground_mask = earring_write_mask * resize_mask(
+                target_hair_for_earring,
+                gen_F_256_01.shape[-2:],
+            )
+            losses["earring_foreground_restore"] = foreground_restore_weight * (
+                masked_l1(gen_F_256_01, earring_reference, foreground_mask)
+                + 0.5 * masked_l1(
+                    high_pass_filter(gen_F_256_01),
+                    high_pass_filter(earring_reference),
+                    foreground_mask,
                 )
             )
         if target_earring_suppress_mask is not None:

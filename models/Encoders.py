@@ -1,9 +1,6 @@
 import argparse
 
-try:
-    import clip
-except ImportError:
-    clip = None
+import clip
 import torch
 import torch.nn as nn
 from torch.nn import Linear, LayerNorm, LeakyReLU, Sequential
@@ -11,12 +8,6 @@ from torchvision import transforms as T
 
 from models.Net import FeatureEncoderMult, IBasicBlock, conv1x1
 from models.stylegan2.model import PixelNorm
-
-
-def _load_clip_model(name, device="cuda"):
-    if clip is None:
-        raise RuntimeError("The optional OpenAI CLIP package is required for blending/image-embedding models.")
-    return clip.load(name, device=device)
 
 
 class ModulationModule(nn.Module):
@@ -84,7 +75,7 @@ class ClipBlendingModel(nn.Module):
     def __init__(self, clip_model="ViT-B/32"):
         super().__init__()
         self.pixelnorm = PixelNorm()
-        self.clip_model, _ = _load_clip_model(clip_model, device="cuda")
+        self.clip_model, _ = clip.load(clip_model, device="cuda")
         self.transform = T.Compose(
             [T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))])
         self.face_pool = torch.nn.AdaptiveAvgPool2d((224, 224))
@@ -149,7 +140,7 @@ class PostProcessModel(nn.Module):
 class ClipModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.clip_model, _ = _load_clip_model("ViT-B/32", device="cuda")
+        self.clip_model, _ = clip.load("ViT-B/32", device="cuda")
         self.transform = T.Compose(
             [T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))]
         )
