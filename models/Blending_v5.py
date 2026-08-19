@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import pickle
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +18,58 @@ from utils.hair_color_match_v8 import gaussian_blur2d, lab_to_rgb, rgb_to_lab
 from utils.image_utils import DilateErosion
 from utils.mask_delta_v8 import filter_parsing_to_primary_subject
 from utils.save_utils import save_gen_image, save_latents, save_vis_mask
+
+
+def load_blending_checkpoint_v5(checkpoint_path: str) -> dict:
+    """Load the required blending checkpoint with diagnostics for bad artifacts."""
+    path = Path(checkpoint_path).expanduser()
+    try:
+        stat = path.stat()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            "[BlendingV5] Blending checkpoint was not found: "
+            f"{path}. Pass a valid --blending_checkpoint path."
+        ) from error
+
+    if not path.is_file():
+        raise ValueError(f"[BlendingV5] Blending checkpoint is not a file: {path}")
+    if stat.st_size == 0:
+        raise ValueError(
+            f"[BlendingV5] Blending checkpoint is empty: {path}. "
+            "Re-copy the verified checkpoint artifact."
+        )
+
+    try:
+        checkpoint = torch.load(path, map_location="cpu")
+    except (EOFError, OSError, RuntimeError, pickle.UnpicklingError) as error:
+        try:
+            with path.open("rb") as handle:
+                magic = handle.read(16).hex() or "empty"
+        except OSError:
+            magic = "unreadable"
+        raise RuntimeError(
+            "[BlendingV5] Unable to read the configured blending checkpoint.\n"
+            f"  path: {path}\n"
+            f"  size: {stat.st_size:,} bytes\n"
+            f"  first_16_bytes_hex: {magic}\n"
+            f"  torch.load error: {error}\n"
+            "The file is truncated, corrupted, or not a PyTorch checkpoint. "
+            "Re-copy the verified blending checkpoint at this exact path, or pass "
+            "a verified compatible file with --blending_checkpoint. V5 will not "
+            "fall back to a different checkpoint automatically."
+        ) from error
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            "[BlendingV5] Blending checkpoint has an unsupported payload: "
+            f"{path}. Expected a dictionary containing 'model_state_dict'."
+        )
+    if "model_state_dict" not in checkpoint:
+        raise ValueError(
+            "[BlendingV5] Blending checkpoint is missing 'model_state_dict': "
+            f"{path}. This is not a compatible blending checkpoint."
+        )
+    return checkpoint
 
 
 def hair_color_debug_ab_to_rgb(image: torch.Tensor, ab: torch.Tensor) -> torch.Tensor:
@@ -45,7 +99,7 @@ class BlendingV5(Blending_v8):
         self.opts = opts
         self.net = Net(self.opts) if net is None else net
 
-        blending_checkpoint = torch.load(self.opts.blending_checkpoint, map_location="cpu")
+        blending_checkpoint = load_blending_checkpoint_v5(self.opts.blending_checkpoint)
         self.blending_color_policy_v8 = validate_blending_checkpoint_policy_v8(
             blending_checkpoint,
             self.opts,
@@ -167,9 +221,7 @@ class BlendingV5(Blending_v8):
                 "earring_learned_fallback_alpha",
                 0.0,
             ),
-            # Face detail is produced by the PP path itself.  The final
-            # compositor keeps target authority only for transferred hair and
-            # occlusion, matching the forehead-repair pipeline.
+            # V19 uses one PP face base; normal-face hard authority is disabled.
             enable_direct_face_skin_restore=False,
             output_target_hair_preserve_dilate=pp_policy_value(
                 "output_target_hair_preserve_dilate", 5
@@ -360,12 +412,12 @@ class BlendingV5(Blending_v8):
         matched_l = target_l + luma_strength * (matched_low_l - target_low_l)
 
         matched_rgb = lab_to_rgb(torch.cat((matched_l, matched_ab), dim=1))
-        feather = max(0, int(kwargs.get(
-            "hair_color_feather_radius_v8",
-            getattr(self.opts, "hair_color_feather_radius_v8", 5),
-        )))
-        alpha = gaussian_blur2d(target_mask, radius=feather) if feather > 0 else target_mask
-        alpha = (alpha * strength).clamp(0, 1)
+        # V5 must not spread a colour transfer through the hair boundary.  At
+        # 256px the old 5px Gaussian alpha became a broad face-side and
+        # outer-hair halo; after the final 1024px restore it appeared as two
+        # concentric fake-hair rings.  Colour changes stay inside the semantic
+        # hair ownership mask.  The generated RGB itself keeps strand detail.
+        alpha = ((target_mask > 0.5).to(image_01.dtype) * strength).clamp(0, 1)
         output_01 = (matched_rgb * alpha + image_01 * (1.0 - alpha)).clamp(0, 1)
         output = output_01 * 2.0 - 1.0 if image_is_normalized else output_01
         debug = None
@@ -397,7 +449,9 @@ class BlendingV5(Blending_v8):
         desired = color_before_pp.to(device=image.device, dtype=image.dtype)
         low_delta = desired - low
         delta = F.interpolate(low_delta, size=image.shape[-2:], mode="bicubic", align_corners=False)
-        mask = self._as_mask(target_hair_mask, image.shape[-2:], image.dtype)
+        mask = (self._as_mask(target_hair_mask, image.shape[-2:], image.dtype) > 0.5).to(
+            dtype=image.dtype
+        )
         if earring_exclude_mask is not None:
             # A recovered earring can sit in front of target hair.  The final
             # hair-colour correction must not recolour that exact object after
@@ -408,13 +462,9 @@ class BlendingV5(Blending_v8):
                 image.dtype,
             )
             mask = mask * (1.0 - exclude).clamp(0, 1)
-        feather = max(0, int(kwargs.get(
-            "hair_color_feather_radius_v8",
-            getattr(self.opts, "hair_color_feather_radius_v8", 5),
-        )))
-        if feather > 0:
-            scale = max(1, round(image.shape[-1] / max(1, desired.shape[-1])))
-            mask = gaussian_blur2d(mask, radius=feather * scale)
+        # Do not feather this authority mask.  It is the second V5 colour
+        # hand-off; blurring a 256px radius by the output scale was changing
+        # non-hair pixels on both sides of the hairline after PP completed.
         mask = mask.clamp(0, 1)
         return (image + delta * mask).clamp(-1, 1), mask
 
@@ -468,16 +518,14 @@ class BlendingV5(Blending_v8):
             if torch.is_tensor(delta_masks.get(key))
         } if isinstance(delta_masks, dict) else {}
 
-        # Build this once at the formal stage boundary as well as in the final
-        # path.  PP dataset generation can then carry the repaired v8 hair
-        # topology forward instead of reparsing a 256px image and reviving an
-        # old crown/ear gap.
-        authoritative_hair_highres, _ = self._restore_authoritative_color_after_pp(
-            I_blend,
-            color_before_pp,
-            HM_X,
-            kwargs,
-        )
+        # ``color_before_pp`` is a 256px conditioning image.  Lifting its
+        # Lab delta back onto a 1024px result creates a second, low-frequency
+        # image of the hair and visibly flattens strands on both sides of the
+        # hairline.  The generated high-resolution blend is the only hair RGB
+        # authority; the low-resolution colour image remains PP conditioning
+        # only.  This keeps the target hairstyle continuous through the final
+        # V5 compositor instead of adding an inner/outer colour ring.
+        authoritative_hair_highres = I_blend
 
         # PP dataset generation needs the *actual* inference tensor at this
         # boundary.  Expose it explicitly instead of monkey-patching
@@ -530,46 +578,11 @@ class BlendingV5(Blending_v8):
             cleanup_masks=cleanup_masks,
         )
         I_final, _ = self.post_process.render_refined(self.net.generator, S_final, F_final, aux)
-        # PP checkpoints trained with the old colour path can still shift the
-        # hair toward the source.  Reuse the exact same transform, restricted
-        # to the repaired target-hair mask, for a deterministic final hand-off.
         I_final_raw = I_final
-        # The V5 final compositor has already declared the semantic face and
-        # the recovered accessory target-owned.  Exclude both from the last
-        # high-resolution colour correction too; otherwise a dilated hair mask
-        # can reintroduce a narrow forehead/cheek colour band after PP has
-        # restored the correct target pixels.
-        final_color_exclude = torch.zeros(
-            I_final.shape[0],
-            1,
-            I_final.shape[-2],
-            I_final.shape[-1],
-            device=I_final.device,
-            dtype=I_final.dtype,
-        )
-        for key in (
-            "earring_write_mask",
-            # The final V5 compositor may recover a thin hoop/wire outside a
-            # sparse 256px write mask.  Keep that verified high-resolution
-            # alpha (and its target-owned hole) out of the final colour pass.
-            "output_source_earring_composite_mask",
-            "output_highres_earring_hole",
-            "output_face_target_authority_mask",
-            "output_direct_face_skin_restore_mask",
-        ):
-            value = aux.get(key)
-            if value is not None:
-                final_color_exclude = torch.maximum(
-                    final_color_exclude,
-                    self._as_mask(value, I_final.shape[-2:], I_final.dtype),
-                )
-        I_final, _ = self._restore_authoritative_color_after_pp(
-            I_final_raw,
-            color_before_pp,
-            HM_X,
-            kwargs,
-            earring_exclude_mask=final_color_exclude,
-        )
+        # Do not reapply the 256px colour delta after face/earring composition.
+        # The compositor has already selected the generated high-resolution
+        # hair, direct source face pixels, and exact source earring alpha.
+        # A second upsampled colour pass corrupts all three at semantic edges.
 
         if save_all:
             exp_name = kwargs.get("exp_name") or ""
@@ -636,6 +649,20 @@ class BlendingV5(Blending_v8):
                     "earring_native_reference.png",
                     aux["output_source_earring_native_reference"] * 2 - 1,
                 )
+            if aux.get("output_v19_base") is not None:
+                save_gen_image(
+                    output_dir,
+                    "PostProcessV5",
+                    "v19_face_base_before_earring.png",
+                    aux["output_v19_base"] * 2 - 1,
+                )
+            if aux.get("output_v19_source_rgb") is not None:
+                save_gen_image(
+                    output_dir,
+                    "PostProcessV5",
+                    "v19_source_earring_rgb.png",
+                    aux["output_v19_source_rgb"] * 2 - 1,
+                )
             for mask_name in (
                 "source_earring_mask",
                 "source_left_parser_earring",
@@ -692,6 +719,23 @@ class BlendingV5(Blending_v8):
                 "fine_mask_before_floor",
                 "earring_fine_floor_support",
                 "output_source_earring_composite_mask",
+                "output_v19_unified_face",
+                "output_v19_face_pp_alpha",
+                "output_v19_face_residual_mask",
+                "output_v19_face_residual_alpha",
+                "output_v19_localization_roi",
+                "output_v19_foreground_seed",
+                "output_v19_raw_foreground",
+                "output_v19_source_alpha",
+                "output_v19_source_detail_mask",
+                "output_v19_source_face_alpha",
+                "output_v19_source_skin_alpha",
+                "output_v19_source_detail_alpha",
+                "output_v19_revealed_skin_alpha",
+                "output_v19_face_tone_correction",
+                "output_v19_boundary_band",
+                "output_v19_hole_mask",
+                "output_v19_alpha_leak",
                 "output_v5_earring_edit_mask",
                 "output_source_earring_native_reference_gate",
                 "output_source_earring_native_parse_earring",

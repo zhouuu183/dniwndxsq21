@@ -2191,6 +2191,292 @@ def build_source_earring_instance_masks_v5(
     }
 
 
+def extract_source_earring_foreground_v5(
+    source_01: torch.Tensor,
+    source_parsing: torch.Tensor | None,
+    *,
+    source_seed_mask: torch.Tensor | None = None,
+    source_hair_mask: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Extract source earring foreground alpha for the V19 V5 compositor.
+
+    This is deliberately source-only.  Parser labels and visual cues locate
+    the object, while the returned alpha is built from source pixels inside a
+    side-local foreground segmentation.  No target ROI, hair mask, bbox or
+    synthetic hoop geometry can grant write permission here.
+    """
+    source_01 = normalized_to_01(source_01)
+    bsz, _, height, width = source_01.shape
+    device, dtype = source_01.device, source_01.dtype
+    zeros = torch.zeros(bsz, 1, height, width, device=device, dtype=dtype)
+    presence = torch.zeros(bsz, 2, device=device, dtype=dtype)
+    confidence = torch.zeros(bsz, 2, device=device, dtype=dtype)
+    if source_parsing is None:
+        return {
+            "source_alpha": zeros,
+            "left_source_alpha": zeros.clone(),
+            "right_source_alpha": zeros.clone(),
+            "source_rgb": source_01,
+            "presence_state": presence,
+            "instance_confidence": confidence,
+            "localization_roi": zeros.clone(),
+            "foreground_seed": zeros.clone(),
+            "raw_foreground": zeros.clone(),
+            "boundary_band": zeros.clone(),
+            "hole_mask": zeros.clone(),
+        }
+
+    parsing = ensure_mask_4d(source_parsing).long().to(device=device)
+    if parsing.shape[-2:] != (height, width):
+        parsing = F.interpolate(parsing.float(), size=(height, width), mode="nearest").long()
+    parser_earring = (parsing == RAW_EARRING).float()
+    left_ear = (parsing == RAW_LEFT_EAR).float()
+    right_ear = (parsing == RAW_RIGHT_EAR).float()
+    hair = (
+        parsing == RAW_HAIR
+        if source_hair_mask is None
+        else ensure_mask_4d(source_hair_mask).to(device=device) > 0.5
+    ).float()
+    # The 256px candidate mask is a localisation prior, never a native object
+    # contour.  Upsampling it and adding it directly to the seed made its
+    # square lobe/near-ear footprint eligible for final source RGB paste.
+    supplied = zeros if source_seed_mask is None else resize_mask(source_seed_mask, (height, width))
+    supplied = (supplied > 0.25).to(dtype)
+    semantic_subject = (
+        parsing_label_mask(parsing, RAW_SKIN_SURFACE_LABELS)
+        + parsing_label_mask(parsing, RAW_DETAIL_LABELS)
+        + (parsing == RAW_HAIR).float()
+    ).clamp(0, 1)
+
+    scale = max(height, width) / 256.0
+    def k(value: float, minimum: int = 1) -> int:
+        n = max(minimum, int(round(value * scale)))
+        return n if n % 2 else n + 1
+
+    # High-resolution visual evidence.  It is intentionally only probable
+    # foreground; component association below is the authority boundary.
+    gray = rgb_to_gray(source_01)
+    local = low_pass_filter(gray, kernel_size=k(9, 3), sigma=max(1.0, 2.5 * scale))
+    large = low_pass_filter(gray, kernel_size=k(31, 5), sigma=max(2.0, 8.0 * scale))
+    local_rgb = low_pass_filter(source_01, kernel_size=k(9, 3), sigma=max(1.0, 2.5 * scale))
+    colour_residual = (source_01 - local_rgb).abs().mean(dim=1, keepdim=True)
+    edge = sobel_magnitude(source_01).clamp(0, 1)
+    chroma = source_01.amax(dim=1, keepdim=True) - source_01.amin(dim=1, keepdim=True)
+    evidence = (0.8 * (gray - local).abs() + 0.7 * (gray - large).abs() + 0.8 * edge + 0.4 * chroma).clamp(0, 1)
+
+    y_grid = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1)
+    x_grid = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width)
+    left_out, right_out = [], []
+    roi_out, seed_out, raw_out, band_out, hole_out = [], [], [], [], []
+
+    def _side_context(ear: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        anchor = build_earlobe_anchor(ear, ear_roi=dilate_mask(ear, k(35, 5)), lower_ratio=0.60, dilate=k(3, 1))
+        rail = torch.zeros_like(ear)
+        # A continuous rail follows a pendant from the lobe instead of one
+        # displaced blob.  This keeps the localization ROI over a long drop
+        # at both 64/256px tests and native 512/1024px inference.
+        for offset in (0, 24, 48, 72, 96, 120, 144):
+            rail = torch.maximum(
+                rail,
+                shift_mask(dilate_mask(anchor, k(20, 3)), down=k(offset, 0)),
+            )
+        context = torch.clamp(
+            dilate_mask(ear, k(35, 5))
+            + rail,
+            0,
+            1,
+        )
+        return context, anchor
+
+    left_context, left_anchor = _side_context(left_ear)
+    right_context, right_anchor = _side_context(right_ear)
+    left_area = left_anchor.sum(dim=(2, 3), keepdim=True)
+    right_area = right_anchor.sum(dim=(2, 3), keepdim=True)
+    left_y = (left_anchor * y_grid).sum(dim=(2, 3), keepdim=True) / left_area.clamp_min(1.0)
+    left_x = (left_anchor * x_grid).sum(dim=(2, 3), keepdim=True) / left_area.clamp_min(1.0)
+    right_y = (right_anchor * y_grid).sum(dim=(2, 3), keepdim=True) / right_area.clamp_min(1.0)
+    right_x = (right_anchor * x_grid).sum(dim=(2, 3), keepdim=True) / right_area.clamp_min(1.0)
+    left_present = left_area >= 1.0
+    right_present = right_area >= 1.0
+    # If a parser omits the ear label, source-side assignment still remains
+    # deterministic and local rather than using a global face mask.
+    left_context = torch.where(left_present, left_context, (x_grid < width * 0.5).to(dtype) * dilate_mask(parser_earring, k(27, 3)))
+    right_context = torch.where(right_present, right_context, (x_grid >= width * 0.5).to(dtype) * dilate_mask(parser_earring, k(27, 3)))
+
+    def _run_one(rgb_np, roi_np, seed_np, probable_np, material_np, parser_np, anchor_np, subject_np):
+        roi_np = roi_np.astype(np.uint8)
+        seed_np = seed_np.astype(bool)
+        probable_np = probable_np.astype(bool)
+        material_np = material_np.astype(bool)
+        parser_np = parser_np.astype(bool)
+        anchor_np = anchor_np.astype(bool)
+        gc = np.full(roi_np.shape, cv2.GC_BGD if cv2 is not None else 0, np.uint8)
+        if cv2 is not None:
+            gc[roi_np > 0] = cv2.GC_PR_BGD
+            gc[probable_np & (roi_np > 0)] = cv2.GC_PR_FGD
+            gc[parser_np | seed_np] = cv2.GC_FGD
+            if int((gc == cv2.GC_FGD).sum()) >= 1:
+                try:
+                    cv2.grabCut((rgb_np * 255).astype(np.uint8), gc, None, None, None, 3, cv2.GC_INIT_WITH_MASK)
+                    fg = (gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD)
+                except cv2.error:
+                    fg = parser_np | seed_np
+            else:
+                fg = parser_np | seed_np
+        else:
+            fg = parser_np | seed_np | probable_np
+        # GrabCut can keep only the high-contrast rim of a flat pendant.  Its
+        # probable-foreground evidence remains eligible for component graph
+        # association, so the measured body is not reduced to the root dot.
+        fg = (fg | probable_np | parser_np | seed_np) & (roi_np > 0)
+        # Component graph association: retain seed components and components
+        # within a small appearance-compatible gap.  This replaces the old
+        # pixel-by-pixel lobe connectivity requirement.
+        if cv2 is not None:
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8), 8)
+            keep = np.zeros_like(fg, dtype=bool)
+            selected = []
+            for idx in range(1, n):
+                comp = labels == idx
+                area = int(stats[idx, cv2.CC_STAT_AREA])
+                if area <= 0 or area > int(0.08 * height * width):
+                    continue
+                if bool((comp & (parser_np | seed_np)).any()):
+                    selected.append(idx)
+            # Parser-missed small studs are uncertain, not negative.  Let a
+            # compact visual component immediately beside the lobe open an
+            # inspection path, but still require real pixel evidence rather
+            # than treating the lobe/search ROI as foreground.
+            if not selected and anchor_np.any():
+                uncertain_gap = max(3, int(round(8 * scale)))
+                anchor_near = cv2.dilate(
+                    anchor_np.astype(np.uint8),
+                    np.ones((uncertain_gap * 2 + 1,) * 2, np.uint8),
+                    1,
+                ).astype(bool)
+                nearby = []
+                for idx in range(1, n):
+                    comp = labels == idx
+                    area = int(stats[idx, cv2.CC_STAT_AREA])
+                    if 0 < area <= int(0.02 * height * width) and bool((comp & anchor_near).any()):
+                        nearby.append(idx)
+                selected.extend(nearby[:2])
+            # Attach detached pieces by a 1-3px source gap, while requiring
+            # visual support and preserving a bounded side-local extent.
+            max_gap = max(2, int(round(4 * scale)))
+            for idx in range(1, n):
+                if idx in selected:
+                    continue
+                comp = labels == idx
+                if not comp.any() or int(stats[idx, cv2.CC_STAT_AREA]) > int(0.08 * height * width):
+                    continue
+                near = cv2.dilate(comp.astype(np.uint8), np.ones((2 * max_gap + 1, 2 * max_gap + 1), np.uint8), 1).astype(bool)
+                if any(bool((near & (labels == base)).any()) for base in selected):
+                    selected.append(idx)
+            for idx in selected:
+                keep |= labels == idx
+            fg = keep | (parser_np | seed_np)
+        # GrabCut may colour a broad connected source background as probable
+        # foreground.  Final alpha remains constrained to direct source
+        # material/edge evidence (plus explicit parser/seed pixels), never to
+        # the ROI or a filled connected component alone.
+        # A semantic face/ear pixel is not earring material merely because it
+        # resembles a small low-resolution candidate.  It needs a native
+        # parser label or an actual native visual seed.  Background-labelled
+        # pendant pixels remain eligible through ``material_np``.
+        material_allowed = (~subject_np) | parser_np | seed_np
+        return fg & ((material_np & material_allowed) | parser_np | seed_np)
+
+    for batch_idx in range(bsz):
+        side_results = []
+        for side_idx, (context, anchor, cx, parser_side) in enumerate(
+            ((left_context, left_anchor, left_x, parser_earring * left_context),
+             (right_context, right_anchor, right_x, parser_earring * right_context))
+        ):
+            roi = torch.clamp(context[batch_idx:batch_idx + 1] + parser_side[batch_idx:batch_idx + 1], 0, 1)
+            roi_evidence = evidence[batch_idx:batch_idx + 1] * roi
+            mean = roi_evidence.flatten(1).sum(dim=1, keepdim=True) / roi.flatten(1).sum(dim=1, keepdim=True).clamp_min(1.0)
+            var = ((roi_evidence - mean.view(1, 1, 1, 1)) ** 2 * roi).flatten(1).sum(dim=1, keepdim=True) / roi.flatten(1).sum(dim=1, keepdim=True).clamp_min(1.0)
+            probable = (roi_evidence >= (mean + 0.35 * torch.sqrt(var + 1e-6)).view(1, 1, 1, 1)).float() * roi
+            strong_visual = (roi_evidence >= (mean + 1.0 * torch.sqrt(var + 1e-6)).view(1, 1, 1, 1)).float() * roi
+            # A coarse candidate may open inspection of a parser-missed stud,
+            # but only pixels with native high-evidence can seed foreground.
+            native_seed = (
+                supplied[batch_idx:batch_idx + 1]
+                * context[batch_idx:batch_idx + 1]
+                * strong_visual
+            )
+            seed = torch.clamp(parser_side[batch_idx:batch_idx + 1] + native_seed, 0, 1)
+            seed_area_tensor = seed.flatten(1).sum(dim=1, keepdim=True).view(1, 1, 1, 1)
+            seed_colour = (source_01[batch_idx:batch_idx + 1] * seed).sum(dim=(2, 3), keepdim=True) / seed_area_tensor.clamp_min(1.0)
+            colour_distance = (source_01[batch_idx:batch_idx + 1] - seed_colour).pow(2).mean(dim=1, keepdim=True).sqrt()
+            # Flat metal/stone bodies often have low edge energy internally;
+            # local colour agreement with the trusted seed supplies probable
+            # foreground without turning the whole ROI into write alpha.
+            material = (colour_distance <= (0.12 + 0.35 * torch.sqrt(var + 1e-6)).view(1, 1, 1, 1)).float()
+            seedless_material = strong_visual * (colour_residual[batch_idx:batch_idx + 1] >= 0.10).to(dtype)
+            material = torch.where(seed_area_tensor > 0, material, seedless_material)
+            probable = torch.maximum(probable, material * roi * (seed_area_tensor > 0).to(dtype))
+            # Preserve parser/seed evidence even when the object is a one-pixel
+            # stud; area affects confidence, never presence hard-off.
+            fg_np = _run_one(
+                source_01[batch_idx].permute(1, 2, 0).detach().cpu().numpy(),
+                roi[0, 0].detach().cpu().numpy(),
+                seed[0, 0].detach().cpu().numpy(),
+                probable[0, 0].detach().cpu().numpy(),
+                material[0, 0].detach().cpu().numpy(),
+                parser_side[batch_idx, 0].detach().cpu().numpy(),
+                anchor[batch_idx, 0].detach().cpu().numpy(),
+                semantic_subject[batch_idx, 0].detach().cpu().numpy() > 0.5,
+            )
+            alpha = torch.from_numpy(fg_np.astype(np.float32)).to(device=device, dtype=dtype).view(1, 1, height, width)
+            alpha = alpha * roi
+            seed_area = float(seed.sum().item())
+            alpha_area = float(alpha.sum().item())
+            if seed_area <= 0 and alpha_area <= 0:
+                state = 0.0
+            elif seed_area > 0 or alpha_area >= max(1.0, 2.0 * scale):
+                state = 2.0
+            else:
+                state = 1.0
+            conf = min(1.0, (0.45 if seed_area > 0 else 0.15) + min(0.4, alpha_area / max(1.0, 0.02 * height * width)))
+            presence[batch_idx, side_idx] = state
+            confidence[batch_idx, side_idx] = conf
+            side_results.append(alpha)
+        left_alpha, right_alpha = side_results
+        left_out.append(left_alpha)
+        right_out.append(right_alpha)
+        roi_out.append(torch.clamp(left_context[batch_idx:batch_idx + 1] + right_context[batch_idx:batch_idx + 1], 0, 1))
+        seed_out.append(torch.clamp(supplied[batch_idx:batch_idx + 1] + parser_earring[batch_idx:batch_idx + 1], 0, 1))
+        raw_out.append(torch.clamp(left_alpha + right_alpha, 0, 1))
+        band_out.append((dilate_mask(torch.clamp(left_alpha + right_alpha, 0, 1), 3) - erode_mask(torch.clamp(left_alpha + right_alpha, 0, 1), 3)).clamp(0, 1))
+        combined_alpha = torch.clamp(left_alpha + right_alpha, 0, 1)
+        # A hole is derived from the segmented source alpha itself.  It is
+        # topology metadata, never a synthetic ring footprint or a separate
+        # compositor branch.
+        hole_out.append(compute_earring_hole_mask(combined_alpha))
+
+    left_alpha = torch.cat(left_out, dim=0)
+    right_alpha = torch.cat(right_out, dim=0)
+    hole = torch.cat(hole_out, dim=0)
+    left_alpha = left_alpha * (1.0 - hole).clamp(0, 1)
+    right_alpha = right_alpha * (1.0 - hole).clamp(0, 1)
+    alpha = torch.clamp(left_alpha + right_alpha, 0, 1) * (1.0 - hole).clamp(0, 1)
+    return {
+        "source_alpha": alpha,
+        "left_source_alpha": left_alpha,
+        "right_source_alpha": right_alpha,
+        "source_rgb": source_01,
+        "presence_state": presence,
+        "instance_confidence": confidence,
+        "localization_roi": torch.cat(roi_out, dim=0),
+        "foreground_seed": torch.cat(seed_out, dim=0),
+        "raw_foreground": torch.cat(raw_out, dim=0),
+        "boundary_band": torch.cat(band_out, dim=0),
+        "hole_mask": hole,
+    }
+
+
 def refine_earring_instances_highres(
     source_01: torch.Tensor,
     source_parsing: torch.Tensor | None,
@@ -2468,7 +2754,13 @@ def refine_earring_instances_highres(
         # never permission to copy the lobe neighbourhood itself.
         seed &= local_window
         observed &= local_window
-        if int(seed.sum()) < max(3, int(round(0.75 * scale))):
+        # A native parser can retain only one or two pixels of a small stud at
+        # the lobe.  That is enough to start *inspection*, not enough to write
+        # RGB: every returned pixel still has to pass the connected-component,
+        # material/edge and area checks below.  Scaling this locator threshold
+        # with output resolution discarded valid studs before those checks and
+        # also prevented a pendant root from reaching its visible body.
+        if int(seed.sum()) < 1:
             return empty, empty, empty
 
         # ``side_search`` is built at the PP resolution and is intentionally
@@ -2647,7 +2939,12 @@ def refine_earring_instances_highres(
         # unmeasured label-9 island is how a source earlobe patch became a
         # dark split in the target lobe.
         candidate |= crop_observed & (~ear_interior | visual_support)
-        candidate &= (~crop_background | crop_observed)
+        # A parser commonly labels a thin pendant body as background even
+        # though the source pixels have a continuous material edge from an
+        # observed lobe-side root.  Keep only that structured candidate; the
+        # connectivity pass immediately below still rejects detached source
+        # background, and the complete-object path keeps flat regions out.
+        candidate &= (~crop_background | crop_observed | visual_support)
         candidate &= (~crop_hair_interior | near_seed)
         # Normal ear-core pixels stay forbidden.  The only expansion exception
         # is the compact, parser-anchored earlobe-stud zone above; it still
@@ -3003,7 +3300,8 @@ def refine_earring_instances_highres(
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(5), odd(5))),
             ).astype(bool)
             candidate = component_mask_connected_to_seed(
-                (edge_band & crop_local & ~crop_background) | crop_observed,
+                (edge_band & crop_local & (~crop_background | visual_support))
+                | crop_observed,
                 trusted_start,
             )
 

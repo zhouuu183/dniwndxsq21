@@ -10,6 +10,7 @@ from models.ear_modules_v5 import (
     RAW_FACE_SURFACE_LABELS,
     build_weak_earring_mask,
     dilate_mask,
+    erode_mask,
     ensure_mask_4d,
     high_pass_filter,
     low_pass_filter,
@@ -106,18 +107,8 @@ def build_v58_earring_keep_mask(
     size: tuple[int, int],
     template: torch.Tensor,
 ) -> torch.Tensor:
-    """Return target-hair override pixels for a verified earring instance.
-
-    Online proposals remain restricted to the compact target-ear visibility
-    corridor.  A generated-dataset instance, however, is already a complete
-    source-native object aligned to that exposed side.  Cropping it by the
-    corridor made the target-hair preservation objective win everywhere below
-    the earlobe, teaching long earrings as a short edge fragment.  Dataset
-    authority therefore keeps the full solid/pendant instance in front of
-    target hair while a separately stored hoop hole stays target-owned.
-    """
+    """Return the complete aligned foreground alpha used by V19 losses."""
     confident = aux.get("earring_confident_mask")
-    valid_roi = aux.get("earring_valid_roi", aux.get("visible_ear_roi"))
     if confident is None:
         return torch.zeros(
             template.size(0),
@@ -128,27 +119,11 @@ def build_v58_earring_keep_mask(
             dtype=template.dtype,
         )
     confident = resize_mask(confident, size)
-    dataset_authority = aux.get("earring_instance_is_dataset")
-    if dataset_authority is None:
-        if valid_roi is None:
-            return torch.zeros_like(confident)
-        keep = confident * resize_mask(valid_roi, size)
-    else:
-        authority = ensure_mask_4d(dataset_authority).to(
-            device=template.device,
-            dtype=template.dtype,
-        )
-        if authority.shape[0] != template.shape[0]:
-            authority = torch.zeros_like(confident[:, :, :1, :1])
-        elif authority.shape[-2:] != (1, 1):
-            authority = F.interpolate(authority, size=(1, 1), mode="nearest")
-        authority = (authority > 0.5).to(dtype=template.dtype)
-        online_keep = (
-            torch.zeros_like(confident)
-            if valid_roi is None
-            else confident * resize_mask(valid_roi, size)
-        )
-        keep = confident * authority + online_keep * (1.0 - authority)
+    # V19 treats the aligned source instance as the complete object target.
+    # Localization/visible-ear ROI is a search prior only; intersecting it
+    # here taught long earrings to stop at the lobe and made the learned
+    # branch disagree with the final source-alpha compositor.
+    keep = resize_mask(confident, size)
     hole = aux.get("hoop_hole_mask")
     if hole is not None:
         keep = keep * (1.0 - resize_mask(hole, size)).clamp(0, 1)
@@ -447,6 +422,85 @@ def revealed_skin_tone_continuity_loss(
     revealed_grad = masked_channel_mean(sobel_edges(pred_low), revealed_mask)
     seam_grad = masked_channel_mean(sobel_edges(pred_low), seam).detach()
     return (revealed_mean - recovered_mean).abs().mean() + 0.5 * (revealed_grad - seam_grad).abs().mean()
+
+
+def _revealed_boundary_bands(
+    face_mask: torch.Tensor,
+    revealed_mask: torch.Tensor,
+    size: tuple[int, int],
+    *,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the two skin bands adjacent to a revealed-skin boundary."""
+    face = resize_mask(face_mask, size)
+    revealed = resize_mask(revealed_mask, size) * face
+    inner = (revealed - erode_mask(revealed, width)).clamp(0, 1) * face
+    outer = (dilate_mask(revealed, width) - revealed).clamp(0, 1) * face
+    return inner.clamp(0, 1), outer.clamp(0, 1)
+
+
+def face_lowfreq_continuity_loss(
+    pred: torch.Tensor,
+    face_mask: torch.Tensor,
+    revealed_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize a low-frequency skin step on the two sides of one seam."""
+    inner, outer = _revealed_boundary_bands(
+        face_mask,
+        revealed_mask,
+        pred.shape[-2:],
+        width=5,
+    )
+    if inner.detach().sum().item() < 1 or outer.detach().sum().item() < 1:
+        return pred.sum() * 0.0
+    low = low_pass_filter(pred, kernel_size=25, sigma=6.0)
+    inner_mean = masked_channel_mean(low, inner)
+    outer_mean = masked_channel_mean(low, outer).detach()
+    inner_std = torch.sqrt(masked_channel_mean((low - inner_mean).pow(2), inner) + 1e-6)
+    outer_std = torch.sqrt(masked_channel_mean((low - outer_mean).pow(2), outer) + 1e-6).detach()
+    return (inner_mean - outer_mean).abs().mean() + 0.25 * (inner_std - outer_std).abs().mean()
+
+
+def revealed_boundary_seam_loss(
+    pred: torch.Tensor,
+    face_mask: torch.Tensor,
+    revealed_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Match colour and gradient statistics immediately across a mask edge."""
+    inner, outer = _revealed_boundary_bands(
+        face_mask,
+        revealed_mask,
+        pred.shape[-2:],
+        width=3,
+    )
+    if inner.detach().sum().item() < 1 or outer.detach().sum().item() < 1:
+        return pred.sum() * 0.0
+    low = low_pass_filter(pred, kernel_size=15, sigma=3.5)
+    colour = (
+        masked_channel_mean(low, inner)
+        - masked_channel_mean(low, outer).detach()
+    ).abs().mean()
+    gradient = (
+        masked_channel_mean(sobel_edges(low), inner)
+        - masked_channel_mean(sobel_edges(low), outer).detach()
+    ).abs().mean()
+    return colour + 0.5 * gradient
+
+
+def revealed_texture_stat_loss(
+    pred: torch.Tensor,
+    face_mask: torch.Tensor,
+    revealed_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Match revealed-skin texture statistics to adjacent generated skin."""
+    _inner, outer = _revealed_boundary_bands(
+        face_mask,
+        revealed_mask,
+        pred.shape[-2:],
+        width=7,
+    )
+    revealed = resize_mask(revealed_mask, pred.shape[-2:]) * resize_mask(face_mask, pred.shape[-2:])
+    return texture_stat_loss(pred, pred.detach(), revealed, outer)
 
 
 def build_weak_ear_pseudo_mask(
@@ -864,6 +918,74 @@ class EarAwareLossBuilder(LossBuilderMulti):
                     + 0.5 * masked_l1(
                         low_pass_filter(gen_F_256_01), low_pass_filter(target), normal_face
                     )
+                )
+
+        # V19 source-visible face supervision uses real source skin as an
+        # identity/detail anchor.  It is a loss mask only; the final
+        # compositor never hard-cuts this region back to source or target.
+        source_valid_face = aux.get("source_visible_skin_reference_mask", aux.get("source_skin_valid_mask"))
+        if source_valid_face is not None:
+            source_valid_face = resize_mask(source_valid_face, gen_F_256_01.shape[-2:])
+            earring_guard = resize_mask(earring_confident_mask, gen_F_256_01.shape[-2:])
+            source_valid_face = source_valid_face * (1.0 - dilate_mask(earring_guard, 3)).clamp(0, 1)
+            source_face_reference = aux.get("source_face_reference_01", source)
+            source_face_reference = F.interpolate(
+                source_face_reference,
+                size=gen_F_256_01.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).clamp(0, 1)
+            source_valid_weight = float(self.losses_dict.get("source_valid_face_high", 0.35))
+            source_color_weight = float(self.losses_dict.get("source_valid_face_color", 0.15))
+            if source_valid_weight > 0:
+                losses["source_valid_face_high"] = source_valid_weight * masked_l1(
+                    high_pass_filter(gen_F_256_01),
+                    high_pass_filter(source_face_reference),
+                    source_valid_face,
+                )
+            if source_color_weight > 0:
+                losses["source_valid_face_color"] = source_color_weight * masked_l1(
+                    low_pass_filter(gen_F_256_01),
+                    low_pass_filter(source_face_reference),
+                    source_valid_face,
+                )
+
+        # V19 trains the exact composed output against artificial revealed-skin
+        # boundaries.  These are local continuity constraints, never a request
+        # to copy source bangs into a newly exposed forehead.
+        revealed_boundary_weight = float(self.losses_dict.get("revealed_boundary_seam", 0.0))
+        revealed_texture_stat_weight = float(self.losses_dict.get("revealed_texture_stat", 0.0))
+        face_lowfreq_weight = float(self.losses_dict.get("face_lowfreq_continuity", 0.0))
+        revealed_for_v19 = aux.get("revealed_skin_mask")
+        face_for_v19 = aux.get("target_face_surface_mask")
+        if face_for_v19 is None:
+            face_for_v19 = parsing_label_mask(aux.get("target_parsing"), RAW_FACE_SURFACE_LABELS)
+        if (
+            revealed_for_v19 is not None
+            and face_for_v19 is not None
+            and (revealed_boundary_weight > 0 or revealed_texture_stat_weight > 0 or face_lowfreq_weight > 0)
+        ):
+            revealed_for_v19 = resize_mask(revealed_for_v19, gen_F_256_01.shape[-2:])
+            face_for_v19 = resize_mask(face_for_v19, gen_F_256_01.shape[-2:])
+            aux["v19_revealed_continuity_mask"] = revealed_for_v19
+            aux["v19_face_continuity_mask"] = face_for_v19
+            if face_lowfreq_weight > 0:
+                losses["face_lowfreq_continuity"] = face_lowfreq_weight * face_lowfreq_continuity_loss(
+                    gen_F_256_01,
+                    face_for_v19,
+                    revealed_for_v19,
+                )
+            if revealed_boundary_weight > 0:
+                losses["revealed_boundary_seam"] = revealed_boundary_weight * revealed_boundary_seam_loss(
+                    gen_F_256_01,
+                    face_for_v19,
+                    revealed_for_v19,
+                )
+            if revealed_texture_stat_weight > 0:
+                losses["revealed_texture_stat"] = revealed_texture_stat_weight * revealed_texture_stat_loss(
+                    gen_F_256_01,
+                    face_for_v19,
+                    revealed_for_v19,
                 )
 
         earring_confident_mask = resize_mask(earring_confident_mask, gen_F_256_01.shape[-2:])

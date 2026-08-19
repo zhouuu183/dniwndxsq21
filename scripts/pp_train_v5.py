@@ -30,9 +30,9 @@ from utils.train import WandbLogger, _LegacyUnpickler, get_fid_calc, image_grid,
 faulthandler.enable(all_threads=True)
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
-# Must match ``scripts/pp_gen_v5.py``.  Schema 18 separates the complete,
-# source-safe PP learning target from the strict source-RGB instance contract.
-PP_DATASET_SCHEMA_VERSION = 18
+# Must match ``scripts/pp_gen_v5.py``.  Schema 20 uses the same complete
+# source-native foreground instance but clean pre-PP hairline targets.
+PP_DATASET_SCHEMA_VERSION = 20
 PP_EXTRA_MASK_KEYS = (
     "cleanup_inner_edge",
     "revealed_skin_mask",
@@ -73,13 +73,13 @@ VAL_COLUMNS = (
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_instance_v18_foreground_learning")
-USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long_instance_v18_foreground_learning")
-USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_instance_v18_foreground_learning"
+USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_instance_v20_hair_boundary_face_detail")
+USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long_instance_v20_hair_boundary_face_detail")
+USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_instance_v20_hair_boundary_face_detail"
 
-USER_DATASET_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v18_foreground_learning")
-USER_OUTPUT_DIR_FULL = Path("output/pp_v5_checkpoints_full_instance_v18_foreground_learning")
-USER_RUN_NAME_FULL = "ear_refine_v5_dual_full_instance_v18_foreground_learning"
+USER_DATASET_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v20_hair_boundary_face_detail")
+USER_OUTPUT_DIR_FULL = Path("output/pp_v5_checkpoints_full_instance_v20_hair_boundary_face_detail")
+USER_RUN_NAME_FULL = "ear_refine_v5_dual_full_instance_v20_hair_boundary_face_detail"
 
 USER_FID_DATASET = "fid_images"
 USER_USE_FID = False
@@ -291,6 +291,16 @@ USER_LAMBDA_CLEANUP_HIGH = 0.0
 USER_LAMBDA_CLEANUP_TEXTURE_STAT = 0.0
 USER_LAMBDA_DETAIL_HIGH = 0.0
 USER_LAMBDA_DETAIL_LOW_ANCHOR = 1.5
+# V19 keeps the entire PP face as one image authority, then supervises real
+# source-visible skin as a high-frequency/color anchor through loss masks.
+USER_LAMBDA_SOURCE_VALID_FACE_HIGH = 0.35
+USER_LAMBDA_SOURCE_VALID_FACE_COLOR = 0.15
+# V19 continuity losses act only across the revealed-skin boundary.  They do
+# not blur or overwrite the face during compositing, and they leave the normal
+# joint_highres training cadence unchanged.
+USER_LAMBDA_FACE_LOWFREQ_CONTINUITY = 0.30
+USER_LAMBDA_REVEALED_BOUNDARY_SEAM = 0.35
+USER_LAMBDA_REVEALED_TEXTURE_STAT = 0.12
 # Revealed skin is constrained only against neighbouring target/PP skin; the
 # loss implementation no longer copies source bang-hidden RGB/texture.
 # PP owns ordinary face pixels.  Do not pull them back toward smooth SATD
@@ -528,6 +538,11 @@ RESOLVED_USER_CONFIG = {
     "cleanup_texture_stat": USER_LAMBDA_CLEANUP_TEXTURE_STAT,
     "detail_high": USER_LAMBDA_DETAIL_HIGH,
     "detail_low_anchor": USER_LAMBDA_DETAIL_LOW_ANCHOR,
+    "source_valid_face_high": USER_LAMBDA_SOURCE_VALID_FACE_HIGH,
+    "source_valid_face_color": USER_LAMBDA_SOURCE_VALID_FACE_COLOR,
+    "face_lowfreq_continuity": USER_LAMBDA_FACE_LOWFREQ_CONTINUITY,
+    "revealed_boundary_seam": USER_LAMBDA_REVEALED_BOUNDARY_SEAM,
+    "revealed_texture_stat": USER_LAMBDA_REVEALED_TEXTURE_STAT,
     "revealed_skin_texture": USER_LAMBDA_REVEALED_SKIN_TEXTURE,
     "revealed_skin_tone": USER_LAMBDA_REVEALED_SKIN_TONE,
     "normal_face_preserve": USER_LAMBDA_NORMAL_FACE_PRESERVE,
@@ -763,6 +778,11 @@ def build_parser(defaults):
     parser.add_argument("--cleanup_texture_stat", type=float, default=defaults["cleanup_texture_stat"])
     parser.add_argument("--detail_high", type=float, default=defaults["detail_high"])
     parser.add_argument("--detail_low_anchor", type=float, default=defaults["detail_low_anchor"])
+    parser.add_argument("--source_valid_face_high", type=float, default=defaults["source_valid_face_high"])
+    parser.add_argument("--source_valid_face_color", type=float, default=defaults["source_valid_face_color"])
+    parser.add_argument("--face_lowfreq_continuity", type=float, default=defaults["face_lowfreq_continuity"])
+    parser.add_argument("--revealed_boundary_seam", type=float, default=defaults["revealed_boundary_seam"])
+    parser.add_argument("--revealed_texture_stat", type=float, default=defaults["revealed_texture_stat"])
     parser.add_argument("--revealed_skin_texture", type=float, default=defaults["revealed_skin_texture"])
     parser.add_argument("--revealed_skin_tone", type=float, default=defaults["revealed_skin_tone"])
     parser.add_argument("--normal_face_preserve", type=float, default=defaults["normal_face_preserve"])
@@ -943,6 +963,11 @@ class TrainerV5:
                 "cleanup_texture_stat": args.cleanup_texture_stat,
                 "detail_high": args.detail_high,
                 "detail_low_anchor": args.detail_low_anchor,
+                "source_valid_face_high": args.source_valid_face_high,
+                "source_valid_face_color": args.source_valid_face_color,
+                "face_lowfreq_continuity": args.face_lowfreq_continuity,
+                "revealed_boundary_seam": args.revealed_boundary_seam,
+                "revealed_texture_stat": args.revealed_texture_stat,
                 "revealed_skin_texture": args.revealed_skin_texture,
                 "revealed_skin_tone": args.revealed_skin_tone,
                 "normal_face_preserve": args.normal_face_preserve,
@@ -1222,6 +1247,9 @@ class TrainerV5:
                         merge_dataset_aux_mask(key, resolve_dataset_gate(DATASET_AUX_MASK_FLAGS[key]))
                 else:
                     aux[key] = batch[key]
+        for key in ("earring_presence_state", "earring_instance_confidence"):
+            if key in batch:
+                aux[key] = batch[key]
         if "earring_search_mask" in batch and aux.get("earring_search_mask") is None:
             merge_dataset_aux_mask(
                 "earring_search_mask",
@@ -1590,6 +1618,9 @@ class PPDatasetV5(Dataset):
         sample["left_ear_roi"] = right_roi
         sample["right_ear_roi"] = left_roi
         sample["presence_target"] = sample["presence_target"][[1, 0, 2]]
+        for key in ("earring_presence_state", "earring_instance_confidence"):
+            if key in sample:
+                sample[key] = sample[key][[1, 0]]
         return sample
 
     def __getitem__(self, idx):
@@ -1629,6 +1660,12 @@ class PPDatasetV5(Dataset):
             "earring_learning_reference": item.get(
                 "earring_learning_reference",
                 item.get("earring_reference", item["target"]),
+            ).clone(),
+            "earring_presence_state": item.get(
+                "earring_presence_state", torch.zeros(2, dtype=torch.float32)
+            ).clone(),
+            "earring_instance_confidence": item.get(
+                "earring_instance_confidence", torch.zeros(2, dtype=torch.float32)
             ).clone(),
             "hoop_instance_mask": item.get("hoop_instance_mask", torch.zeros_like(fallback_mask)).clone(),
             "hoop_hole_mask": item.get("hoop_hole_mask", torch.zeros_like(fallback_mask)).clone(),
