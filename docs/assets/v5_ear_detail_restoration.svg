@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="500" viewBox="0 0 1200 500" role="img" aria-labelledby="title desc">
+  <title id="title">v5 anchor-constrained earring detail recovery</title>
+  <desc id="desc">The v5 module builds an ear-lobe anchored query, constructs high-frequency and fine-mask earring priors, adapts them to the blend brightness, and applies shared HFDA residual injection before the 64 and 128 resolution StyleGAN2 decoder stages.</desc>
+  <defs>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#147f5e"/></marker>
+    <marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10z" fill="#6c8194"/></marker>
+    <style>
+      .title{font:700 18px Arial,Helvetica,sans-serif;fill:#26353c;letter-spacing:0}
+      .head{font:700 16px Arial,Helvetica,sans-serif;fill:#147f5e;letter-spacing:0}
+      .bluehead{font:700 16px Arial,Helvetica,sans-serif;fill:#5c7e9e;letter-spacing:0}
+      .label{font:700 12px Arial,Helvetica,sans-serif;fill:#27363d;letter-spacing:0}
+      .small{font:400 11px Arial,Helvetica,sans-serif;fill:#52636c;letter-spacing:0}
+      .tiny{font:400 9px Arial,Helvetica,sans-serif;fill:#6b7a82;letter-spacing:0}
+      .math{font:700 12px Arial,Helvetica,sans-serif;fill:#147f5e;letter-spacing:0}
+      .module{fill:#f5fbf8;stroke:#147f5e;stroke-width:1.35}
+      .op{fill:#ffffff;stroke:#147f5e;stroke-width:1.1}
+      .frozen{fill:#f3f7fb;stroke:#7a9fc4;stroke-width:1.35}
+      .g{fill:none;stroke:#147f5e;stroke-width:1.8;marker-end:url(#ag)}
+      .b{fill:none;stroke:#6c8194;stroke-width:1.8;marker-end:url(#ab)}
+      .d{fill:none;stroke:#147f5e;stroke-width:1.55;stroke-dasharray:5 4;marker-end:url(#ag)}
+    </style>
+  </defs>
+  <rect width="1200" height="500" fill="#ffffff"/>
+  <text x="24" y="31" class="title">v5. Anchor-constrained earring detail recovery</text>
+  <text x="1176" y="29" text-anchor="end" class="tiny">proposed: green   frozen StyleGAN2: blue</text>
+  <line x1="24" y1="47" x2="1176" y2="47" stroke="#d6e0e3"/>
+
+  <!-- source and preliminary blend -->
+  <text x="66" y="91" text-anchor="middle" class="label">Source I_s</text>
+  <rect x="22" y="101" width="88" height="88" fill="#fff" stroke="#33434b" stroke-width="1.1"/>
+  <image x="26" y="105" width="80" height="80" preserveAspectRatio="xMidYMid slice" xlink:href="v5_ear_source_example.png" href="v5_ear_source_example.png"/>
+  <text x="66" y="292" text-anchor="middle" class="label">Blend I_b</text>
+  <rect x="22" y="302" width="88" height="88" fill="#fff" stroke="#33434b" stroke-width="1.1"/>
+  <image x="26" y="306" width="80" height="80" opacity="0.6" preserveAspectRatio="xMidYMid slice" xlink:href="v5_ear_source_example.png" href="v5_ear_source_example.png"/>
+  <text x="66" y="407" text-anchor="middle" class="tiny">preliminary blend</text>
+
+  <!-- anchor localizer -->
+  <rect x="140" y="72" width="250" height="346" rx="7" class="module"/>
+  <text x="160" y="102" class="head">Anchor-guided localization</text>
+  <text x="160" y="122" class="small">frozen parsing + visible ear</text>
+  <path d="M110 145H126V166H140" class="d"/><path d="M110 346H126V190H140" class="d"/>
+  <rect x="160" y="146" width="47" height="61" rx="3" class="op"/>
+  <text x="183" y="166" text-anchor="middle" class="tiny">parsing</text>
+  <rect x="168" y="178" width="11" height="11" fill="#e5a27e"/><rect x="185" y="178" width="11" height="11" fill="#76b7c0"/>
+  <rect x="168" y="193" width="11" height="9" fill="#9bc98a"/><rect x="185" y="193" width="11" height="9" fill="#ddc86d"/>
+  <path d="M209 177H223" class="g"/>
+  <rect x="226" y="141" width="141" height="70" rx="3" class="op"/>
+  <path d="M239 196 C239 167 260 150 281 150 C303 150 334 167 353 196" fill="none" stroke="#8d9ba1" stroke-width="3"/>
+  <circle cx="246" cy="193" r="6" fill="none" stroke="#147f5e" stroke-width="2"/><circle cx="346" cy="193" r="6" fill="none" stroke="#147f5e" stroke-width="2"/>
+  <path d="M246 199V205M346 199V205" stroke="#147f5e" stroke-width="2"/>
+  <text x="296" y="230" text-anchor="middle" class="tiny">ear-lobe landmarks</text>
+  <path d="M296 240V259" class="g"/>
+  <rect x="254" y="262" width="84" height="63" rx="3" fill="#e2f3e9" stroke="#147f5e"/>
+  <path d="M265 316 Q274 271 284 316 M302 316 Q314 271 327 316" fill="none" stroke="#147f5e" stroke-width="4"/>
+  <text x="296" y="348" text-anchor="middle" class="math">ear query Q</text>
+  <text x="160" y="393" class="tiny">spatially stable ear support</text>
+
+  <!-- earring-aware prior construction -->
+  <rect x="415" y="72" width="320" height="346" rx="7" class="module"/>
+  <text x="435" y="102" class="head">Earring-aware prior</text>
+  <text x="435" y="122" class="small">high-frequency detail + dynamic mask</text>
+  <text x="435" y="151" class="label">High-frequency extractor</text>
+  <rect x="435" y="163" width="35" height="45" fill="#263338"/>
+  <image x="439" y="167" width="27" height="37" preserveAspectRatio="xMidYMid slice" xlink:href="v5_ear_source_example.png" href="v5_ear_source_example.png"/>
+  <path d="M472 185H482" class="g"/><circle cx="496" cy="185" r="13" fill="#f0f4de" stroke="#849660"/><text x="496" y="189" text-anchor="middle" class="label">G</text>
+  <path d="M510 185H520" class="g"/><circle cx="535" cy="185" r="13" class="op"/><text x="535" y="190" text-anchor="middle" class="label">-</text>
+  <path d="M549 185H559" class="g"/>
+  <g stroke="#3b755f" stroke-width="0.8"><polygon points="561,168 573,156 573,212 561,224" fill="#a1d7b4"/><polygon points="573,156 580,161 580,217 573,212" fill="#278664"/><polygon points="585,176 597,164 597,204 585,216" fill="#a1d7b4"/><polygon points="597,164 604,169 604,209 597,204" fill="#278664"/></g>
+  <path d="M607 185H617" class="g"/><rect x="619" y="163" width="31" height="45" fill="#e2f3e9" stroke="#147f5e"/><rect x="625" y="169" width="7" height="31" fill="#278664"/><rect x="638" y="169" width="7" height="20" fill="#91d1a9"/>
+  <text x="635" y="225" text-anchor="middle" class="math">P_HF</text>
+  <text x="545" y="241" text-anchor="middle" class="tiny">I_s - Gsigma(I_s), Conv 3x3</text>
+  <line x1="435" y1="255" x2="714" y2="255" stroke="#cbded4"/>
+  <text x="435" y="279" class="label">Recall and fine-mask refinement</text>
+  <rect x="435" y="292" width="34" height="49" fill="#20272a"/><path d="M441 333L447 301L453 336L460 309L466 328" fill="none" stroke="#f0a171" stroke-width="2"/>
+  <path d="M471 316H481" class="g"/><rect x="484" y="292" width="32" height="49" class="op"/><path d="M490 332Q500 300 510 332" fill="none" stroke="#147f5e" stroke-width="4"/>
+  <text x="500" y="358" text-anchor="middle" class="math">M_e</text>
+  <path d="M518 316H528" class="g"/>
+  <g stroke="#3b755f" stroke-width="0.8"><polygon points="530,298 542,287 542,346 530,357" fill="#a1d7b4"/><polygon points="542,287 549,292 549,351 542,346" fill="#278664"/><polygon points="553,306 565,295 565,342 553,353" fill="#a1d7b4"/><polygon points="565,295 572,300 572,347 565,342" fill="#278664"/><polygon points="576,314 588,303 588,337 576,348" fill="#a1d7b4"/><polygon points="588,303 595,308 595,342 588,337" fill="#278664"/></g>
+  <path d="M598 316H608" class="g"/><rect x="610" y="295" width="28" height="42" class="op"/><text x="624" y="320" text-anchor="middle" class="tiny">1x1</text><path d="M640 316H650" class="g"/>
+  <rect x="652" y="295" width="27" height="42" fill="#e2f3e9" stroke="#147f5e"/><path d="M658 330Q665 301 673 330" fill="none" stroke="#147f5e" stroke-width="3"/>
+  <text x="665" y="358" text-anchor="middle" class="math">M_f</text>
+  <text x="567" y="390" text-anchor="middle" class="tiny">edge / contrast recall; Conv 3x3 + SiLU; sigmoid</text>
+  <path d="M338 293H400V185H415" class="g"/><path d="M338 293H400V316H415" class="g"/>
+
+  <!-- brightness adaptation -->
+  <rect x="755" y="72" width="175" height="346" rx="7" class="module"/>
+  <text x="775" y="102" class="head">Brightness</text><text x="775" y="122" class="head">re-estimator</text>
+  <text x="842" y="146" text-anchor="middle" class="tiny">P_HF, M_f, I_b, Q</text>
+  <g stroke="#4a907c" stroke-width="0.8"><polygon points="776,166 789,154 789,229 776,241" fill="#aeddd3"/><polygon points="789,154 797,159 797,234 789,229" fill="#4b9b86"/><polygon points="801,178 814,166 814,222 801,234" fill="#aeddd3"/><polygon points="814,166 822,171 822,227 814,222" fill="#4b9b86"/></g>
+  <path d="M825 198H834" class="g"/><circle cx="850" cy="198" r="14" class="op"/><text x="850" y="202" text-anchor="middle" class="tiny">GAP</text><path d="M865 198H874" class="g"/>
+  <rect x="877" y="174" width="35" height="18" class="op"/><rect x="877" y="205" width="35" height="18" class="op"/><text x="894" y="187" text-anchor="middle" class="tiny">FC g</text><text x="894" y="218" text-anchor="middle" class="tiny">FC b</text>
+  <text x="842" y="270" text-anchor="middle" class="math">P'_HF = g P_HF + b</text>
+  <rect x="826" y="287" width="33" height="38" fill="#e2f3e9" stroke="#147f5e"/><rect x="832" y="293" width="7" height="25" fill="#278664"/><rect x="846" y="293" width="7" height="15" fill="#91d1a9"/>
+  <text x="842" y="351" text-anchor="middle" class="math">adapted P'_HF</text>
+  <path d="M650 185H755" class="g"/><path d="M679 316H720V225H755" class="g"/>
+
+  <!-- decoder and shared injection -->
+  <rect x="950" y="72" width="226" height="346" rx="7" class="frozen"/>
+  <text x="970" y="102" class="bluehead">Frozen StyleGAN2</text>
+  <text x="970" y="122" class="small">two-scale detail injection</text>
+  <rect x="970" y="143" width="186" height="84" rx="4" fill="#ffffff" stroke="#147f5e" stroke-width="1.2"/>
+  <text x="984" y="165" class="math">shared HFDA</text>
+  <rect x="984" y="177" width="27" height="31" class="op"/><text x="997" y="197" text-anchor="middle" class="tiny">1x1</text><path d="M1013 192H1020" class="g"/>
+  <circle cx="1032" cy="192" r="11" class="op"/><text x="1032" y="196" text-anchor="middle" class="label">||</text><path d="M1044 192H1051" class="g"/>
+  <rect x="1053" y="177" width="31" height="31" class="op"/><text x="1068" y="190" text-anchor="middle" class="tiny">3x3</text><text x="1068" y="202" text-anchor="middle" class="tiny">1x1</text><path d="M1086 192H1093" class="g"/>
+  <text x="1118" y="196" text-anchor="middle" class="tiny">M_f x dF</text>
+  <path d="M930 306H950V192H970" class="g"/>
+  <text x="1062" y="248" text-anchor="middle" class="tiny">shared residuals at 64^2 and 128^2</text>
+  <rect x="967" y="278" width="31" height="38" class="op"/><text x="982" y="294" text-anchor="middle" class="tiny">F64</text><text x="982" y="306" text-anchor="middle" class="tiny">64^2</text>
+  <path d="M999 297H1006" class="b"/><circle cx="1020" cy="297" r="12" fill="#fff" stroke="#147f5e" stroke-width="1.5"/><text x="1020" y="302" text-anchor="middle" class="head">+</text>
+  <path d="M1033 297H1040" class="b"/>
+  <g stroke="#55779a" stroke-width="0.8"><polygon points="1042,279 1056,269 1056,320 1042,330" fill="#a9c9ec"/><polygon points="1056,269 1064,274 1064,325 1056,320" fill="#7397c2"/><polygon points="1067,287 1081,277 1081,312 1067,322" fill="#a9c9ec"/><polygon points="1081,277 1089,282 1089,317 1081,312" fill="#7397c2"/></g>
+  <text x="1066" y="345" text-anchor="middle" class="tiny">G5</text>
+  <path d="M1091 297H1098" class="b"/><rect x="1100" y="278" width="31" height="38" class="op"/><rect x="1106" y="284" width="5" height="26" fill="#7ea7d3"/><rect x="1116" y="284" width="5" height="17" fill="#b1ceec"/><text x="1115" y="332" text-anchor="middle" class="tiny">F128</text>
+  <path d="M1132 297H1139" class="b"/><circle cx="1152" cy="297" r="12" fill="#fff" stroke="#147f5e" stroke-width="1.5"/><text x="1152" y="302" text-anchor="middle" class="head">+</text>
+  <path d="M1165 297H1172" class="b"/>
+  <text x="1171" y="317" class="tiny">G6-8</text>
+  <path d="M1020 227V284" class="g"/><path d="M1152 227V284" class="g"/>
+  <text x="1020" y="270" text-anchor="middle" class="tiny">@64^2</text><text x="1152" y="270" text-anchor="middle" class="tiny">@128^2</text>
+  <text x="970" y="391" class="tiny">F' = F + M_f x dF</text>
+  <text x="1176" y="460" text-anchor="end" class="tiny">Anchor -> high-frequency prior / fine mask -> brightness adaptation -> shared two-scale HFDA</text>
+</svg>
