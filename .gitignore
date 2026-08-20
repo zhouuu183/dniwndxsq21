@@ -1,0 +1,11 @@
+notebooks/
+pretrained_models/
+
+__pycache__/
+*.py[cod]
+*.pyc.*
+
+.vscode/
+.DS_Store
+*.out
+*.md

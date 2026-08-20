@@ -1,0 +1,30 @@
+[
+  {
+    "phase": "v235_hair_only_chroma_disentanglement_diagnostic_only",
+    "version": "v2.35",
+    "training": false,
+    "mode": "HAIR_ONLY_CHROMA_DISENTANGLEMENT",
+    "full_image_color_embedding": false,
+    "full_feature_injection": false,
+    "luminance_preserve": true,
+    "target_structure_owner": "STRONG_ANCHOR",
+    "summary": {
+      "median_base_leakage_fraction": 0.6178925335407257,
+      "median_boundary_chroma_error": 0.3012894243001938,
+      "median_confidence_mean": 0.07661445811390877,
+      "median_face_rgb_change": 0.0,
+      "median_face_rgb_change_max": 0.0,
+      "median_hair_chroma_ab_error": 11.739115715026855,
+      "median_hair_reference_progress": 0.3285479098558426,
+      "median_non_hair_change_max": 0.0,
+      "median_non_hair_leakage_max": 0.0,
+      "median_non_hair_leakage_mean": 0.0,
+      "median_texture_preservation_error": 0.00025192080647684634,
+      "count": 64
+    },
+    "failed_gates": [
+      "V235_HAIR_CHROMA_FAIL"
+    ],
+    "automatic_decision": "V235_HAIR_CHROMA_FAIL"
+  }
+]

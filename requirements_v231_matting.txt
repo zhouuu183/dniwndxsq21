@@ -1,0 +1,6 @@
+# Transformers 5.x requires PyTorch >=2.5 and disables the backend in the
+# HairFastGAN torch 1.13 environment. This 4.x set includes ViTMatte support.
+transformers==4.39.3
+tokenizers==0.15.2
+huggingface_hub==0.22.2
+safetensors==0.4.3
