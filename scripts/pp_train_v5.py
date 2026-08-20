@@ -30,9 +30,9 @@ from utils.train import WandbLogger, _LegacyUnpickler, get_fid_calc, image_grid,
 faulthandler.enable(all_threads=True)
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
-# Must match ``scripts/pp_gen_v5.py``.  Schema 20 uses the same complete
-# source-native foreground instance but clean pre-PP hairline targets.
-PP_DATASET_SCHEMA_VERSION = 20
+# Must match ``scripts/pp_gen_v5.py``. Schema 22 also stores the completed
+# high-resolution hair transfer as an immutable final-output authority.
+PP_DATASET_SCHEMA_VERSION = 22
 PP_EXTRA_MASK_KEYS = (
     "cleanup_inner_edge",
     "revealed_skin_mask",
@@ -73,13 +73,13 @@ VAL_COLUMNS = (
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_instance_v20_hair_boundary_face_detail")
-USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long_instance_v20_hair_boundary_face_detail")
-USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_instance_v20_hair_boundary_face_detail"
+USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_hair_locked_v5")
+USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long_hair_locked_v5")
+USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_hair_locked_v5"
 
-USER_DATASET_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v20_hair_boundary_face_detail")
-USER_OUTPUT_DIR_FULL = Path("output/pp_v5_checkpoints_full_instance_v20_hair_boundary_face_detail")
-USER_RUN_NAME_FULL = "ear_refine_v5_dual_full_instance_v20_hair_boundary_face_detail"
+USER_DATASET_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v21_structural_correction")
+USER_OUTPUT_DIR_FULL = Path("output/pp_v5_checkpoints_full_instance_v21_structural_correction")
+USER_RUN_NAME_FULL = "ear_refine_v5_dual_full_instance_v21_structural_correction"
 
 USER_FID_DATASET = "fid_images"
 USER_USE_FID = False
@@ -94,7 +94,7 @@ USER_VAL_SIZE = 512
 USER_VAL_PREVIEW_COUNT = 50
 # Filling a small validation split with training samples runs extra full
 # inference passes, but does not contribute to validation loss or training.
-USER_VAL_SUPPLEMENT_TRAIN_PREVIEWS = False
+USER_VAL_SUPPLEMENT_TRAIN_PREVIEWS = True
 USER_GRAD_ACCUM_STEPS = 2
 
 USER_TRAINING_STAGE = "joint_highres"  # "ear_only", "joint_highres", or "full"
@@ -102,6 +102,17 @@ USER_PRETRAIN = False
 USER_FINETUNE = False
 USER_USE_MOD = True
 USER_USE_FULL = True
+
+# V5 structural compositor contract. These are intentionally independent from
+# legacy write/search-mask knobs, which are ignored by the final source-native
+# compositor.
+USER_ENABLE_V5_STRUCTURAL_COMPOSITOR = True
+USER_FACE_CONTINUITY_WORK_SIZE = 512
+USER_FACE_DETAIL_SOFT_EDGE = 6
+USER_FACE_HAIR_SOFT_EDGE = 4
+USER_EARRING_USE_NATIVE_COORD_CONTRACT = True
+USER_EARRING_COMPONENT_MAX_DEPTH = 4
+USER_EARRING_COMPONENT_MAX_CUMULATIVE_COST = 1.85
 
 USER_ITER_BEFORE_ADV = 10_000
 USER_D_REG_EVERY = 16
@@ -291,11 +302,17 @@ USER_LAMBDA_CLEANUP_HIGH = 0.0
 USER_LAMBDA_CLEANUP_TEXTURE_STAT = 0.0
 USER_LAMBDA_DETAIL_HIGH = 0.0
 USER_LAMBDA_DETAIL_LOW_ANCHOR = 1.5
-# V19 keeps the entire PP face as one image authority, then supervises real
+# V5 keeps the entire PP face as one image authority, then supervises real
 # source-visible skin as a high-frequency/color anchor through loss masks.
 USER_LAMBDA_SOURCE_VALID_FACE_HIGH = 0.35
 USER_LAMBDA_SOURCE_VALID_FACE_COLOR = 0.15
-# V19 continuity losses act only across the revealed-skin boundary.  They do
+USER_LAMBDA_FACE_SOURCE_DETAIL_HR = 1.0
+USER_LAMBDA_FACE_LOWFREQ_ANCHOR_HR = 0.35
+USER_LAMBDA_FACE_LOWFREQ_CONTINUITY_HR = 1.0
+USER_LAMBDA_REVEALED_BOUNDARY_SEAM_HR = 1.5
+USER_LAMBDA_REVEALED_SOURCE_TEXTURE_STAT_HR = 0.60
+USER_LAMBDA_FACE_HAIR_BOUNDARY_SEAM_HR = 1.0
+# V5 continuity losses act only across the revealed-skin boundary.  They do
 # not blur or overwrite the face during compositing, and they leave the normal
 # joint_highres training cadence unchanged.
 USER_LAMBDA_FACE_LOWFREQ_CONTINUITY = 0.30
@@ -396,6 +413,13 @@ RESOLVED_USER_CONFIG = {
     "pretrain": USER_PRETRAIN,
     "finetune": USER_FINETUNE,
     "training_stage": USER_TRAINING_STAGE,
+    "enable_v5_structural_compositor": USER_ENABLE_V5_STRUCTURAL_COMPOSITOR,
+    "face_continuity_work_size": USER_FACE_CONTINUITY_WORK_SIZE,
+    "face_detail_soft_edge": USER_FACE_DETAIL_SOFT_EDGE,
+    "face_hair_soft_edge": USER_FACE_HAIR_SOFT_EDGE,
+    "earring_use_native_coord_contract": USER_EARRING_USE_NATIVE_COORD_CONTRACT,
+    "earring_component_max_depth": USER_EARRING_COMPONENT_MAX_DEPTH,
+    "earring_component_max_cumulative_cost": USER_EARRING_COMPONENT_MAX_CUMULATIVE_COST,
     "ear_parse_size": USER_EAR_PARSE_SIZE,
     "ear_feature_channels": USER_EAR_FEATURE_CHANNELS,
     "ear_low_alpha": USER_EAR_LOW_ALPHA,
@@ -540,6 +564,12 @@ RESOLVED_USER_CONFIG = {
     "detail_low_anchor": USER_LAMBDA_DETAIL_LOW_ANCHOR,
     "source_valid_face_high": USER_LAMBDA_SOURCE_VALID_FACE_HIGH,
     "source_valid_face_color": USER_LAMBDA_SOURCE_VALID_FACE_COLOR,
+    "face_source_detail_hr": USER_LAMBDA_FACE_SOURCE_DETAIL_HR,
+    "face_lowfreq_anchor_hr": USER_LAMBDA_FACE_LOWFREQ_ANCHOR_HR,
+    "face_lowfreq_continuity_hr": USER_LAMBDA_FACE_LOWFREQ_CONTINUITY_HR,
+    "revealed_boundary_seam_hr": USER_LAMBDA_REVEALED_BOUNDARY_SEAM_HR,
+    "revealed_source_texture_stat_hr": USER_LAMBDA_REVEALED_SOURCE_TEXTURE_STAT_HR,
+    "face_hair_boundary_seam_hr": USER_LAMBDA_FACE_HAIR_BOUNDARY_SEAM_HR,
     "face_lowfreq_continuity": USER_LAMBDA_FACE_LOWFREQ_CONTINUITY,
     "revealed_boundary_seam": USER_LAMBDA_REVEALED_BOUNDARY_SEAM,
     "revealed_texture_stat": USER_LAMBDA_REVEALED_TEXTURE_STAT,
@@ -628,6 +658,17 @@ def build_parser(defaults):
     parser.add_argument("--pretrain", type=str2bool, default=defaults["pretrain"])
     parser.add_argument("--finetune", type=str2bool, default=defaults["finetune"])
     parser.add_argument("--training_stage", type=str, default=defaults["training_stage"])
+    parser.add_argument(
+        "--enable_v5_structural_compositor",
+        type=str2bool,
+        default=defaults["enable_v5_structural_compositor"],
+    )
+    parser.add_argument("--face_continuity_work_size", type=int, default=defaults["face_continuity_work_size"])
+    parser.add_argument("--face_detail_soft_edge", type=int, default=defaults["face_detail_soft_edge"])
+    parser.add_argument("--face_hair_soft_edge", type=int, default=defaults["face_hair_soft_edge"])
+    parser.add_argument("--earring_use_native_coord_contract", type=str2bool, default=defaults["earring_use_native_coord_contract"])
+    parser.add_argument("--earring_component_max_depth", type=int, default=defaults["earring_component_max_depth"])
+    parser.add_argument("--earring_component_max_cumulative_cost", type=float, default=defaults["earring_component_max_cumulative_cost"])
     parser.add_argument("--ear_parse_size", type=int, default=defaults["ear_parse_size"])
     parser.add_argument("--ear_feature_channels", type=int, default=defaults["ear_feature_channels"])
     parser.add_argument("--ear_low_alpha", type=float, default=defaults["ear_low_alpha"])
@@ -780,6 +821,12 @@ def build_parser(defaults):
     parser.add_argument("--detail_low_anchor", type=float, default=defaults["detail_low_anchor"])
     parser.add_argument("--source_valid_face_high", type=float, default=defaults["source_valid_face_high"])
     parser.add_argument("--source_valid_face_color", type=float, default=defaults["source_valid_face_color"])
+    parser.add_argument("--face_source_detail_hr", type=float, default=defaults["face_source_detail_hr"])
+    parser.add_argument("--face_lowfreq_anchor_hr", type=float, default=defaults["face_lowfreq_anchor_hr"])
+    parser.add_argument("--face_lowfreq_continuity_hr", type=float, default=defaults["face_lowfreq_continuity_hr"])
+    parser.add_argument("--revealed_boundary_seam_hr", type=float, default=defaults["revealed_boundary_seam_hr"])
+    parser.add_argument("--revealed_source_texture_stat_hr", type=float, default=defaults["revealed_source_texture_stat_hr"])
+    parser.add_argument("--face_hair_boundary_seam_hr", type=float, default=defaults["face_hair_boundary_seam_hr"])
     parser.add_argument("--face_lowfreq_continuity", type=float, default=defaults["face_lowfreq_continuity"])
     parser.add_argument("--revealed_boundary_seam", type=float, default=defaults["revealed_boundary_seam"])
     parser.add_argument("--revealed_texture_stat", type=float, default=defaults["revealed_texture_stat"])
@@ -965,6 +1012,13 @@ class TrainerV5:
                 "detail_low_anchor": args.detail_low_anchor,
                 "source_valid_face_high": args.source_valid_face_high,
                 "source_valid_face_color": args.source_valid_face_color,
+                "enable_v5_structural_compositor": args.enable_v5_structural_compositor,
+                "face_source_detail_hr": args.face_source_detail_hr,
+                "face_lowfreq_anchor_hr": args.face_lowfreq_anchor_hr,
+                "face_lowfreq_continuity_hr": args.face_lowfreq_continuity_hr,
+                "revealed_boundary_seam_hr": args.revealed_boundary_seam_hr,
+                "revealed_source_texture_stat_hr": args.revealed_source_texture_stat_hr,
+                "face_hair_boundary_seam_hr": args.face_hair_boundary_seam_hr,
                 "face_lowfreq_continuity": args.face_lowfreq_continuity,
                 "revealed_boundary_seam": args.revealed_boundary_seam,
                 "revealed_texture_stat": args.revealed_texture_stat,
@@ -1130,6 +1184,7 @@ class TrainerV5:
         source_full = batch["source"]
         source = self.downsample_256(source_full).clip(0, 1)
         target = batch["target"]
+        completed_hair_highres = batch["completed_hair_highres"].clamp(0, 1)
         target_mask = batch["target_mask"]
         HT_E = batch["HT_E"]
         use_dataset_earring_aux = bool(getattr(self.args, "use_dataset_earring_aux", False))
@@ -1175,6 +1230,8 @@ class TrainerV5:
             target_parsing=batch["target_parsing"],
             source_hair_mask=batch["source_hair_mask"],
             target_hair_mask=batch["target_hair_mask"],
+            authoritative_hair_highres=self.normalize(completed_hair_highres),
+            authoritative_target_highres=self.normalize(completed_hair_highres),
             query_mask=batch["query_mask"],
             source_ear_mask=source_ear_mask,
             source_earring_object_mask=source_earring_object_mask,
@@ -1191,6 +1248,13 @@ class TrainerV5:
             revealed_skin_seam_mask=batch.get("revealed_skin_seam_mask"),
             source_visible_skin_reference_mask=batch.get("source_visible_skin_reference_mask"),
             source_skin_valid_mask=batch.get("source_skin_valid_mask"),
+        )
+        # The V5 final compositor consumes these runtime-only controls from
+        # its args; keep them explicit rather than falling back to legacy
+        # rail/write-mask defaults.
+        aux["v5_structural_compositor_enabled"] = torch.full_like(
+            source[:, :1],
+            float(self.args.enable_v5_structural_compositor),
         )
         for key in CLEANUP_MASK_KEYS:
             aux[key] = batch[key]
@@ -1434,6 +1498,10 @@ class TrainerV5:
                             idx,
                         )
                     )
+                    if len(highres_preview_files) < preview_count:
+                        highres_preview_files.append(
+                            ((gen_im_F[idx] + 1) / 2).detach().cpu().clamp(0, 1)
+                        )
 
                 del source, target, target_mask, HT_E, gen_im_W, F_w, gen_im_F, latent_f, aux
                 del gen_w_256, gen_f_256
@@ -1461,16 +1529,9 @@ class TrainerV5:
                 preview_dataset._reported_missing_preview_references = True
 
         if preview_files and len(preview_files) < preview_count:
-            repeat_pool = train_preview_files if train_preview_files else list(preview_files)
-            repeat_count = preview_count - len(preview_files)
-            preview_files.extend(
-                repeat_pool[idx % len(repeat_pool)]
-                for idx in range(repeat_count)
-            )
-            repeat_source = "training" if train_preview_files else "validation"
             print(
-                f"Validation preview request ({preview_count}) exceeds the number of available unique samples; "
-                f"reused {repeat_count} {repeat_source} preview(s) to satisfy the requested count."
+                f"Validation preview request ({preview_count}) exceeds the number of available distinct samples; "
+                f"saved {len(preview_files)} distinct preview(s) without reuse."
             )
 
         if self.fid_calc is not None and images_to_fid:
@@ -1601,7 +1662,7 @@ class PPDatasetV5(Dataset):
         if self.is_test or random.random() <= 0.5:
             return sample
 
-        keys_to_flip = ["source", "shape_reference", "color_reference", "target", "earring_reference", "earring_learning_reference", "target_mask", "HT_E", "source_hair_mask", "target_hair_mask",
+        keys_to_flip = ["source", "shape_reference", "color_reference", "target", "completed_hair_highres", "earring_reference", "earring_learning_reference", "target_mask", "HT_E", "source_hair_mask", "target_hair_mask",
                         "source_earring_mask", "target_earring_mask", "query_mask", "ear_roi",
                         "visible_ear_roi", "earring_valid_roi", "target_covered_ear_block_mask",
                         "source_hair_block_mask", "source_earring_object_mask", "source_earring_seed_mask",
@@ -1628,9 +1689,25 @@ class PPDatasetV5(Dataset):
         part_path, item_idx = self.dataset_index.locate(global_idx)
         item = self.load_part_items(part_path)[item_idx]
         fallback_mask = item["target_mask"]
+        completed_hair_highres = item.get("completed_hair_highres")
+        if not torch.is_tensor(completed_hair_highres):
+            raise RuntimeError(
+                "V5 dataset item is missing completed_hair_highres. "
+                "Regenerate the schema-22 V5 dataset before training."
+            )
+        if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
+            raise RuntimeError(
+                "completed_hair_highres must be RGB [3,H,W], "
+                f"got {tuple(completed_hair_highres.shape)}."
+            )
+        if completed_hair_highres.dtype == torch.uint8:
+            completed_hair_highres = completed_hair_highres.float().div(255)
+        else:
+            completed_hair_highres = completed_hair_highres.float().clamp(0, 1)
         sample = {
             "source": self.load_image(item["source_path"]),
             "target": item["target"].clone(),
+            "completed_hair_highres": completed_hair_highres,
             "target_mask": item["target_mask"].clone(),
             "HT_E": item["HT_E"].clone(),
             "source_parsing": item["source_parsing"].clone(),
@@ -1650,16 +1727,16 @@ class PPDatasetV5(Dataset):
                 item.get("earring_confident_mask", item["source_earring_mask"]),
             ).clone(),
             "earring_learning_mask": item.get(
-                "earring_learning_mask",
-                item.get("earring_write_mask", item["source_earring_mask"]),
+                "target_aligned_earring_alpha",
+                item.get("earring_learning_mask", item.get("earring_write_mask", item["source_earring_mask"])),
             ).clone(),
             "earring_learning_hole_mask": item.get(
                 "earring_learning_hole_mask",
                 item.get("hoop_hole_mask", torch.zeros_like(fallback_mask)),
             ).clone(),
             "earring_learning_reference": item.get(
-                "earring_learning_reference",
-                item.get("earring_reference", item["target"]),
+                "target_aligned_earring_rgb",
+                item.get("earring_learning_reference", item.get("earring_reference", item["target"])),
             ).clone(),
             "earring_presence_state": item.get(
                 "earring_presence_state", torch.zeros(2, dtype=torch.float32)

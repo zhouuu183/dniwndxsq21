@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pickle
 from pathlib import Path
 
@@ -161,6 +162,16 @@ class BlendingV5(Blending_v8):
             # a recovered earring to chase two noisy parser centroids creates
             # a second earring; zero is the correct default contract.
             earring_align_max_shift=pp_value("earring_align_max_shift", 0),
+            # V5 structural compositor controls.  They are runtime policy,
+            # not checkpoint metadata, so an older V5 weight cannot reactivate
+            # a source-face paste or target-aligned seed path.
+            face_continuity_work_size=pp_value("face_continuity_work_size", 512),
+            face_detail_soft_edge=pp_value("face_detail_soft_edge", 6),
+            face_hair_soft_edge=pp_value("face_hair_soft_edge", 4),
+            earring_component_max_depth=pp_value("earring_component_max_depth", 3),
+            earring_component_max_cumulative_cost=pp_value(
+                "earring_component_max_cumulative_cost", 1.55
+            ),
             ear_blur_kernel=pp_value("ear_blur_kernel", 11),
             ear_blur_sigma=pp_value("ear_blur_sigma", 3.0),
             ear_mask_hidden=pp_value("ear_mask_hidden", 32),
@@ -221,7 +232,7 @@ class BlendingV5(Blending_v8):
                 "earring_learned_fallback_alpha",
                 0.0,
             ),
-            # V19 uses one PP face base; normal-face hard authority is disabled.
+            # V5 uses one PP face base; normal-face hard authority is disabled.
             enable_direct_face_skin_restore=False,
             output_target_hair_preserve_dilate=pp_policy_value(
                 "output_target_hair_preserve_dilate", 5
@@ -519,12 +530,11 @@ class BlendingV5(Blending_v8):
         } if isinstance(delta_masks, dict) else {}
 
         # ``color_before_pp`` is a 256px conditioning image.  Lifting its
-        # Lab delta back onto a 1024px result creates a second, low-frequency
-        # image of the hair and visibly flattens strands on both sides of the
-        # hairline.  The generated high-resolution blend is the only hair RGB
-        # authority; the low-resolution colour image remains PP conditioning
-        # only.  This keeps the target hairstyle continuous through the final
-        # V5 compositor instead of adding an inner/outer colour ring.
+        # colour delta back onto the 1024px result replaces the native strand
+        # residual with an enlarged low-frequency field, which is precisely the
+        # waxy/filter-like hair failure.  Keep the generated high-resolution
+        # transfer as the only final hair RGB authority.  The colour-adjusted
+        # 256px tensor remains the PP conditioning/training target.
         authoritative_hair_highres = I_blend
 
         # PP dataset generation needs the *actual* inference tensor at this
@@ -550,6 +560,11 @@ class BlendingV5(Blending_v8):
                 "image": color_stage,
                 "color_before_pp": color_stage,
                 "pre_reference_color": raw_stage,
+                # The high-resolution hair transfer is already complete at
+                # this point.  PP receives the 256px colour-stage tensor, but
+                # its final compositor must preserve these original pixels
+                # rather than decode a new hairstyle for validation/inference.
+                "completed_hair_highres": ((I_blend[0] + 1.0) * 0.5).clamp(0, 1).detach().cpu(),
                 "cleanup_masks": cleanup_masks,
                 "target_hair_mask": HM_X[0].detach().cpu(),
                 "authoritative_hair_highres": authoritative_hair_highres[0].detach().cpu(),
@@ -649,20 +664,34 @@ class BlendingV5(Blending_v8):
                     "earring_native_reference.png",
                     aux["output_source_earring_native_reference"] * 2 - 1,
                 )
-            if aux.get("output_v19_base") is not None:
+            if aux.get("output_v5_base") is not None:
                 save_gen_image(
                     output_dir,
                     "PostProcessV5",
-                    "v19_face_base_before_earring.png",
-                    aux["output_v19_base"] * 2 - 1,
+                    "v5_face_base_before_earring.png",
+                    aux["output_v5_base"] * 2 - 1,
                 )
-            if aux.get("output_v19_source_rgb") is not None:
+            if aux.get("output_v5_source_rgb") is not None:
                 save_gen_image(
                     output_dir,
                     "PostProcessV5",
-                    "v19_source_earring_rgb.png",
-                    aux["output_v19_source_rgb"] * 2 - 1,
+                    "v5_source_earring_rgb.png",
+                    aux["output_v5_source_rgb"] * 2 - 1,
                 )
+            for image_name in (
+                "output_v5_face_face_after_lowfreq",
+                "output_v5_face_face_after_detail",
+                "output_v5_face_source_highfreq_residual",
+                "output_v5_target_aligned_earring_rgb",
+            ):
+                if aux.get(image_name) is not None:
+                    category = "earring" if "earring" in image_name else "face"
+                    save_gen_image(
+                        output_dir,
+                        f"res/v5_structural/{category}",
+                        f"{image_name}.png",
+                        aux[image_name] * 2 - 1,
+                    )
             for mask_name in (
                 "source_earring_mask",
                 "source_left_parser_earring",
@@ -788,8 +817,102 @@ class BlendingV5(Blending_v8):
                 "revealed_skin_tone_reference",
                 "skin_field_L",
                 "skin_field_ab",
+                "output_v5_face_source_valid_skin",
+                "output_v5_face_source_valid_detail",
+                "output_v5_face_source_hair_guard_uncertain",
+                "output_v5_face_revealed_skin",
+                "output_v5_face_revealed_skin_microtexture",
+                "output_v5_face_revealed_skin_microtexture_alpha",
+                "output_v5_face_face_surface",
+                "output_v5_face_target_hair_soft_alpha",
+                "output_v5_face_face_boundary_band",
+                "output_v5_target_aligned_earring_alpha",
+                "output_v5_target_hair_overlap",
+                "output_v5_outside_alpha_write_area",
+                "output_v5_target_left_visible_ear",
+                "output_v5_target_right_visible_ear",
+                "output_v5_earring_source_native_earring_alpha",
+                "output_v5_earring_source_native_hole_alpha",
+                "output_v5_earring_source_native_left_alpha",
+                "output_v5_earring_source_native_right_alpha",
+                "output_v5_earring_source_native_left_hole_alpha",
+                "output_v5_earring_source_native_right_hole_alpha",
+                "output_v5_earring_source_native_recall_hint",
+                "output_v5_earring_parser_earring_seed",
+                "output_v5_earring_lobe_anchor",
+                "output_v5_earring_localization_core",
+                "output_v5_earring_localization_adaptive",
+                "output_v5_earring_probable_visual_evidence",
+                "output_v5_earring_grabcut_raw",
+                "output_v5_earring_selected_components",
             ):
                 if aux.get(mask_name) is not None:
-                    save_vis_mask(output_dir, "PostProcessV5Masks", f"{mask_name}.png", aux[mask_name])
+                    mask_path = (
+                        "res/v5_structural/diagnostics"
+                        if mask_name.startswith("output_v5_")
+                        else "PostProcessV5Masks"
+                    )
+                    save_vis_mask(output_dir, mask_path, f"{mask_name}.png", aux[mask_name])
+
+            # Persist scalar P0 diagnostics next to the high-resolution masks.
+            # They are deliberately descriptive rather than a single quality
+            # score: visual inspection must catch upper/mid/lower face seams
+            # and no-earring false positives before any long training run.
+            def mean_value(name):
+                value = aux.get(name)
+                if value is None:
+                    return None
+                return float(value.detach().float().mean().cpu().item())
+
+            def area_value(name):
+                value = aux.get(name)
+                if value is None:
+                    return None
+                return float((value.detach().float() > 0.5).sum().cpu().item())
+
+            face_delta = aux.get("output_v5_face_continuous_lowfreq_delta")
+            face_delta_l = None
+            face_delta_ab = None
+            if face_delta is not None:
+                face_delta = face_delta.detach().float()
+                face_delta_l = float(face_delta[:, :1].abs().mean().cpu().item())
+                face_delta_ab = float(face_delta[:, 1:].abs().mean().cpu().item())
+            face_detail = aux.get("output_v5_face_source_highfreq_residual")
+            face_energy = {"upper": None, "mid": None, "lower": None}
+            if face_detail is not None:
+                energy = face_detail.detach().float().abs().mean(dim=1, keepdim=True)
+                height = energy.size(-2)
+                thirds = ((0, height // 3), (height // 3, 2 * height // 3), (2 * height // 3, height))
+                for key, (start, end) in zip(face_energy, thirds):
+                    face_energy[key] = float(energy[:, :, start:end].mean().cpu().item())
+            diagnostic = {
+                "face": {
+                    "source_valid_face_area": area_value("output_v5_face_source_valid_skin"),
+                    "revealed_skin_area": area_value("output_v5_face_revealed_skin"),
+                    "face_boundary_lowfreq_delta_L": face_delta_l,
+                    "face_boundary_lowfreq_delta_ab": face_delta_ab,
+                    "face_boundary_gradient_jump": mean_value("output_v5_face_face_boundary_band"),
+                    "upper_face_HF_energy": face_energy["upper"],
+                    "mid_face_HF_energy": face_energy["mid"],
+                    "lower_face_HF_energy": face_energy["lower"],
+                    "source_valid_HF_retention": mean_value("output_v5_face_source_valid_detail"),
+                },
+                "earring": {
+                    "presence_state": aux.get("output_v5_earring_source_native_presence_state", torch.empty(0)).detach().cpu().tolist(),
+                    "presence_score": aux.get("output_v5_earring_source_native_presence_score", torch.empty(0)).detach().cpu().tolist(),
+                    "native_alpha_area": area_value("output_v5_earring_source_native_earring_alpha"),
+                    "native_component_count": aux.get("output_v5_earring_component_count", torch.empty(0)).detach().cpu().tolist(),
+                    "selected_component_area": area_value("output_v5_earring_selected_components"),
+                    "max_graph_depth_used": aux.get("output_v5_earring_max_graph_depth_used", torch.empty(0)).detach().cpu().tolist(),
+                    "cumulative_graph_cost": aux.get("output_v5_earring_cumulative_graph_cost", torch.empty(0)).detach().cpu().tolist(),
+                    "aligned_alpha_area": area_value("output_v5_target_aligned_earring_alpha"),
+                    "target_hair_overlap": mean_value("output_v5_target_hair_overlap"),
+                    "outside_alpha_write_area": mean_value("output_v5_outside_alpha_write_area"),
+                },
+            }
+            diagnostic_dir = output_dir / "res" / "v5_structural" / "diagnostics"
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            with (diagnostic_dir / "diagnostics.json").open("w", encoding="utf-8") as handle:
+                json.dump(diagnostic, handle, ensure_ascii=True, indent=2)
 
         return ((I_final[0] + 1) / 2).clip(0, 1)

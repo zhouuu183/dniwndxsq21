@@ -107,7 +107,7 @@ def build_v58_earring_keep_mask(
     size: tuple[int, int],
     template: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the complete aligned foreground alpha used by V19 losses."""
+    """Return the complete aligned foreground alpha used by V5 losses."""
     confident = aux.get("earring_confident_mask")
     if confident is None:
         return torch.zeros(
@@ -119,7 +119,7 @@ def build_v58_earring_keep_mask(
             dtype=template.dtype,
         )
     confident = resize_mask(confident, size)
-    # V19 treats the aligned source instance as the complete object target.
+    # V5 treats the aligned source instance as the complete object target.
     # Localization/visible-ear ROI is a search prior only; intersecting it
     # here taught long earrings to stop at the lobe and made the learned
     # branch disagree with the final source-alpha compositor.
@@ -501,6 +501,41 @@ def revealed_texture_stat_loss(
     )
     revealed = resize_mask(revealed_mask, pred.shape[-2:]) * resize_mask(face_mask, pred.shape[-2:])
     return texture_stat_loss(pred, pred.detach(), revealed, outer)
+
+
+def face_lowfreq_smoothness_loss(pred: torch.Tensor, face_mask: torch.Tensor) -> torch.Tensor:
+    """Suppress low-frequency step seams without using source hair as skin GT."""
+    face = resize_mask(face_mask, pred.shape[-2:])
+    if face.detach().sum().item() < 1:
+        return pred.sum() * 0.0
+    low = low_pass_filter(pred, kernel_size=31, sigma=7.0)
+    laplace = (
+        -4.0 * low
+        + F.pad(low[:, :, 1:], (0, 0, 0, 1))
+        + F.pad(low[:, :, :-1], (0, 0, 1, 0))
+        + F.pad(low[:, :, :, 1:], (0, 1, 0, 0))
+        + F.pad(low[:, :, :, :-1], (1, 0, 0, 0))
+    ).abs()
+    return masked_mean(laplace, face)
+
+
+def face_hair_boundary_seam_loss(
+    pred: torch.Tensor,
+    face_mask: torch.Tensor,
+    hair_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Detect a second low-frequency ring at the sole face/hair boundary."""
+    face = resize_mask(face_mask, pred.shape[-2:])
+    hair = resize_mask(hair_mask, pred.shape[-2:])
+    boundary = (
+        dilate_mask(hair, 3) - erode_mask(hair, 2)
+    ).clamp(0, 1) * dilate_mask(face, 4)
+    if boundary.detach().sum().item() < 1:
+        return pred.sum() * 0.0
+    low = low_pass_filter(pred, kernel_size=21, sigma=5.0)
+    gradient = sobel_edges(low)
+    local_mean = F.avg_pool2d(gradient, kernel_size=9, stride=1, padding=4)
+    return masked_mean((gradient - local_mean).abs(), boundary)
 
 
 def build_weak_ear_pseudo_mask(
@@ -920,7 +955,7 @@ class EarAwareLossBuilder(LossBuilderMulti):
                     )
                 )
 
-        # V19 source-visible face supervision uses real source skin as an
+        # V5 source-visible face supervision uses real source skin as an
         # identity/detail anchor.  It is a loss mask only; the final
         # compositor never hard-cuts this region back to source or target.
         source_valid_face = aux.get("source_visible_skin_reference_mask", aux.get("source_skin_valid_mask"))
@@ -950,43 +985,119 @@ class EarAwareLossBuilder(LossBuilderMulti):
                     source_valid_face,
                 )
 
-        # V19 trains the exact composed output against artificial revealed-skin
+        # V5 trains the exact composed output against artificial revealed-skin
         # boundaries.  These are local continuity constraints, never a request
         # to copy source bangs into a newly exposed forehead.
         revealed_boundary_weight = float(self.losses_dict.get("revealed_boundary_seam", 0.0))
         revealed_texture_stat_weight = float(self.losses_dict.get("revealed_texture_stat", 0.0))
         face_lowfreq_weight = float(self.losses_dict.get("face_lowfreq_continuity", 0.0))
-        revealed_for_v19 = aux.get("revealed_skin_mask")
-        face_for_v19 = aux.get("target_face_surface_mask")
-        if face_for_v19 is None:
-            face_for_v19 = parsing_label_mask(aux.get("target_parsing"), RAW_FACE_SURFACE_LABELS)
+        revealed_for_v5 = aux.get("revealed_skin_mask")
+        face_for_v5 = aux.get("target_face_surface_mask")
+        if face_for_v5 is None:
+            face_for_v5 = parsing_label_mask(aux.get("target_parsing"), RAW_FACE_SURFACE_LABELS)
         if (
-            revealed_for_v19 is not None
-            and face_for_v19 is not None
+            revealed_for_v5 is not None
+            and face_for_v5 is not None
             and (revealed_boundary_weight > 0 or revealed_texture_stat_weight > 0 or face_lowfreq_weight > 0)
         ):
-            revealed_for_v19 = resize_mask(revealed_for_v19, gen_F_256_01.shape[-2:])
-            face_for_v19 = resize_mask(face_for_v19, gen_F_256_01.shape[-2:])
-            aux["v19_revealed_continuity_mask"] = revealed_for_v19
-            aux["v19_face_continuity_mask"] = face_for_v19
+            revealed_for_v5 = resize_mask(revealed_for_v5, gen_F_256_01.shape[-2:])
+            face_for_v5 = resize_mask(face_for_v5, gen_F_256_01.shape[-2:])
+            aux["v5_revealed_continuity_mask"] = revealed_for_v5
+            aux["v5_face_continuity_mask"] = face_for_v5
             if face_lowfreq_weight > 0:
                 losses["face_lowfreq_continuity"] = face_lowfreq_weight * face_lowfreq_continuity_loss(
                     gen_F_256_01,
-                    face_for_v19,
-                    revealed_for_v19,
+                    face_for_v5,
+                    revealed_for_v5,
                 )
             if revealed_boundary_weight > 0:
                 losses["revealed_boundary_seam"] = revealed_boundary_weight * revealed_boundary_seam_loss(
                     gen_F_256_01,
-                    face_for_v19,
-                    revealed_for_v19,
+                    face_for_v5,
+                    revealed_for_v5,
                 )
             if revealed_texture_stat_weight > 0:
                 losses["revealed_texture_stat"] = revealed_texture_stat_weight * revealed_texture_stat_loss(
                     gen_F_256_01,
-                    face_for_v19,
-                    revealed_for_v19,
+                    face_for_v5,
+                    revealed_for_v5,
                 )
+
+        # V5 evaluates the rendered final compositor at 512px or native
+        # resolution. Revealed regions are compared only to adjacent final
+        # skin statistics; source RGB is used exclusively in valid skin/detail.
+        if bool(self.losses_dict.get("enable_v5_structural_compositor", False)):
+            final_hr = ((gen_F + 1.0) * 0.5).clamp(0, 1)
+            max_side = max(final_hr.shape[-2:])
+            if max_side > 512:
+                scale = 512.0 / float(max_side)
+                hr_size = (
+                    max(1, int(round(final_hr.shape[-2] * scale))),
+                    max(1, int(round(final_hr.shape[-1] * scale))),
+                )
+                final_hr = F.interpolate(final_hr, size=hr_size, mode="bilinear", align_corners=False)
+            else:
+                hr_size = tuple(final_hr.shape[-2:])
+            face_hr = aux.get("output_v5_face_face_surface", aux.get("target_face_surface_mask"))
+            valid_hr = aux.get("output_v5_face_source_valid_skin", source_valid_face)
+            revealed_hr = aux.get("output_v5_face_revealed_skin", revealed_for_v5)
+            hair_hr = aux.get("output_v5_face_target_hair_soft_alpha", aux.get("target_hair_mask"))
+            if face_hr is not None:
+                face_hr = resize_mask(face_hr, hr_size)
+                source_hr = aux.get("source_face_reference_01", aux.get("source_full_01", source))
+                source_hr = F.interpolate(source_hr, size=hr_size, mode="bilinear", align_corners=False).clamp(0, 1)
+                if valid_hr is not None:
+                    valid_hr = resize_mask(valid_hr, hr_size)
+                    high_weight = float(self.losses_dict.get("face_source_detail_hr", 0.0))
+                    color_weight = float(self.losses_dict.get("face_lowfreq_anchor_hr", 0.0))
+                    if high_weight > 0:
+                        losses["face_source_detail_hr"] = high_weight * masked_l1(
+                            high_pass_filter(final_hr), high_pass_filter(source_hr), valid_hr
+                        )
+                    if color_weight > 0:
+                        losses["face_lowfreq_anchor_hr"] = color_weight * masked_l1(
+                            low_pass_filter(final_hr), low_pass_filter(source_hr), valid_hr
+                        )
+                continuity_weight = float(self.losses_dict.get("face_lowfreq_continuity_hr", 0.0))
+                if continuity_weight > 0:
+                    continuity = face_lowfreq_smoothness_loss(final_hr, face_hr)
+                    if revealed_hr is not None:
+                        continuity = continuity + face_lowfreq_continuity_loss(
+                            final_hr, face_hr, resize_mask(revealed_hr, hr_size)
+                        )
+                    losses["face_lowfreq_continuity_hr"] = continuity_weight * continuity
+                revealed_weight_hr = float(self.losses_dict.get("revealed_boundary_seam_hr", 0.0))
+                if revealed_weight_hr > 0 and revealed_hr is not None:
+                    losses["revealed_boundary_seam_hr"] = revealed_weight_hr * revealed_boundary_seam_loss(
+                        final_hr, face_hr, resize_mask(revealed_hr, hr_size)
+                    )
+                # The source fringe-covered pixels are not an RGB target, but
+                # their recovered skin must have the same *amount* of pore/
+                # fine-detail energy as trusted visible source skin.  This
+                # compares only aggregate high-pass and edge statistics, never
+                # moves a source eyebrow, bang or shadow into the forehead.
+                source_texture_weight = float(
+                    self.losses_dict.get("revealed_source_texture_stat_hr", 0.0)
+                )
+                if (
+                    source_texture_weight > 0
+                    and revealed_hr is not None
+                    and valid_hr is not None
+                ):
+                    losses["revealed_source_texture_stat_hr"] = (
+                        source_texture_weight
+                        * texture_stat_loss(
+                            final_hr,
+                            source_hr,
+                            resize_mask(revealed_hr, hr_size),
+                            valid_hr,
+                        )
+                    )
+                hair_weight = float(self.losses_dict.get("face_hair_boundary_seam_hr", 0.0))
+                if hair_weight > 0 and hair_hr is not None:
+                    losses["face_hair_boundary_seam_hr"] = hair_weight * face_hair_boundary_seam_loss(
+                        final_hr, face_hr, resize_mask(hair_hr, hr_size)
+                    )
 
         earring_confident_mask = resize_mask(earring_confident_mask, gen_F_256_01.shape[-2:])
         earring_reference = F.interpolate(earring_reference, size=gen_F_256_01.shape[-2:], mode="bilinear", align_corners=False)

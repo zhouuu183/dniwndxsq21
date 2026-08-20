@@ -24,13 +24,9 @@ from models.ear_modules_v5 import (
     HairMaskExtractorV5,
     RAW_EAR_SURFACE_LABELS,
     RAW_EARRING,
-    RAW_HAIR,
-    align_earring_reference_to_target,
     build_earring_highlight_mask,
     build_earring_search_mask,
     build_earring_write_masks,
-    build_source_earring_instance_masks_v5,
-    extract_source_earring_foreground_v5,
     build_strong_earring_candidate,
     compute_earring_hole_mask,
     dilate_mask,
@@ -44,15 +40,21 @@ from models.ear_modules_v5 import (
     parsing_label_mask,
     resize_mask,
 )
+from models.earring_foreground_v5 import (
+    EarringCoordinateSpace,
+    EarringNativeInstanceV5,
+    align_earring_instance_v5,
+    extract_source_native_earring_v5,
+)
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import list_image_files
 from utils.train import seed_everything
 
 CLEANUP_MASK_KEYS = ("M_remove", "M_remove_halo", "M_remove_face", "M_remove_tail", "M_remove_neck")
-# Schema 20 keeps the V19 source-native foreground contract and additionally
-# records pre-PP targets generated without colour-feather contamination across
-# the hairline.  Schema 19 targets can contain the old inner/outer hair halo.
-DATASET_CONFIG_SCHEMA_VERSION = 20
+# Schema 22 adds the completed high-resolution hair transfer.  PP still trains
+# on the 256px colour-stage target, but final output must preserve this image
+# byte-for-byte outside the earring object.
+DATASET_CONFIG_SCHEMA_VERSION = 22
 DATASET_POLICY_FILES = (
     "scripts/pp_gen_v5.py",
     "hair_swap_v5.py",
@@ -60,6 +62,7 @@ DATASET_POLICY_FILES = (
     "models/Blending_v5.py",
     "models/Blending_v8.py",
     "models/ear_modules_v5.py",
+    "models/earring_foreground_v5.py",
     "models/postprocess_v5.py",
 )
 PP_EXTRA_MASK_KEYS = (
@@ -79,9 +82,10 @@ USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full
 
 USER_FACE_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/mix_ear/")
 USER_DONOR_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/ear/")
-# Keep regenerated data separate from the previous policy-locked directory.
-# ``validate_pp_dataset_resume`` intentionally refuses to mix those parts.
-USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_instance_v20_hair_boundary_face_detail")
+# This directory is deliberately fresh.  The previous V21 parts carry a
+# completed-generation cursor and cannot be reused after changing source
+# coverage or final-compositor policy.
+USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_hair_locked_v5")
 # 0 means exactly one experiment per source image.  Set --size explicitly if
 # deliberate repeated sampling is wanted; do not silently expand a small
 # accessory gallery back to the old 500-render workload.
@@ -93,7 +97,7 @@ USER_MASK_BATCH_SIZE_SMALL = 8
 
 USER_FACE_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
 USER_DONOR_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
-USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v20_hair_boundary_face_detail")
+USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v21_structural_correction")
 USER_DATASET_SIZE_FULL = 10_000
 USER_CHUNK_SIZE_FULL = 256
 USER_MASK_BATCH_SIZE_FULL = 16
@@ -341,7 +345,28 @@ def unpack_color_before_pp_stage(result):
                 size=image.shape[-2:],
                 mode="nearest",
             )[0]
-    return image.clamp(0, 1), cleanup_masks, pre_reference_color, target_hair_mask
+    completed_hair_highres = result.get("completed_hair_highres")
+    if not torch.is_tensor(completed_hair_highres):
+        raise RuntimeError(
+            "color_before_pp stage is missing completed_hair_highres. "
+            "Use the matching V5 Blending implementation before generating PP data."
+        )
+    if completed_hair_highres.ndim == 4:
+        if completed_hair_highres.size(0) != 1:
+            raise RuntimeError("completed_hair_highres must contain one sample.")
+        completed_hair_highres = completed_hair_highres[0]
+    if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
+        raise RuntimeError(
+            "completed_hair_highres must be RGB [3,H,W], "
+            f"got {tuple(completed_hair_highres.shape)}."
+        )
+    return (
+        image.clamp(0, 1),
+        cleanup_masks,
+        pre_reference_color,
+        target_hair_mask,
+        completed_hair_highres.clamp(0, 1),
+    )
 
 
 def str2path(value):
@@ -499,6 +524,24 @@ def png_roundtrip_tensor(image):
         .div(255)
     )
 
+
+def png_uint8_tensor(image):
+    """Store a high-resolution RGB hand-off with PNG-equivalent precision."""
+
+    if not torch.is_tensor(image):
+        raise TypeError("Expected an RGB tensor for 8-bit dataset storage.")
+    if image.ndim != 3 or image.size(0) != 3:
+        raise ValueError(f"Expected RGB [3,H,W], got {tuple(image.shape)}.")
+    return (
+        image.detach()
+        .to(device="cpu", dtype=torch.float32)
+        .clamp(0, 1)
+        .mul(255)
+        .add(0.5)
+        .clamp(0, 255)
+        .to(torch.uint8)
+    )
+
 def ceil_div(value, divisor):
     return (value + divisor - 1) // divisor
 
@@ -536,11 +579,16 @@ def sample_distinct_triplets(face_images, donor_images, size: int):
             "keys for source/shape/color separation."
         )
 
-    sources = np.random.choice(
-        face_images,
-        size=size,
-        replace=size > len(face_images),
-    )
+    # The normal V5 dataset mode is one render per source image.  Make that
+    # explicit instead of relying on ``choice(..., replace=False)`` so the
+    # generation log and the produced dataset cannot silently contain repeated
+    # targets when ``--size`` is at or below the source-gallery size.
+    if size <= len(face_images):
+        sources = np.random.permutation(np.asarray(face_images, dtype=object))[:size]
+    else:
+        initial = np.random.permutation(np.asarray(face_images, dtype=object))
+        extra = np.random.choice(face_images, size=size - len(face_images), replace=True)
+        sources = np.concatenate((initial, extra))
     identity_keys = np.array(sorted(donor_by_identity), dtype=object)
     experiments = []
     for source_name in sources:
@@ -824,6 +872,21 @@ class RenderedPairDataset(Dataset):
                 if pre_reference_name is not None
                 else target_full
             )
+        completed_hair_highres = item.get("completed_hair_highres")
+        if not torch.is_tensor(completed_hair_highres):
+            raise RuntimeError(
+                "Rendered V5 dataset item is missing completed_hair_highres. "
+                "Regenerate this schema-22 dataset from the matching V5 generator."
+            )
+        if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
+            raise RuntimeError(
+                "completed_hair_highres must be RGB [3,H,W], "
+                f"got {tuple(completed_hair_highres.shape)}."
+            )
+        if completed_hair_highres.dtype == torch.uint8:
+            completed_hair_highres = completed_hair_highres.float().div(255)
+        else:
+            completed_hair_highres = completed_hair_highres.float().clamp(0, 1)
         return {
             "source_path": str(source_path),
             "shape_reference_path": str(self.donor_gallery_root / shape_name),
@@ -836,6 +899,7 @@ class RenderedPairDataset(Dataset):
             "color_reference_full": color_reference_full,
             "target_full": target_full,
             "pre_reference_color_full": pre_reference_color_full,
+            "completed_hair_highres": completed_hair_highres,
             "cleanup_masks": item.get("cleanup_masks", {}),
             "target_hair_mask_override": item.get("target_hair_mask"),
         }
@@ -919,6 +983,10 @@ class DatasetItemBatchBuilder:
                     [item["pre_reference_color_full"] for item in batch_items],
                     dim=0,
                 ),
+                "completed_hair_highres": torch.stack(
+                    [item["completed_hair_highres"] for item in batch_items],
+                    dim=0,
+                ),
                 "target_hair_mask_override": torch.stack(
                     [
                         item.get(
@@ -985,6 +1053,10 @@ class DatasetItemBatchBuilder:
             )
             target_full = batch["target_full"].to(self.device, non_blocking=False)
             pre_reference_color_full = batch["pre_reference_color_full"].to(
+                self.device,
+                non_blocking=False,
+            )
+            completed_hair_highres = batch["completed_hair_highres"].to(
                 self.device,
                 non_blocking=False,
             )
@@ -1087,37 +1159,59 @@ class DatasetItemBatchBuilder:
             # long pendant simply did not exist.  Keep the high-resolution
             # contract here, then reduce only the verified object alpha/RGB
             # label that PP is trained to consume.
-            source_hair_full = parsing_label_mask(
-                source_parsing_full,
-                (RAW_HAIR,),
-            )
             reliable_source_seed_full = F.interpolate(
                 reliable_source_seed.float(),
                 size=source_native_size,
                 mode="nearest",
             )
-            source_instances_full = build_source_earring_instance_masks_v5(
+            source_recall_hint = torch.zeros_like(reliable_source_seed)
+            for key in (
+                "strong_earring_candidate_core",
+                "online_earring_candidate_mask",
+                "earring_candidate_mask",
+                "earring_query_recall_mask",
+                "earring_object_recall_mask",
+                "earring_object_detection_mask",
+            ):
+                value = earring_policy.get(key)
+                if value is not None:
+                    source_recall_hint = torch.maximum(
+                        source_recall_hint,
+                        F.interpolate(value.float(), size=source_recall_hint.shape[-2:], mode="nearest"),
+                    )
+            source_recall_hint_full = F.interpolate(
+                source_recall_hint,
+                size=source_native_size,
+                mode="nearest",
+            )
+            # V5 dataset authority is one source-native foreground
+            # instance. The target-aligned supervision below is derived from
+            # it once; no target field is ever resized back into this extractor.
+            source_foreground_v5 = extract_source_native_earring_v5(
                 source_full,
                 source_parsing_full,
-                source_hair_mask=source_hair_full,
-                source_seed_mask=reliable_source_seed_full,
+                source_native_seed=reliable_source_seed_full,
+                seed_space=EarringCoordinateSpace.SOURCE_NATIVE,
+                source_native_recall_hint=source_recall_hint_full,
+                recall_hint_space=EarringCoordinateSpace.SOURCE_CANONICAL,
+                max_graph_depth=4,
+                max_cumulative_cost=1.85,
             )
-            # V19 dataset authority is the unified source foreground alpha.
-            # Keep the legacy locator fields for diagnostics, but replace its
-            # final instance masks before any 256px supervision is serialized.
-            source_foreground_v19 = extract_source_earring_foreground_v5(
-                source_full,
-                source_parsing_full,
-                source_seed_mask=reliable_source_seed_full,
-                source_hair_mask=source_hair_full,
-            )
-            source_instances_full["left_instance_mask"] = source_foreground_v19["left_source_alpha"]
-            source_instances_full["right_instance_mask"] = source_foreground_v19["right_source_alpha"]
-            source_instances_full["instance_mask"] = source_foreground_v19["source_alpha"]
-            source_instances_full["left_parser_instance_mask"] = source_foreground_v19["left_source_alpha"]
-            source_instances_full["right_parser_instance_mask"] = source_foreground_v19["right_source_alpha"]
-            source_instances_full["left_context"] = source_foreground_v19["localization_roi"]
-            source_instances_full["right_context"] = source_foreground_v19["localization_roi"]
+            native_zero = torch.zeros_like(source_foreground_v5["source_native_earring_alpha"])
+            source_instances_full = {
+                "left_instance_mask": source_foreground_v5["source_native_left_alpha"],
+                "right_instance_mask": source_foreground_v5["source_native_right_alpha"],
+                "instance_mask": source_foreground_v5["source_native_earring_alpha"],
+                "left_parser_instance_mask": source_foreground_v5["source_native_left_alpha"],
+                "right_parser_instance_mask": source_foreground_v5["source_native_right_alpha"],
+                "left_hole_mask": source_foreground_v5["source_native_left_hole_alpha"],
+                "right_hole_mask": source_foreground_v5["source_native_right_hole_alpha"],
+                "left_context": source_foreground_v5["localization_core"],
+                "right_context": source_foreground_v5["localization_core"],
+                "locator_presence_seed": source_foreground_v5["parser_earring_seed"],
+                "left_visual_recall_hoop_seed_mask": native_zero,
+                "right_visual_recall_hoop_seed_mask": native_zero,
+            }
 
             # Ordinary earrings need the same source-native refinement as the
             # final V5 compositor.  Schema 11 only used ``instance_mask`` here;
@@ -1210,12 +1304,8 @@ class DatasetItemBatchBuilder:
             source_earring_mask = source_instances_256["instance_mask"]
             left_source_instance = source_instances_256["left_instance_mask"]
             right_source_instance = source_instances_256["right_instance_mask"]
-            left_regular_hole = source_instance_to_256(
-                native_regular_refined_full["left_hoop_hole_mask"]
-            )
-            right_regular_hole = source_instance_to_256(
-                native_regular_refined_full["right_hoop_hole_mask"]
-            )
+            left_regular_hole = source_instances_256["left_hole_mask"]
+            right_regular_hole = source_instances_256["right_hole_mask"]
             active_earring_case = (
                 source_earring_mask.flatten(1).sum(dim=1, keepdim=True) >= 1.0
             ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
@@ -1450,23 +1540,34 @@ class DatasetItemBatchBuilder:
             ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
             no_earring_case = (1.0 - active_earring_case).clamp(0, 1).expand_as(source_earring_mask)
             earring_valid_roi = earring_valid_roi * active_earring_case
-            align_info = align_earring_reference_to_target(
-                source_256,
-                torch.clamp(left_mask + right_mask, 0, 1),
+            native_instance_256 = EarringNativeInstanceV5(
+                alpha=torch.clamp(left_mask + right_mask, 0, 1),
+                rgb=source_256,
+                hole_alpha=torch.clamp(left_regular_hole + right_regular_hole, 0, 1),
+                left_alpha=left_mask,
+                right_alpha=right_mask,
+                left_hole_alpha=left_regular_hole,
+                right_hole_alpha=right_regular_hole,
+                space=EarringCoordinateSpace.SOURCE_CANONICAL,
+            )
+            aligned_v5 = align_earring_instance_v5(
+                native_instance_256,
                 query_info["source_left_ear_mask"],
                 query_info["source_right_ear_mask"],
                 query_info["target_left_ear_mask"],
                 query_info["target_right_ear_mask"],
-                query_info["left_ear_roi"],
-                query_info["right_ear_roi"],
-                max_vertical_shift=self.args.earring_align_max_shift,
-                max_horizontal_shift=max(0, self.args.earring_align_max_shift // 2),
-                reference_base=target_256,
-                source_left_instance_mask=left_mask,
-                source_right_instance_mask=right_mask,
-                source_left_hole_mask=left_regular_hole,
-                source_right_hole_mask=right_regular_hole,
+                max_shift=max(0, int(self.args.earring_align_max_shift)),
             )
+            aligned_alpha_v5 = aligned_v5["target_aligned_earring_alpha"]
+            align_info = {
+                "earring_confident_mask": aligned_alpha_v5,
+                "hoop_hole_mask": aligned_v5["target_aligned_hole_alpha"],
+                "earring_reference": (
+                    target_256 * (1.0 - aligned_alpha_v5)
+                    + aligned_v5["target_aligned_earring_rgb"] * aligned_alpha_v5
+                ).clamp(0, 1),
+                "coordinate_space": "TARGET_CANONICAL",
+            }
             # Keep the aligned alpha/hole fields under one foreground contract.
             # The zero hoop compatibility fields above never grant RGB.
             # No hoop-specific final alignment in V19.  Keep zero topology
@@ -1538,6 +1639,12 @@ class DatasetItemBatchBuilder:
                     "shape_reference": shape_reference_256[idx].cpu(),
                     "color_reference": color_reference_256[idx].cpu(),
                     "target": target_256[idx].cpu(),
+                    # The completed high-resolution transfer is immutable
+                    # final-output authority.  It is quantized only for the
+                    # on-disk dataset item below.
+                    "completed_hair_highres": png_uint8_tensor(
+                        completed_hair_highres[idx]
+                    ),
                     # Keep both stages for reproducible validation previews.  The
                     # training target is always the authoritative color stage.
                     "color_before_pp": target_256[idx].cpu(),
@@ -1551,12 +1658,29 @@ class DatasetItemBatchBuilder:
                     "source_hair_block_mask": source_hair_block_mask[idx].cpu(),
                     "source_earring_mask": source_earring_mask[idx].cpu(),
                     "source_earring_object_mask": source_earring_mask[idx].cpu(),
+                    # V5 coordinate contract: native extraction evidence
+                    # and target-frame learned labels are separate fields.
+                    "source_native_earring_alpha": source_foreground_v5["source_native_earring_alpha"][idx].cpu(),
+                    "source_native_earring_rgb_reference": {
+                        "kind": "source_path",
+                        "path": source_paths[idx],
+                        "space": "SOURCE_NATIVE",
+                    },
+                    "source_earring_presence": source_foreground_v5["source_native_presence_state"][idx].cpu(),
+                    "target_aligned_earring_alpha": earring_confident_mask[idx].cpu(),
+                    "target_aligned_earring_rgb": earring_learning_reference[idx].cpu(),
+                    "coordinate_manifest": {
+                        "source_native_earring_alpha": "SOURCE_NATIVE",
+                        "source_native_earring_rgb_reference": "SOURCE_NATIVE",
+                        "target_aligned_earring_alpha": "TARGET_CANONICAL",
+                        "target_aligned_earring_rgb": "TARGET_CANONICAL",
+                    },
                     "earring_instance_mask": earring_confident_mask[idx].cpu(),
                     "earring_learning_mask": earring_learning_mask[idx].cpu(),
                     "earring_learning_reference": earring_learning_reference[idx].cpu(),
                     "earring_learning_hole_mask": earring_learning_hole[idx].cpu(),
-                    "earring_presence_state": source_foreground_v19["presence_state"][idx].cpu(),
-                    "earring_instance_confidence": source_foreground_v19["instance_confidence"][idx].cpu(),
+                    "earring_presence_state": source_foreground_v5["source_native_presence_state"][idx].cpu(),
+                    "earring_instance_confidence": source_foreground_v5["source_native_presence_score"][idx].cpu(),
                     "hoop_instance_mask": aligned_hoop_instance[idx].cpu(),
                     "source_earring_seed_mask": earring_policy["source_parser_earring_mask"][idx].cpu(),
                     "target_earring_mask": query_info["target_earring_mask"][idx].cpu(),
@@ -1864,6 +1988,11 @@ def main(args):
             f"Source gallery has {len(face_images)} images; sampling {resolved_size} "
             "experiments with replacement, matching the legacy generator."
         )
+    else:
+        print(
+            f"Source coverage: rendering {resolved_size} distinct target image(s) "
+            f"from all {len(face_images)} image(s) in {args.face_gallery_dir}."
+        )
 
     print(
         f"Using dataset_profile={args.dataset_profile}, source_dir={args.face_gallery_dir}, "
@@ -1954,6 +2083,7 @@ def main(args):
                     cleanup_masks,
                     pre_reference_color,
                     target_hair_mask,
+                    completed_hair_highres,
                 ) = unpack_color_before_pp_stage(result)
                 # The target used to be serialized to a temporary 8-bit PNG
                 # and read back.  Preserve that numerical distribution in RAM
@@ -1970,6 +2100,7 @@ def main(args):
                     "color_reference_full": color_reference_full,
                     "target_full": target_full,
                     "pre_reference_color_full": pre_reference_color_full,
+                    "completed_hair_highres": png_uint8_tensor(completed_hair_highres),
                     "cleanup_masks": cleanup_masks,
                 }
                 if target_hair_mask is not None:
