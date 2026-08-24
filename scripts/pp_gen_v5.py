@@ -85,11 +85,11 @@ USER_DONOR_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/i
 # This directory is deliberately fresh.  The previous V21 parts carry a
 # completed-generation cursor and cannot be reused after changing source
 # coverage or final-compositor policy.
-USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_hair_locked_v5")
+USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v5_three_band_source_detail_10_v5")
 # 0 means exactly one experiment per source image.  Set --size explicitly if
 # deliberate repeated sampling is wanted; do not silently expand a small
 # accessory gallery back to the old 500-render workload.
-USER_DATASET_SIZE_SMALL = 0
+USER_DATASET_SIZE_SMALL = 10
 # Chunk size now controls checkpoint frequency only.  Render/mask work streams
 # one mask batch at a time, so this does not retain a whole chunk in memory.
 USER_CHUNK_SIZE_SMALL = 256

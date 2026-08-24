@@ -4340,10 +4340,16 @@ class PostProcessModelV5(nn.Module):
         image: torch.Tensor,
         aux: dict[str, torch.Tensor] | None,
     ) -> torch.Tensor:
-        """V5 final output contract: unified face field plus source-native earring alpha."""
+        """V19 source-detail face contract with its original earring compositor."""
         if aux is None:
             return image
-        return self._compose_final_v5(image, aux)
+        # Restore the complete high-detail V19 face path from 9f2786b.  Its
+        # visible-source-face RGB authority is intentionally active here: this
+        # is the known sharp, three-band baseline requested for the next
+        # iteration.  Do not route through _compose_final_v5, which keeps the
+        # source-detail fields only as diagnostics and leaves the entire face
+        # as the lower-detail PP field.
+        return self._compose_final_v19_legacy_v19(image, aux)
 
     def render_refined(
         self,

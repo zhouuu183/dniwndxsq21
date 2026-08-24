@@ -59,23 +59,21 @@ ONLINE_EARRING_AUX_KEYS = {
     "earring_candidate_mask",
     "earring_search_mask",
 }
-# Only the six pipeline images the user wants to inspect.  All mask/debug
-# columns were removed from the validation preview.
+# Only face/image outputs belong in the validation sheet.  Earring masks stay
+# out of the visual review path.
 VAL_COLUMNS = (
-    "source",                 # 1. source face
-    "shape_reference",        # 2. reference hairstyle
-    "color_reference",        # 3. reference hair color
-    "target_deshadow",        # 4. shape transfer + SATD de-shadow (pre-color)
-    "target",                 # 5. de-shadow + color blend (the PP input)
-    "gen_f",                  # 6. PP earring/face-detail recovery (final)
+    "source",  # 1. source face
+    "target",  # 2. completed transfer supplied to PP
+    "gen_w",   # 3. base generator image
+    "gen_f",   # 4. final PP image
 )
 
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_dual_ear_short_long_hair_locked_v5")
-USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_ear_short_long_hair_locked_v5")
-USER_RUN_NAME_SMALL = "ear_refine_v5_dual_small_hair_locked_v5"
+USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v5_three_band_source_detail_10_v5")
+USER_OUTPUT_DIR_SMALL = Path("output/pp_v5_checkpoints_three_band_source_detail_10_v5")
+USER_RUN_NAME_SMALL = "pp_v5_three_band_source_detail_10"
 
 USER_DATASET_DIR_FULL = Path("images/pp_dataset_v5_dual_full_instance_v21_structural_correction")
 USER_OUTPUT_DIR_FULL = Path("output/pp_v5_checkpoints_full_instance_v21_structural_correction")
@@ -87,13 +85,11 @@ USER_USE_WANDB = False
 USER_RESUME_CHECKPOINT = None
 USER_BASE_CHECKPOINT = "pretrained_models/PostProcess/pp_model.pth"
 
-USER_BATCH_SIZE = 8
+USER_BATCH_SIZE = 4
 USER_NUM_WORKERS = 0
 USER_EPOCHS = 120
-USER_VAL_SIZE = 512
-USER_VAL_PREVIEW_COUNT = 50
-# Filling a small validation split with training samples runs extra full
-# inference passes, but does not contribute to validation loss or training.
+USER_VAL_SIZE = 9
+USER_VAL_PREVIEW_COUNT = 10
 USER_VAL_SUPPLEMENT_TRAIN_PREVIEWS = True
 USER_GRAD_ACCUM_STEPS = 2
 
@@ -1090,9 +1086,11 @@ class TrainerV5:
 
         vis_dir = self.args.checkpoint_dir / "val_images" / epoch_tag
         vis_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = self.args.checkpoint_dir / "val_final_images" / epoch_tag
+        final_dir.mkdir(parents=True, exist_ok=True)
         for old_preview in vis_dir.glob("val_*.png"):
             old_preview.unlink()
-        for old_preview in vis_dir.glob("final_highres_*.png"):
+        for old_preview in final_dir.glob("final_*.png"):
             old_preview.unlink()
         with open(vis_dir / "columns.txt", "w", encoding="utf-8") as file:
             file.write(" | ".join(VAL_COLUMNS) + "\n")
@@ -1100,12 +1098,11 @@ class TrainerV5:
         for order, preview_row in enumerate(files):
             image = image_grid(list(map(T.functional.to_pil_image, preview_row)), 1, len(preview_row))
             image.save(vis_dir / f"val_{order:03d}.png")
-        # The six-column validation sheet is intentionally 256px per sample.
-        # Keep the final native-resolution output beside it so a thin stud or
-        # wire is never judged from a downsampled thumbnail.
+        # Keep each matching native-resolution final result separate from the
+        # compact four-column review sheet.
         for order, image in enumerate(highres_files or []):
             T.functional.to_pil_image(image).save(
-                vis_dir / f"final_highres_{order:03d}.png"
+                final_dir / f"final_{order:03d}.png"
             )
 
     @staticmethod
@@ -1156,22 +1153,10 @@ class TrainerV5:
         return image.clamp(0, 1)
 
     def build_preview_row(self, source, target, gen_w_256, gen_f_256, aux, batch, idx):
-        image_size = tuple(source.shape[-2:])
-        # Column 4 is the de-shadowed, pre-color-blend image.  The current
-        # pipeline bakes de-shadow and color into one generator pass, so it is
-        # only present when the dataset stored a separate "target_deshadow";
-        # otherwise fall back to the color-blended target so the row stays valid.
-        deshadow = batch.get("target_deshadow")
-        if deshadow is not None:
-            col4 = self.image_to_rgb(deshadow, idx, image_size)
-        else:
-            col4 = target[idx].detach().cpu()
         return [
             source[idx].detach().cpu(),
-            self.image_to_rgb(batch.get("shape_reference"), idx, image_size),
-            self.image_to_rgb(batch.get("color_reference"), idx, image_size),
-            col4,
             target[idx].detach().cpu(),
+            gen_w_256[idx].detach().cpu(),
             gen_f_256[idx].detach().cpu(),
         ]
 
@@ -1977,7 +1962,7 @@ def main(args):
         f"earring_recovery_positive={recovery_positive_count}, "
         f"covered_or_nonpositive={len(dataset_index) - recovery_positive_count}"
     )
-    test_size = min(args.test_size, max(1, len(dataset_index) // 10))
+    test_size = min(max(1, int(args.test_size)), len(dataset_index) - 1)
     train_indices, test_indices = split_dataset_indices(len(dataset_index), test_size, seed=42)
 
     train_dataset = PPDatasetV5(dataset_index, train_indices)
