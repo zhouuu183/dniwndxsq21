@@ -189,7 +189,7 @@ def main(args):
         raise RuntimeError(f"Dataset item is missing required keys: {', '.join(missing)}")
     if not bool(item["direct_satd_pp_input"]):
         raise RuntimeError(
-            "This trace expects a schema-34 direct-SATD dataset item. "
+            "This trace expects a schema-35 direct-SATD dataset item. "
             "Regenerate with pp_gen_v6.py --direct_satd_pp_input true."
         )
 
@@ -321,6 +321,10 @@ def main(args):
         "query_mask": batch_tensor(item.get("query_mask"), device),
         "source_ear_mask": source_native_alpha,
         "source_earring_object_mask": source_native_alpha,
+        "source_instance_verified_left": batch_tensor(item.get("source_instance_verified_left"), device),
+        "source_instance_verified_right": batch_tensor(item.get("source_instance_verified_right"), device),
+        "source_native_left_alpha": batch_tensor(item.get("source_native_left_alpha"), device),
+        "source_native_right_alpha": batch_tensor(item.get("source_native_right_alpha"), device),
         "earring_confident_mask": earring_learning_mask,
         "earring_supervision_mask": earring_learning_mask,
         "earring_reference": batch_image_01(item.get("earring_learning_reference"), device),
@@ -353,14 +357,17 @@ def main(args):
             target_hair,
             **common_v6_kwargs,
         )
-        # Mirror pp_train_v6's explicit statement that the serialised source
-        # alpha is source-native, verified object evidence.  The model's
-        # generic 256px resolver does not infer this flag on its own.
+        # The model's 256px query resolver also stores a gated diagnostic mask;
+        # restore the serialized SOURCE_NATIVE object alpha for the final
+        # compositor without granting it a global verification flag.
         if source_native_alpha is not None:
             v6_aux["source_earring_object_mask"] = source_native_alpha
-            v6_aux["source_earring_object_mask_verified_native"] = torch.ones(
-                1, 1, 1, 1, device=device, dtype=source_native_alpha.dtype
-            )
+        for key in ("source_instance_verified_left", "source_instance_verified_right"):
+            if common_v6_kwargs.get(key) is not None:
+                v6_aux[key] = common_v6_kwargs[key]
+        for key in ("source_native_left_alpha", "source_native_right_alpha"):
+            if common_v6_kwargs.get(key) is not None:
+                v6_aux[key] = common_v6_kwargs[key]
         for key, value in common_v6_kwargs["cleanup_masks"].items():
             v6_aux[key] = value
         # The author HairFast instance has been released above; instantiate
@@ -461,6 +468,9 @@ def main(args):
         ("v6_target_aligned_right_alpha", "16_v6_target_aligned_right_alpha.png", "TARGET_NATIVE"),
         ("v6_source_left_label9_chain", "17_v6_source_left_label9_chain.png", "SOURCE_NATIVE"),
         ("v6_source_right_label9_chain", "18_v6_source_right_label9_chain.png", "SOURCE_NATIVE"),
+        ("source_component_labels", "19_source_component_ids.png", "SOURCE_NATIVE"),
+        ("source_selected_components", "20_source_accepted_component_ids.png", "SOURCE_NATIVE"),
+        ("final_hole_alpha", "21_final_hole_alpha.png", "TARGET_OUTPUT"),
     ):
         value = v6_aux.get(key) if isinstance(v6_aux, dict) else None
         if torch.is_tensor(value):
@@ -484,6 +494,27 @@ def main(args):
         value = v6_aux.get(key) if isinstance(v6_aux, dict) else None
         if torch.is_tensor(value):
             mask_stats[key] = {"value": float(value.detach().cpu().flatten()[0].item())}
+    for key in (
+        "alignment_raw_left_dx",
+        "alignment_raw_left_dy",
+        "alignment_raw_right_dx",
+        "alignment_raw_right_dy",
+        "alignment_valid_left",
+        "alignment_valid_right",
+        "fallback_zero_shift_used_left",
+        "fallback_zero_shift_used_right",
+        "target_lobe_hair_cover_ratio_left",
+        "target_lobe_hair_cover_ratio_right",
+        "source_root_component_id",
+        "source_accepted_component_count",
+        "source_rejected_component_count",
+        "source_reject_reason",
+    ):
+        value = v6_aux.get(key) if isinstance(v6_aux, dict) else None
+        if torch.is_tensor(value):
+            mask_stats[key] = {
+                "value": [float(item) for item in value.detach().cpu().flatten().tolist()]
+            }
     for key in ("output_v19_target_left_visible_ear", "output_v19_target_right_visible_ear"):
         value = v6_aux.get(key) if isinstance(v6_aux, dict) else None
         if torch.is_tensor(value):
@@ -508,6 +539,8 @@ def main(args):
 13/14_v6_source_selected_*_alpha.png: final per-side source masks before target anchoring.
 15/16_v6_target_aligned_*_alpha.png: each source side after its one target-lobe alignment.
 output_v19_target_left_visible_ear.png / output_v19_target_right_visible_ear.png: per-side target-ear visibility gates.
+metrics.txt also records raw/accepted alignment, source component counts/rejection
+reason, target lobe hair-cover ratios, and zero-shift fallback diagnostics.
 """
     (output / "README.txt").write_text(manifest, encoding="utf-8")
     (output / "metrics.txt").write_text(

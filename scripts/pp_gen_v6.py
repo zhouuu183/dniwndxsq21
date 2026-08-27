@@ -40,6 +40,7 @@ from models.ear_modules_v5 import (
     build_weak_earring_masks,
     enhance_query_with_earring_recall,
     assign_components_to_ear_sides,
+    build_earlobe_anchor,
     parsing_label_mask,
     resize_mask,
 )
@@ -64,13 +65,13 @@ CLEANUP_MASK_KEYS = (
     "M_remove_neck",
     "M_remove_context",
 )
-# Schema 34 stores the SATD-rendered image as the direct PP target.  PP then
+# Schema 35 stores the SATD-rendered image as the direct PP target.  PP then
 # decodes that image live with the source, and no decoded-image SATD residual
 # is applied a second time.  Older parts are intentionally rejected because
 # they represent a different PP input contract.
-# Schema 34 also fixes ``source_earring_object_mask`` to SOURCE_NATIVE
+# Schema 35 also fixes ``source_earring_object_mask`` to SOURCE_NATIVE
 # coordinates; ``source_earring_mask`` remains TARGET_CANONICAL.
-DATASET_CONFIG_SCHEMA_VERSION = 34
+DATASET_CONFIG_SCHEMA_VERSION = 35
 DATASET_POLICY_FILES = (
     "scripts/pp_gen_v6.py",
     "hair_swap_v6.py",
@@ -986,7 +987,7 @@ class RenderedPairDataset(Dataset):
         if not torch.is_tensor(completed_hair_highres):
             raise RuntimeError(
                 "Rendered V6 dataset item is missing completed_hair_highres. "
-                "Regenerate this schema-34 dataset from the matching V6 generator."
+                "Regenerate this schema-35 dataset from the matching V6 generator."
             )
         if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
             raise RuntimeError(
@@ -1001,7 +1002,7 @@ class RenderedPairDataset(Dataset):
         if not torch.is_tensor(satd_background_highres):
             raise RuntimeError(
                 "Rendered V6 dataset item is missing satd_background_highres. "
-                "Regenerate this schema-34 dataset from the matching V6 generator."
+                "Regenerate this schema-35 dataset from the matching V6 generator."
             )
         if satd_background_highres.ndim != 3 or satd_background_highres.size(0) != 3:
             raise RuntimeError(
@@ -1450,11 +1451,8 @@ class DatasetItemBatchBuilder:
                 source_left_ear_full,
                 source_right_ear_full,
             )
-            pendant_gap = max(8, int(round(42.0 * max(source_native_size) / 256.0)))
-            pendant_extent = max(
-                pendant_gap,
-                int(round(240.0 * max(source_native_size) / 256.0)),
-            )
+            pendant_gap = max(3, int(round(6.0 * max(source_native_size) / 256.0)))
+            pendant_extent = None
             parser_left_full = retain_single_earring_group_v6(
                 parser_left_full,
                 source_left_ear_full,
@@ -1541,10 +1539,35 @@ class DatasetItemBatchBuilder:
             # label-0 tail here would truncate precisely the long pendants
             # this fallback is meant to recover.
             source_labels_full = source_parsing_full.long()
+            # Parser labels are a semantic veto, not an object detector.  A
+            # real metal/stone earring is often labelled ear/skin (7/8/1/10)
+            # rather than label 9.  The native extractor/structured verifier
+            # is allowed to retain that independently verified object pixel;
+            # all unverified face, neck, clothing, hair and hat labels remain
+            # blocked from source RGB.
             source_subject_block_full = (
-                (source_labels_full != 0) & (source_labels_full != RAW_EARRING)
+                (source_labels_full != 0)
+                & ~torch.isin(source_labels_full, torch.tensor(
+                    (7, 8, RAW_EARRING), device=source_labels_full.device
+                ))
             ).to(source_full.dtype)
-            source_object_gate_full = (1.0 - source_subject_block_full).clamp(0, 1)
+            verified_object_full = torch.clamp(
+                selected_source_left
+                + selected_source_right
+                + structured_source_instances["left_instance_mask"].to(
+                    device=source_full.device, dtype=source_full.dtype
+                )
+                + structured_source_instances["right_instance_mask"].to(
+                    device=source_full.device, dtype=source_full.dtype
+                ),
+                0,
+                1,
+            )
+            source_object_gate_full = torch.clamp(
+                (1.0 - source_subject_block_full) + verified_object_full,
+                0,
+                1,
+            )
             selected_source_left = selected_source_left * source_object_gate_full
             selected_source_right = selected_source_right * source_object_gate_full
             selected_source_left = selected_source_left * (1.0 - selected_source_left_hole).clamp(0, 1)
@@ -1829,24 +1852,107 @@ class DatasetItemBatchBuilder:
                 ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
 
             # Query-time side flags may remain open after transferred hair
-            # covers an ear.  Use only final target parser/lobe evidence for
-            # both training visibility and the target attachment point.
-            parser_min_visible_area = 2.0
-            left_open = (
-                target_left_parser_visible.flatten(1).sum(dim=1, keepdim=True)
-                >= parser_min_visible_area
-            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
-            left_open = torch.maximum(
-                left_open,
-                exposed_lobe_fallback("left_lobe_anchor", "left_ear_roi"),
+            # covers an ear.  Visibility is therefore measured on the actual
+            # high-resolution completed transfer (I_satd_blend), then reduced
+            # to 256px only for the target-canonical training/alignment fields.
+            # This keeps a thin exposed lobe from disappearing during a
+            # 256px round trip, while a fully covered lobe remains closed.
+            target_visibility_rgb = completed_hair_highres
+            if not torch.is_tensor(target_visibility_rgb):
+                target_visibility_rgb = target_full
+            target_visibility_rgb = target_visibility_rgb.to(
+                device=source_full.device, dtype=source_full.dtype
+            ).clamp(0, 1)
+            target_visibility_size = tuple(target_visibility_rgb.shape[-2:])
+            target_visibility_parsing = self.parsing_helper.parse(
+                target_visibility_rgb,
+                out_size=target_visibility_size,
             )
-            right_open = (
-                target_right_parser_visible.flatten(1).sum(dim=1, keepdim=True)
-                >= parser_min_visible_area
-            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+            target_visibility_hair = parsing_label_mask(
+                target_visibility_parsing, (RAW_HAIR,)
+            ).to(device=source_full.device, dtype=source_full.dtype)
+            target_visibility_skin = parsing_label_mask(
+                target_visibility_parsing,
+                (1, 7, 8, 10),
+            ).to(device=source_full.device, dtype=source_full.dtype)
+            target_left_visible_full = (
+                parsing_label_mask(target_visibility_parsing, (7,))
+                * (1.0 - target_visibility_hair).clamp(0, 1)
+            ).clamp(0, 1)
+            target_right_visible_full = (
+                parsing_label_mask(target_visibility_parsing, (8,))
+                * (1.0 - target_visibility_hair).clamp(0, 1)
+            ).clamp(0, 1)
+
+            def to_query_mask(value):
+                if tuple(value.shape[-2:]) == tuple(source_earring_mask.shape[-2:]):
+                    return value
+                if value.shape[-2] >= source_earring_mask.shape[-2] and value.shape[-1] >= source_earring_mask.shape[-1]:
+                    return F.adaptive_max_pool2d(
+                        value.float(), source_earring_mask.shape[-2:]
+                    ).to(dtype=source_earring_mask.dtype)
+                return F.interpolate(
+                    value.float(), size=source_earring_mask.shape[-2:], mode="nearest"
+                ).to(dtype=source_earring_mask.dtype)
+
+            target_left_parser_visible = to_query_mask(target_left_visible_full)
+            target_right_parser_visible = to_query_mask(target_right_visible_full)
+            target_skin_surface = to_query_mask(target_visibility_skin)
+            target_hair_final_query = to_query_mask(target_visibility_hair)
+
+            target_lobe_hair_cover_ratios = {}
+
+            def final_lobe_open(ear_mask_full, side_name):
+                roi_key = "left_ear_roi" if side_name == "left" else "right_ear_roi"
+                lobe_key = "left_lobe_anchor" if side_name == "left" else "right_lobe_anchor"
+                roi_full = resize_mask(
+                    query_info.get(roi_key, torch.zeros_like(target_left_parser_visible)),
+                    target_visibility_size,
+                ).to(device=source_full.device, dtype=source_full.dtype)
+                lobe_hint_full = resize_mask(
+                    query_info.get(lobe_key, query_info.get(roi_key, torch.zeros_like(target_left_parser_visible))),
+                    target_visibility_size,
+                ).to(device=source_full.device, dtype=source_full.dtype)
+                fallback_skin = target_visibility_skin * roi_full * dilate_mask(lobe_hint_full, 5)
+                anchor = build_earlobe_anchor(
+                    ear_mask_full,
+                    fallback_skin_mask=fallback_skin,
+                    ear_roi=roi_full,
+                    lower_ratio=0.70,
+                    dilate=3,
+                ) * (1.0 - target_visibility_hair).clamp(0, 1)
+                window = dilate_mask(anchor, 7)
+                exposed = (
+                    target_visibility_skin * window * (1.0 - target_visibility_hair).clamp(0, 1)
+                ).flatten(1).sum(dim=1, keepdim=True)
+                covered = (target_visibility_hair * window).flatten(1).sum(dim=1, keepdim=True)
+                corridor = ((target_visibility_skin + target_visibility_hair) * window).flatten(1).sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1.0)
+                # A visible lower-lobe footprint is sufficient; the whole ear
+                # need not be exposed.  Hair may not occupy more than 25% of
+                # that local footprint.
+                target_lobe_hair_cover_ratios[side_name] = covered / corridor
+                return (
+                    (exposed >= 4.0)
+                    & ((covered / corridor) <= 0.25)
+                    & (anchor.flatten(1).sum(dim=1, keepdim=True) >= 2.0)
+                ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+
+            parser_min_visible_area = 2.0
+            left_open = torch.maximum(
+                (
+                    target_left_visible_full.flatten(1).sum(dim=1, keepdim=True)
+                    >= max(4.0, 0.00002 * target_visibility_size[0] * target_visibility_size[1])
+                ).to(source_earring_mask.dtype).view(-1, 1, 1, 1),
+                final_lobe_open(target_left_visible_full, "left"),
+            )
             right_open = torch.maximum(
-                right_open,
-                exposed_lobe_fallback("right_lobe_anchor", "right_ear_roi"),
+                (
+                    target_right_visible_full.flatten(1).sum(dim=1, keepdim=True)
+                    >= max(4.0, 0.00002 * target_visibility_size[0] * target_visibility_size[1])
+                ).to(source_earring_mask.dtype).view(-1, 1, 1, 1),
+                final_lobe_open(target_right_visible_full, "right"),
             )
 
             def exposed_lobe_mask(lobe_key: str, roi_key: str) -> torch.Tensor:
@@ -2155,7 +2261,7 @@ class DatasetItemBatchBuilder:
                         dtype=torch.bool,
                     ),
                     # Keep both stages for reproducible validation previews.  In
-                    # schema 34 the PP target is the SATD-rendered image itself;
+                    # schema 35 the PP target is the SATD-rendered image itself;
                     # the explicit flag below prevents any later residual pass.
                     "color_before_pp": target_256[idx].cpu(),
                     "target_mask": target_mask[idx].cpu(),
@@ -2176,9 +2282,36 @@ class DatasetItemBatchBuilder:
                     "source_earring_object_mask": source_foreground_v6[
                         "source_native_earring_alpha"
                     ][idx].cpu(),
+                    # Verification is per source side.  A single global flag
+                    # allowed a valid left object to authorize a right-side
+                    # fallback (and vice versa), which produced duplicate
+                    # earrings during the later target alignment.
+                    "source_instance_verified_left": torch.tensor(
+                        bool(
+                            source_foreground_v6["source_native_presence_state"][idx, 0].item() >= 2.0
+                            and source_foreground_v6["source_native_left_alpha"][idx].sum().item() > 0.5
+                        ),
+                        dtype=torch.bool,
+                    ),
+                    "source_instance_verified_right": torch.tensor(
+                        bool(
+                            source_foreground_v6["source_native_presence_state"][idx, 1].item() >= 2.0
+                            and source_foreground_v6["source_native_right_alpha"][idx].sum().item() > 0.5
+                        ),
+                        dtype=torch.bool,
+                    ),
                     # V5 coordinate contract: native extraction evidence
                     # and target-frame learned labels are separate fields.
                     "source_native_earring_alpha": source_foreground_v6["source_native_earring_alpha"][idx].cpu(),
+                    "source_native_left_alpha": source_foreground_v6["source_native_left_alpha"][idx].cpu(),
+                    "source_native_right_alpha": source_foreground_v6["source_native_right_alpha"][idx].cpu(),
+                    "source_component_ids": source_foreground_v6["component_labels"][idx].cpu(),
+                    "accepted_component_ids": source_foreground_v6["selected_components"][idx].cpu(),
+                    "rejected_component_ids": (
+                        source_foreground_v6["component_labels"][idx]
+                        * (1.0 - source_foreground_v6["selected_components"][idx]).clamp(0, 1)
+                    ).cpu(),
+                    "reject_reason": source_foreground_v6["reject_reason"][idx].cpu(),
                     "source_native_earring_rgb_reference": {
                         "kind": "source_path",
                         "path": source_paths[idx],
@@ -2189,6 +2322,22 @@ class DatasetItemBatchBuilder:
                     "source_earring_structured_alpha": structured_source_alpha[idx].cpu(),
                     "target_aligned_earring_alpha": earring_confident_mask[idx].cpu(),
                     "target_aligned_earring_rgb": earring_learning_reference[idx].cpu(),
+                    "target_lobe_visible_left": left_open[idx].detach().cpu(),
+                    "target_lobe_visible_right": right_open[idx].detach().cpu(),
+                    "alignment_raw_left_dx": aligned_v6["left_raw_shift_x"][idx].detach().cpu(),
+                    "alignment_raw_left_dy": aligned_v6["left_raw_shift_y"][idx].detach().cpu(),
+                    "alignment_raw_right_dx": aligned_v6["right_raw_shift_x"][idx].detach().cpu(),
+                    "alignment_raw_right_dy": aligned_v6["right_raw_shift_y"][idx].detach().cpu(),
+                    "alignment_valid_left": aligned_v6["left_alignment_valid"][idx].detach().cpu(),
+                    "alignment_valid_right": aligned_v6["right_alignment_valid"][idx].detach().cpu(),
+                    "fallback_zero_shift_used_left": aligned_v6["fallback_zero_shift_used_left"][idx].detach().cpu(),
+                    "fallback_zero_shift_used_right": aligned_v6["fallback_zero_shift_used_right"][idx].detach().cpu(),
+                    "target_lobe_hair_cover_ratio_left": target_lobe_hair_cover_ratios.get(
+                        "left", torch.zeros(1)
+                    )[idx].detach().cpu(),
+                    "target_lobe_hair_cover_ratio_right": target_lobe_hair_cover_ratios.get(
+                        "right", torch.zeros(1)
+                    )[idx].detach().cpu(),
                     "coordinate_manifest": {
                         "source_earring_object_mask": "SOURCE_NATIVE",
                         "source_native_earring_alpha": "SOURCE_NATIVE",
@@ -2219,6 +2368,7 @@ class DatasetItemBatchBuilder:
                     "earring_object_mask": earring_policy["earring_object_mask"][idx].cpu(),
                     "earring_filled_mask": earring_policy["earring_filled_mask"][idx].cpu(),
                     "hoop_hole_mask": aligned_hole[idx].cpu(),
+                    "final_hole_alpha": aligned_hole[idx].cpu(),
                     "strong_earring_candidate_core": earring_policy["strong_earring_candidate_core"][idx].cpu(),
                     "left_strong_candidate": earring_policy["left_strong_candidate"][idx].cpu(),
                     "right_strong_candidate": earring_policy["right_strong_candidate"][idx].cpu(),

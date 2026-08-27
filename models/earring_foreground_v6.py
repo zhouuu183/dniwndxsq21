@@ -231,9 +231,17 @@ def _empty_output(source: torch.Tensor) -> dict[str, torch.Tensor]:
         "component_labels": zeros.clone(),
         "component_scores": zeros.clone(),
         "selected_components": zeros.clone(),
+        "accepted_component_ids": zeros.clone(),
+        "rejected_component_ids": zeros.clone(),
         "max_graph_depth_used": torch.zeros(source.size(0), 2, device=source.device, dtype=source.dtype),
         "cumulative_graph_cost": torch.zeros(source.size(0), 2, device=source.device, dtype=source.dtype),
         "component_count": torch.zeros(source.size(0), 2, device=source.device, dtype=source.dtype),
+        "root_component_id": torch.zeros(source.size(0), 2, device=source.device, dtype=source.dtype),
+        "accepted_component_count": torch.zeros(source.size(0), 2, device=source.device, dtype=source.dtype),
+        "rejected_component_count": torch.zeros(source.size(0), 2, device=source.device, dtype=source.dtype),
+        # 0=none, 1=remote, 2=lateral, 3=background, 4=hair, 5=skin,
+        # 6=gap, 7=extent.
+        "reject_reason": torch.zeros(source.size(0), 2, device=source.device, dtype=source.dtype),
     }
 
 
@@ -280,109 +288,114 @@ def retain_single_earring_group_v6(
     rejecting a second same-side accessory or a detached background strand.
     """
     if cv2 is None:
-        return mask
+        return torch.zeros_like(mask)
     value = _mask(mask, tuple(mask.shape[-2:]), mask).detach()
     anchor = _mask(lobe_anchor, tuple(value.shape[-2:]), value).detach()
     output = torch.zeros_like(value)
-    arrays = value[:, 0].cpu().numpy()
-    anchors = anchor[:, 0].cpu().numpy()
-    for batch_index, array in enumerate(arrays):
+    scale = max(value.shape[-2:]) / 256.0
+    # These limits are deliberately small in 256px coordinates.  They are
+    # connection limits, not a rectangular search rail.
+    gap_limit = max(1.0, float(max_gap))
+    for batch_index, array in enumerate(value[:, 0].cpu().numpy()):
         binary = array > 0.01
         count, labels, stats, centroids = cv2.connectedComponentsWithStats(
             binary.astype(np.uint8), 8
         )
-        if count <= 2:
-            output[batch_index, 0] = torch.from_numpy(array).to(output.device, output.dtype)
+        if count <= 1:
             continue
-        anchor_binary = anchors[batch_index] > 0.01
+        anchor_binary = anchor[batch_index, 0].cpu().numpy() > 0.01
         anchor_points = np.argwhere(anchor_binary)
-        candidates: list[tuple[float, float, float, int]] = []
+        candidates = []
         for component_id in range(1, count):
             component = labels == component_id
-            area = float(stats[component_id, cv2.CC_STAT_AREA])
-            anchor_overlap = float((component & anchor_binary).sum())
+            points = np.argwhere(component)
+            if not points.size:
+                continue
             if anchor_points.size:
-                points = np.argwhere(component)
-                distance = float(
-                    np.min(
-                        np.linalg.norm(
-                            points[:, None, :].astype(np.float32)
-                            - anchor_points[None, :, :].astype(np.float32),
-                            axis=2,
-                        )
-                    )
-                )
+                distance = float(np.min(np.linalg.norm(
+                    points[:, None, :].astype(np.float32)
+                    - anchor_points[None, :, :].astype(np.float32), axis=2)))
             else:
                 distance = float("inf")
-            candidates.append((anchor_overlap, distance, area, component_id))
-
-        # Select the component from its attachment, not its area.  The old
-        # score let a large detached label-9/background fragment outweigh the
-        # small component nearest the lobe, then its nearby fragments were
-        # treated as one earring.  That is the direct source of duplicate
-        # earrings and copied source backdrop.  A true dangling earring need
-        # only have one root close to the lobe; the continuation is admitted
-        # separately below.
-        touching = [value for value in candidates if value[0] > 0.0]
-        if touching:
-            root_id = max(touching, key=lambda value: (value[0], -value[1], value[2]))[3]
-        else:
-            nearest = min(candidates, key=lambda value: (value[1], -value[2]))
-            # Do not turn a remote parser fragment into an accessory merely
-            # because this side has no better candidate.
-            if nearest[1] > float(max_gap) * 1.75:
-                continue
-            root_id = nearest[3]
+            overlap = float((component & anchor_binary).sum())
+            area = float(stats[component_id, cv2.CC_STAT_AREA])
+            candidates.append((overlap, distance, area, component_id))
+        if not candidates:
+            continue
+        touching = [item for item in candidates if item[0] > 0.0]
+        root_info = max(touching, key=lambda item: (item[0], -item[1], item[2])) if touching else min(candidates, key=lambda item: (item[1], -item[2]))
+        if not touching and root_info[1] > gap_limit:
+            continue
+        root_id = root_info[3]
         root = labels == root_id
-        root_x = float(centroids[root_id][0])
-        root_y = float(centroids[root_id][1])
+        root_points = np.argwhere(root)
         root_x0 = float(stats[root_id, cv2.CC_STAT_LEFT])
         root_x1 = root_x0 + float(stats[root_id, cv2.CC_STAT_WIDTH])
         root_y0 = float(stats[root_id, cv2.CC_STAT_TOP])
         root_y1 = root_y0 + float(stats[root_id, cv2.CC_STAT_HEIGHT])
+        root_height = max(1.0, root_y1 - root_y0)
         keep = root.copy()
-        keep_x0, keep_x1 = root_x0, root_x1
-        keep_y0, keep_y1 = root_y0, root_y1
-        anchor_bottom = (
-            float(anchor_points[:, 0].max()) if anchor_points.size else root_y1
-        )
-        # Grow a long pendant from the already accepted root.  Comparing every
-        # candidate only with the root centroid rejects a legitimate lower
-        # segment once the first segment has extended downward.
-        for _, _, _, component_id in sorted(
-            (value for value in candidates if value[3] != root_id),
-            key=lambda value: float(stats[value[3], cv2.CC_STAT_TOP]),
-        ):
-            component = labels == component_id
-            x0 = float(stats[component_id, cv2.CC_STAT_LEFT])
-            x1 = x0 + float(stats[component_id, cv2.CC_STAT_WIDTH])
-            y0 = float(stats[component_id, cv2.CC_STAT_TOP])
-            y1 = y0 + float(stats[component_id, cv2.CC_STAT_HEIGHT])
-            gap_x = max(keep_x0 - x1, x0 - keep_x1, 0.0)
-            gap_y = max(y0 - keep_y1, keep_y0 - y1, 0.0)
-            component_x = float(centroids[component_id][0])
-            component_y = float(centroids[component_id][1])
-            # Long pendants extend downward from the lobe. A same-side second
-            # earring is normally lateral or starts alongside the accepted
-            # root, rather than below its lowest accepted segment.
-            if max(gap_x, gap_y) > float(max_gap):
+        keep_x0, keep_x1, keep_y0, keep_y1 = root_x0, root_x1, root_y0, root_y1
+        # A connected component may contain a background strand.  Restrict a
+        # very wide root to the lobe-centred object corridor; this is only a
+        # decontamination step and cannot add pixels outside the input mask.
+        if anchor_points.size:
+            anchor_x = float(anchor_points[:, 1].mean())
+            corridor = max(4.0 * scale, min(16.0 * scale, 0.65 * max(1.0, root_x1 - root_x0)))
+            root &= np.abs(np.indices(root.shape)[1] - anchor_x) <= corridor
+            keep = root
+            ys, xs = np.where(keep)
+            if not len(ys):
                 continue
-            # A real pendant can curve or have a wide lower ornament.  Keep
-            # its reasonably local continuation here; duplicate prevention is
-            # a source-side ownership decision in
-            # ``enforce_exclusive_earring_sides_v6``, not an overly narrow
-            # contour crop that would throw away valid earring pixels.
-            if gap_x > float(max_gap) * 0.70:
-                continue
-            if component_y < keep_y1 - float(max_gap) * 0.25:
-                continue
-            if abs(component_x - root_x) > float(max_gap) * 1.50:
-                continue
-            if max_downward_extent is not None and y1 > anchor_bottom + float(max_downward_extent):
-                continue
+            keep_x0, keep_x1 = float(xs.min()), float(xs.max() + 1)
+            keep_y0, keep_y1 = float(ys.min()), float(ys.max() + 1)
+        # Extend only downward, in short locally connected steps.  The extent
+        # grows from the accepted object, so a remote lateral strand cannot be
+        # admitted merely because it lies in a long fixed rail.
+        dynamic_limit = None if max_downward_extent is None else float(max_downward_extent)
+        accepted_ids = {root_id}
+        changed = True
+        while changed:
+            changed = False
+            best = None
+            best_distance = float("inf")
+            for _, _, _, component_id in candidates:
+                if component_id in accepted_ids:
+                    continue
+                component = labels == component_id
+                x0 = float(stats[component_id, cv2.CC_STAT_LEFT])
+                x1 = x0 + float(stats[component_id, cv2.CC_STAT_WIDTH])
+                y0 = float(stats[component_id, cv2.CC_STAT_TOP])
+                y1 = y0 + float(stats[component_id, cv2.CC_STAT_HEIGHT])
+                gap_x = max(keep_x0 - x1, x0 - keep_x1, 0.0)
+                gap_y = max(y0 - keep_y1, keep_y0 - y1, 0.0)
+                cx = float(centroids[component_id][0])
+                cy = float(centroids[component_id][1])
+                # Pendants go down from the accepted chain.  A component which
+                # begins beside/above the root is treated as a second object.
+                if cy < keep_y1 - max(1.0, 0.25 * gap_limit):
+                    continue
+                if gap_x > 0.75 * gap_limit or gap_y > gap_limit:
+                    continue
+                if abs(cx - 0.5 * (keep_x0 + keep_x1)) > max(2.0 * scale, gap_limit):
+                    continue
+                if dynamic_limit is not None and y1 > root_y1 + dynamic_limit:
+                    continue
+                distance = gap_x + gap_y
+                if distance < best_distance:
+                    best_distance, best = distance, component_id
+            if best is None:
+                break
+            component = labels == best
             keep |= component
+            x0 = float(stats[best, cv2.CC_STAT_LEFT])
+            x1 = x0 + float(stats[best, cv2.CC_STAT_WIDTH])
+            y0 = float(stats[best, cv2.CC_STAT_TOP])
+            y1 = y0 + float(stats[best, cv2.CC_STAT_HEIGHT])
             keep_x0, keep_x1 = min(keep_x0, x0), max(keep_x1, x1)
             keep_y0, keep_y1 = min(keep_y0, y0), max(keep_y1, y1)
+            accepted_ids.add(best)
+            changed = True
         output[batch_index, 0] = torch.from_numpy(array * keep.astype(np.float32)).to(
             output.device, output.dtype
         )
@@ -514,6 +527,10 @@ def extract_source_native_earring_v6(
     max_depth_out = np.zeros((batch, 2), dtype=np.float32)
     cumulative_cost_out = np.zeros((batch, 2), dtype=np.float32)
     component_count_out = np.zeros((batch, 2), dtype=np.float32)
+    root_component_id_out = np.zeros((batch, 2), dtype=np.float32)
+    accepted_component_count_out = np.zeros((batch, 2), dtype=np.float32)
+    rejected_component_count_out = np.zeros((batch, 2), dtype=np.float32)
+    reject_reason_out = np.zeros((batch, 2), dtype=np.float32)
     scale = max(height, width) / 256.0
 
     def radius(value: float, minimum: int = 1) -> int:
@@ -541,7 +558,8 @@ def extract_source_native_earring_v6(
             cutoff = np.quantile(ys, 0.58)
             anchor = ear & (np.indices((height, width))[0] >= cutoff)
             anchor = cv2.dilate(anchor.astype(np.uint8), np.ones((2 * radius(2) + 1, 2 * radius(2) + 1), np.uint8), 1).astype(bool)
-            anchor_y, anchor_x = np.argwhere(anchor).mean(axis=0)
+            anchor_points = np.argwhere(anchor)
+            anchor_y, anchor_x = anchor_points.mean(axis=0)
             core = cv2.dilate(ear.astype(np.uint8), np.ones((2 * radius(18) + 1, 2 * radius(18) + 1), np.uint8), 1).astype(bool)
             y0 = max(0, int(round(anchor_y - radius(18))))
             y1 = min(height, int(round(anchor_y + radius(68))))
@@ -628,34 +646,36 @@ def extract_source_native_earring_v6(
             # component as an additional *candidate* when it is source-lobe
             # associated; all later halo, hair, skin and hole checks still
             # apply before it becomes RGB alpha.
-            parser_component = parser_side & envelope
+            # Parser label 9 is a locator, not a blanket RGB mask.  Keep only
+            # the single label-9 component nearest the lobe; detached label-9
+            # fragments (often cheek contours or source wisps) are discarded.
+            parser_component = np.zeros_like(envelope, dtype=bool)
+            parser_labels_count, parser_labels, parser_stats, _ = cv2.connectedComponentsWithStats(
+                parser_side.astype(np.uint8), 8
+            )
+            parser_candidates = []
+            for parser_id in range(1, parser_labels_count):
+                parser_part = parser_labels == parser_id
+                parser_points = np.argwhere(parser_part)
+                if not parser_points.size:
+                    continue
+                parser_distance = float(np.min(np.linalg.norm(
+                    parser_points[:, None, :].astype(np.float32)
+                    - anchor_points[None, :, :].astype(np.float32), axis=2
+                ))) if anchor_points.size else float("inf")
+                parser_candidates.append((parser_distance, -float(parser_stats[parser_id, cv2.CC_STAT_AREA]), parser_id))
+            if parser_candidates:
+                parser_id = min(parser_candidates)[2]
+                parser_component = parser_labels == parser_id
+            # Label-9 is a locator/seed, never a blanket RGB alpha.  In
+            # particular, do not OR the complete parser component back into
+            # the GrabCut result: parser label-9 can contain a cheek contour,
+            # source wisps, or a backdrop fringe.  A low-contrast long pendant
+            # is recovered later by the independently verified structured
+            # source-instance path, which still applies lobe, material and
+            # background checks before becoming write alpha.
             parser_candidate_area = int(parser_component.sum())
             candidate_area = int(candidate.sum())
-            parser_recovery_limit = int((0.10 if allow_long_continuation else 0.10) * height * width)
-            # A complete long pendant is often entirely label-9 but too flat
-            # for GrabCut's probable-foreground threshold.  Restore the full
-            # raw component only when it reaches the measured lower-lobe
-            # anchor; a detached background strand inside the broad envelope
-            # therefore cannot become an object.  The later halo/hair checks
-            # still remove fringe pixels before RGB compositing.
-            parser_anchor_support = cv2.dilate(
-                anchor.astype(np.uint8),
-                np.ones((2 * radius(24) + 1, 2 * radius(24) + 1), np.uint8),
-                1,
-            ).astype(bool)
-            parser_lobe_connected = bool((parser_component & parser_anchor_support).any())
-            if (
-                parser_lobe_connected
-                and parser_candidate_area > 0
-                and parser_candidate_area <= parser_recovery_limit
-            ):
-                # Label 9 is the only source-semantic foreground authority.
-                # GrabCut is useful for parser-missed pixels, but it commonly
-                # drops the low-contrast lower half of a long pendant.  Always
-                # retain the complete lobe-connected label-9 component; the
-                # component/root and semantic guards below still prevent an
-                # unrelated visual/background component from joining it.
-                candidate = candidate | parser_component
 
             count, component_labels, stats, _ = cv2.connectedComponentsWithStats(candidate.astype(np.uint8), 8)
             components: list[dict[str, object]] = []
@@ -808,6 +828,16 @@ def extract_source_native_earring_v6(
                 if components:
                     state[batch_index, side_index] = 1.0
                     confidence[batch_index, side_index] = float(max(item["score"] for item in components))
+                    rejected_component_count_out[batch_index, side_index] = len(components)
+                    best_component = max(components, key=lambda item: float(item["score"]))
+                    if float(best_component.get("hair_overlap", 0.0)) >= 0.30:
+                        reject_reason_out[batch_index, side_index] = 4.0
+                    elif float(best_component.get("skin_overlap", 0.0)) >= 0.78:
+                        reject_reason_out[batch_index, side_index] = 5.0
+                    elif float(best_component.get("background_overlap", 0.0)) >= 0.55:
+                        reject_reason_out[batch_index, side_index] = 3.0
+                    else:
+                        reject_reason_out[batch_index, side_index] = 2.0
                 result_arrays["parser_earring_seed"][batch_index] = np.maximum(
                     result_arrays["parser_earring_seed"][batch_index], (parser_side | seed_side).astype(np.float32)
                 )
@@ -818,6 +848,8 @@ def extract_source_native_earring_v6(
                 result_arrays["localization_core"][batch_index] = np.maximum(result_arrays["localization_core"][batch_index], core.astype(np.float32))
                 result_arrays["probable_visual_evidence"][batch_index] = np.maximum(result_arrays["probable_visual_evidence"][batch_index], probable.astype(np.float32))
                 continue
+
+            root_component_id_out[batch_index, side_index] = float(roots[0]["id"])
 
             selected: dict[int, tuple[int, float]] = {}
             frontier: list[tuple[dict[str, object], int, float]] = []
@@ -839,9 +871,8 @@ def extract_source_native_earring_v6(
                     # jewel and highlight components.  This is a connection
                     # test only; it never expands the final write alpha.
                     max_gap = max(
-                        radius(6),
-                        radius(28 if allow_long_continuation else 18)
-                        - 2 * depth,
+                        radius(3),
+                        radius(8 if allow_long_continuation else 6) - 2 * depth,
                     )
                     if gap > max_gap:
                         continue
@@ -907,7 +938,7 @@ def extract_source_native_earring_v6(
                 selected_items = [
                     item for item in components if int(item["id"]) in selected
                 ]
-                continuation_limit = int(0.08 * height * width)
+                continuation_limit = int(0.05 * height * width)
                 continuation_area = int(selected_mask.sum())
                 changed = True
                 while changed and continuation_area < continuation_limit:
@@ -935,13 +966,13 @@ def extract_source_native_earring_v6(
                             key=lambda item: _bbox_gap(item["bbox"], candidate_item["bbox"]),
                         )
                         gap = _bbox_gap(nearest["bbox"], candidate_item["bbox"])
-                        if gap > radius(32):
+                        if gap > radius(8):
                             continue
                         lab_distance = float(np.linalg.norm(nearest["mean_lab"] - candidate_item["mean_lab"]))
                         if lab_distance > 68.0:
                             continue
                         x_distance = abs(float(candidate_item["centroid_x"]) - float(nearest["centroid_x"]))
-                        if x_distance > radius(42):
+                        if x_distance > radius(10):
                             continue
                         score = (
                             0.45 * float(candidate_item["material_score"])
@@ -965,6 +996,11 @@ def extract_source_native_earring_v6(
                     continuation_area = int(selected_mask.sum())
                     changed = True
 
+            accepted_component_count_out[batch_index, side_index] = float(len(selected))
+            rejected_component_count_out[batch_index, side_index] = float(
+                max(0, len(components) - len(selected))
+            )
+
             # Decontaminate the selected boundary before exporting RGB alpha.
             # GrabCut correctly finds the broad hoop, but antialiased source
             # edges can still contain a one-pixel strip of the green/bright
@@ -977,9 +1013,15 @@ def extract_source_native_earring_v6(
             if selected_mask.any():
                 trim_kernel = np.ones((2 * radius(2) + 1, 2 * radius(2) + 1), np.uint8)
                 trim_window = (int(trim_kernel.shape[1]), int(trim_kernel.shape[0]))
+                # Matte/contour operations must stay at one or two native
+                # pixels.  ``radius(1)`` scales to four pixels on a 1024px
+                # image, which visibly shrinks small studs and softens long
+                # pendant edges.  The wider trim window above is only a local
+                # background estimator and does not change the matte width.
+                matte_radius = max(1, min(2, int(round(scale * 0.5))))
                 boundary = selected_mask & ~cv2.erode(
                     selected_mask.astype(np.uint8),
-                    np.ones((2 * radius(1) + 1, 2 * radius(1) + 1), np.uint8),
+                    np.ones((2 * matte_radius + 1, 2 * matte_radius + 1), np.uint8),
                     1,
                 ).astype(bool)
                 outside = cv2.dilate(
@@ -1044,11 +1086,15 @@ def extract_source_native_earring_v6(
                 trusted_object_pixels = parser_side | seed_side | trusted_core
                 hair_guard = cv2.dilate(
                     semantic_hair.astype(np.uint8),
-                    np.ones((2 * radius(2) + 1, 2 * radius(2) + 1), np.uint8),
+                    np.ones((2 * matte_radius + 1, 2 * matte_radius + 1), np.uint8),
                     1,
                 ).astype(bool)
                 hair_leak = hair_guard & ~trusted_object_pixels
-                skin_leak = semantic_skin & ~trusted_object_pixels
+                # A verified visual component may be labelled ear/skin by the
+                # parser.  Do not delete those accepted pixels merely because
+                # they are not in the coarse label-9/seed prior; the component
+                # has already passed lobe, material and connectivity checks.
+                skin_leak = semantic_skin & ~trusted_object_pixels & ~selected_mask
                 selected_mask &= ~(background_halo | hair_leak | skin_leak)
 
             final_alpha = selected_mask.astype(np.float32)
@@ -1062,7 +1108,7 @@ def extract_source_native_earring_v6(
             if selected_mask.any():
                 core = cv2.erode(
                     selected_mask.astype(np.uint8),
-                    np.ones((2 * radius(1) + 1, 2 * radius(1) + 1), np.uint8),
+                    np.ones((2 * matte_radius + 1, 2 * matte_radius + 1), np.uint8),
                     1,
                 ).astype(bool)
                 core_support = cv2.boxFilter(
@@ -1137,7 +1183,8 @@ def extract_source_native_earring_v6(
             topology = cv2.morphologyEx(
                 (final_alpha > 0.5).astype(np.uint8),
                 cv2.MORPH_CLOSE,
-                np.ones((2 * radius(1) + 1, 2 * radius(1) + 1), np.uint8),
+                np.ones((2 * max(1, min(2, int(round(scale * 0.5)))) + 1,
+                         2 * max(1, min(2, int(round(scale * 0.5)))) + 1), np.uint8),
             ).astype(bool)
             hole = _fill_holes(topology)
             final_alpha *= (~hole).astype(np.float32)
@@ -1237,6 +1284,15 @@ def extract_source_native_earring_v6(
     output["max_graph_depth_used"] = torch.from_numpy(max_depth_out).to(device=device, dtype=dtype)
     output["cumulative_graph_cost"] = torch.from_numpy(cumulative_cost_out).to(device=device, dtype=dtype)
     output["component_count"] = torch.from_numpy(component_count_out).to(device=device, dtype=dtype)
+    output["root_component_id"] = torch.from_numpy(root_component_id_out).to(device=device, dtype=dtype)
+    output["accepted_component_count"] = torch.from_numpy(accepted_component_count_out).to(device=device, dtype=dtype)
+    output["rejected_component_count"] = torch.from_numpy(rejected_component_count_out).to(device=device, dtype=dtype)
+    output["reject_reason"] = torch.from_numpy(reject_reason_out).to(device=device, dtype=dtype)
+    output["accepted_component_ids"] = output["selected_components"].clone()
+    output["rejected_component_ids"] = (
+        output["component_labels"]
+        * (1.0 - (output["selected_components"] > 0.5).to(dtype))
+    ).clamp_min(0)
     return output
 
 
@@ -1278,14 +1334,38 @@ def align_earring_instance_v6(
     tgt_ry, tgt_rx, tgt_rvalid = _ear_bottom_attachment(target_right)
     left_valid = src_lvalid & tgt_lvalid & (left_instance.flatten(1).sum(dim=1) > 0.5)
     right_valid = src_rvalid & tgt_rvalid & (right_instance.flatten(1).sum(dim=1) > 0.5)
-    left_dy = torch.where(left_valid, torch.round(tgt_ly - src_ly), torch.zeros_like(src_ly)).clamp(-max_shift, max_shift)
-    left_dx = torch.where(left_valid, torch.round(tgt_lx - src_lx), torch.zeros_like(src_lx)).clamp(-max_shift, max_shift)
-    right_dy = torch.where(right_valid, torch.round(tgt_ry - src_ry), torch.zeros_like(src_ry)).clamp(-max_shift, max_shift)
-    right_dx = torch.where(right_valid, torch.round(tgt_rx - src_rx), torch.zeros_like(src_rx)).clamp(-max_shift, max_shift)
+    # Validate the raw translation before applying it.  Clamping an erroneous
+    # cheek/face anchor to ``max_shift`` still writes a real earring at a wrong
+    # location; an invalid correspondence must produce no object instead.
+    raw_left_dy = torch.round(tgt_ly - src_ly)
+    raw_left_dx = torch.round(tgt_lx - src_lx)
+    raw_right_dy = torch.round(tgt_ry - src_ry)
+    raw_right_dx = torch.round(tgt_rx - src_rx)
+    left_in_range = (raw_left_dy.abs() <= float(max_shift)) & (raw_left_dx.abs() <= float(max_shift))
+    right_in_range = (raw_right_dy.abs() <= float(max_shift)) & (raw_right_dx.abs() <= float(max_shift))
+    # For max_shift=0, permit only an already coincident attachment band
+    # (within one native pixel).  A remote/face anchor remains rejected;
+    # clamping it would place the source object at an arbitrary location.
+    left_zero_fallback = left_valid & ~left_in_range & (
+        torch.maximum(raw_left_dy.abs(), raw_left_dx.abs()) <= 1.0
+    )
+    right_zero_fallback = right_valid & ~right_in_range & (
+        torch.maximum(raw_right_dy.abs(), raw_right_dx.abs()) <= 1.0
+    )
+    left_shift_valid = left_valid & (left_in_range | left_zero_fallback)
+    right_shift_valid = right_valid & (right_in_range | right_zero_fallback)
+    left_dy = torch.where(left_shift_valid, raw_left_dy, torch.zeros_like(raw_left_dy))
+    left_dx = torch.where(left_shift_valid, raw_left_dx, torch.zeros_like(raw_left_dx))
+    right_dy = torch.where(right_shift_valid, raw_right_dy, torch.zeros_like(raw_right_dy))
+    right_dx = torch.where(right_shift_valid, raw_right_dx, torch.zeros_like(raw_right_dx))
     left_alpha = _shift_per_batch(left_instance, left_dy, left_dx)
     right_alpha = _shift_per_batch(right_instance, right_dy, right_dx)
     left_hole = _shift_per_batch(_mask(instance.left_hole_alpha, size, source), left_dy, left_dx)
     right_hole = _shift_per_batch(_mask(instance.right_hole_alpha, size, source), right_dy, right_dx)
+    left_alpha = left_alpha * left_shift_valid.view(-1, 1, 1, 1).to(left_alpha.dtype)
+    right_alpha = right_alpha * right_shift_valid.view(-1, 1, 1, 1).to(right_alpha.dtype)
+    left_hole = left_hole * left_shift_valid.view(-1, 1, 1, 1).to(left_hole.dtype)
+    right_hole = right_hole * right_shift_valid.view(-1, 1, 1, 1).to(right_hole.dtype)
     aligned_alpha = (left_alpha + right_alpha).clamp(0, 1)
     aligned_hole = (left_hole + right_hole).clamp(0, 1)
     aligned_alpha = aligned_alpha * (1.0 - aligned_hole).clamp(0, 1)
@@ -1310,6 +1390,14 @@ def align_earring_instance_v6(
         "left_shift_x": left_dx.view(-1, 1),
         "right_shift_y": right_dy.view(-1, 1),
         "right_shift_x": right_dx.view(-1, 1),
+        "left_raw_shift_y": raw_left_dy.view(-1, 1),
+        "left_raw_shift_x": raw_left_dx.view(-1, 1),
+        "right_raw_shift_y": raw_right_dy.view(-1, 1),
+        "right_raw_shift_x": raw_right_dx.view(-1, 1),
+        "left_alignment_valid": left_shift_valid.view(-1, 1).to(source.dtype),
+        "right_alignment_valid": right_shift_valid.view(-1, 1).to(source.dtype),
+        "fallback_zero_shift_used_left": left_zero_fallback.view(-1, 1).to(source.dtype),
+        "fallback_zero_shift_used_right": right_zero_fallback.view(-1, 1).to(source.dtype),
     }
 
 

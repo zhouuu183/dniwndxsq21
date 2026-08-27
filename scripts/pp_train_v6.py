@@ -40,12 +40,12 @@ CLEANUP_MASK_KEYS = (
     "M_remove_neck",
     "M_remove_context",
 )
-# Must match ``scripts/pp_gen_v6.py``. Schema 34 stores the SATD-rendered
+# Must match ``scripts/pp_gen_v6.py``. Schema 35 stores the SATD-rendered
 # image as the direct PP target; every training/validation pass decodes its
 # own PP S/F and never applies a second SATD residual.
-# Schema 34 stores ``source_earring_object_mask`` in SOURCE_NATIVE
+# Schema 35 stores ``source_earring_object_mask`` in SOURCE_NATIVE
 # coordinates; schema-32 serialized the target-aligned mask under that name.
-PP_DATASET_SCHEMA_VERSION = 34
+PP_DATASET_SCHEMA_VERSION = 35
 PP_EXTRA_MASK_KEYS = (
     "cleanup_inner_edge",
     "revealed_skin_mask",
@@ -1413,6 +1413,8 @@ class TrainerV5:
             query_mask=batch["query_mask"],
             source_ear_mask=source_ear_mask,
             source_earring_object_mask=source_earring_object_mask,
+            source_instance_verified_left=batch.get("source_instance_verified_left"),
+            source_instance_verified_right=batch.get("source_instance_verified_right"),
             presence_target=batch["presence_target"],
             earring_confident_mask=earring_confident_mask,
             earring_supervision_mask=earring_confident_mask,
@@ -1427,6 +1429,9 @@ class TrainerV5:
             source_visible_skin_reference_mask=batch.get("source_visible_skin_reference_mask"),
             source_skin_valid_mask=batch.get("source_skin_valid_mask"),
         )
+        for key in ("source_native_left_alpha", "source_native_right_alpha"):
+            if torch.is_tensor(batch.get(key)):
+                aux[key] = batch[key]
         # The V5 final compositor consumes these runtime-only controls from
         # its args; keep them explicit rather than falling back to legacy
         # rail/write-mask defaults.
@@ -1477,18 +1482,12 @@ class TrainerV5:
         # the 256px target-aligned supervision mask.
         if use_dataset_source_mask and torch.is_tensor(source_native_earring_alpha):
             aux["source_earring_object_mask"] = source_native_earring_alpha
-            # This field comes from pp_gen_v6's native foreground verifier and
-            # is in SOURCE_NATIVE coordinates.  The final compositor may keep
-            # its full object alpha (while still rejecting source hair) rather
-            # than shrinking it again with a coarse semantic parser label.
-            aux["source_earring_object_mask_verified_native"] = torch.ones(
-                source_native_earring_alpha.size(0),
-                1,
-                1,
-                1,
-                device=source_native_earring_alpha.device,
-                dtype=source_native_earring_alpha.dtype,
-            )
+            # Keep verification side-specific.  A global ``ones`` flag let a
+            # valid object on one side authorize the other side's fallback.
+            for side, key in enumerate(("source_instance_verified_left", "source_instance_verified_right")):
+                value = batch.get(key)
+                if torch.is_tensor(value):
+                    aux[key] = value.to(device=source_native_earring_alpha.device)
         dataset_mask_gate = batch.get("has_earring_confident_mask")
         if torch.is_tensor(dataset_mask_gate):
             dataset_mask_gate = dataset_mask_gate.float().view(-1, 1, 1, 1) > 0.5
@@ -1934,10 +1933,11 @@ class PPDatasetV5(Dataset):
             return sample
 
         keys_to_flip = ["source", "shape_reference", "color_reference", "target", "completed_hair_highres", "satd_background_highres", "earring_reference", "earring_learning_reference", "target_mask", "HT_E", "source_hair_mask", "target_hair_mask",
-                        "source_earring_mask", "source_native_earring_alpha", "source_earring_structured_alpha", "target_earring_mask", "query_mask", "ear_roi",
+                        "source_earring_mask", "source_native_earring_alpha", "source_native_left_alpha", "source_native_right_alpha", "source_earring_structured_alpha", "target_earring_mask", "query_mask", "ear_roi",
                         "visible_ear_roi", "earring_valid_roi", "target_covered_ear_block_mask",
                         "source_hair_block_mask", "source_earring_object_mask", "source_earring_seed_mask",
                         "earring_search_mask", "earring_learning_mask", "earring_learning_hole_mask",
+                        "source_component_ids", "accepted_component_ids", "rejected_component_ids",
                         *CLEANUP_MASK_KEYS, *PP_EXTRA_MASK_KEYS]
         for key in keys_to_flip:
             if key in sample:
@@ -1953,6 +1953,18 @@ class PPDatasetV5(Dataset):
         for key in ("earring_presence_state", "earring_instance_confidence"):
             if key in sample:
                 sample[key] = sample[key][[1, 0]]
+        for left_key, right_key in (
+            ("source_native_left_alpha", "source_native_right_alpha"),
+            ("source_instance_verified_left", "source_instance_verified_right"),
+            ("target_lobe_visible_left", "target_lobe_visible_right"),
+            ("alignment_valid_left", "alignment_valid_right"),
+            ("fallback_zero_shift_used_left", "fallback_zero_shift_used_right"),
+            ("target_lobe_hair_cover_ratio_left", "target_lobe_hair_cover_ratio_right"),
+        ):
+            if left_key in sample and right_key in sample:
+                sample[left_key], sample[right_key] = sample[right_key], sample[left_key]
+        if "reject_reason" in sample and torch.is_tensor(sample["reject_reason"]):
+            sample["reject_reason"] = sample["reject_reason"][[1, 0]]
         return sample
 
     def __getitem__(self, idx):
@@ -1964,7 +1976,7 @@ class PPDatasetV5(Dataset):
         if not torch.is_tensor(completed_hair_highres):
             raise RuntimeError(
                 "V6 dataset item is missing completed_hair_highres. "
-                "Regenerate the complete schema-34 V6 dataset before training."
+                "Regenerate the complete schema-35 V6 dataset before training."
             )
         if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
             raise RuntimeError(
@@ -1979,7 +1991,7 @@ class PPDatasetV5(Dataset):
         if not torch.is_tensor(satd_background_highres):
             raise RuntimeError(
                 "V6 dataset item is missing satd_background_highres. "
-                "Regenerate the complete schema-34 V6 dataset before training."
+                "Regenerate the complete schema-35 V6 dataset before training."
             )
         if satd_background_highres.ndim != 3 or satd_background_highres.size(0) != 3:
             raise RuntimeError(
@@ -1993,7 +2005,7 @@ class PPDatasetV5(Dataset):
         if "direct_satd_pp_input" not in item:
             raise RuntimeError(
                 "V6 dataset item is missing direct_satd_pp_input. "
-                "Regenerate the schema-34 direct-SATD dataset before training."
+                "Regenerate the schema-35 direct-SATD dataset before training."
             )
         direct_satd_pp_input = item["direct_satd_pp_input"]
         if torch.is_tensor(direct_satd_pp_input):
@@ -2021,7 +2033,11 @@ class PPDatasetV5(Dataset):
                 dtype=torch.float32,
             ),
             "source_earring_mask": item["source_earring_mask"].clone(),
-            "source_earring_object_mask": item.get("source_earring_object_mask", item["source_earring_mask"]).clone(),
+            # Legacy target-canonical ``source_earring_mask`` is a query/loss
+            # field, never a source RGB alpha fallback.
+            "source_earring_object_mask": item.get(
+                "source_earring_object_mask", torch.zeros_like(item["source_earring_mask"])
+            ).clone(),
             # SOURCE_NATIVE alpha is the only dataset earring field valid for
             # source extraction and target-lobe alignment.  Learning masks
             # below are TARGET_CANONICAL supervision and stay separate.
@@ -2029,6 +2045,52 @@ class PPDatasetV5(Dataset):
                 "source_native_earring_alpha",
                 torch.zeros_like(item["source_earring_mask"]),
             ).clone(),
+            "source_instance_verified_left": item.get(
+                "source_instance_verified_left", torch.tensor(False, dtype=torch.bool)
+            ).clone(),
+            "source_instance_verified_right": item.get(
+                "source_instance_verified_right", torch.tensor(False, dtype=torch.bool)
+            ).clone(),
+            "source_native_left_alpha": item.get(
+                "source_native_left_alpha",
+                torch.zeros_like(item.get("source_native_earring_alpha", item["source_earring_mask"])),
+            ).clone(),
+            "source_native_right_alpha": item.get(
+                "source_native_right_alpha",
+                torch.zeros_like(item.get("source_native_earring_alpha", item["source_earring_mask"])),
+            ).clone(),
+            "source_component_ids": item.get(
+                "source_component_ids", torch.zeros_like(item["source_earring_mask"])
+            ).clone(),
+            "accepted_component_ids": item.get(
+                "accepted_component_ids", torch.zeros_like(item["source_earring_mask"])
+            ).clone(),
+            "rejected_component_ids": item.get(
+                "rejected_component_ids", torch.zeros_like(item["source_earring_mask"])
+            ).clone(),
+            "reject_reason": item.get(
+                "reject_reason", torch.zeros(2, dtype=torch.float32)
+            ).clone(),
+            "target_lobe_hair_cover_ratio_left": item.get(
+                "target_lobe_hair_cover_ratio_left", torch.zeros(1)
+            ).clone(),
+            "target_lobe_hair_cover_ratio_right": item.get(
+                "target_lobe_hair_cover_ratio_right", torch.zeros(1)
+            ).clone(),
+            "fallback_zero_shift_used_left": item.get(
+                "fallback_zero_shift_used_left", torch.zeros(1)
+            ).clone(),
+            "fallback_zero_shift_used_right": item.get(
+                "fallback_zero_shift_used_right", torch.zeros(1)
+            ).clone(),
+            "target_lobe_visible_left": item.get("target_lobe_visible_left", torch.tensor(False, dtype=torch.bool)).clone(),
+            "target_lobe_visible_right": item.get("target_lobe_visible_right", torch.tensor(False, dtype=torch.bool)).clone(),
+            "alignment_raw_left_dx": item.get("alignment_raw_left_dx", torch.zeros(1)).clone(),
+            "alignment_raw_left_dy": item.get("alignment_raw_left_dy", torch.zeros(1)).clone(),
+            "alignment_raw_right_dx": item.get("alignment_raw_right_dx", torch.zeros(1)).clone(),
+            "alignment_raw_right_dy": item.get("alignment_raw_right_dy", torch.zeros(1)).clone(),
+            "alignment_valid_left": item.get("alignment_valid_left", torch.tensor(False, dtype=torch.bool)).clone(),
+            "alignment_valid_right": item.get("alignment_valid_right", torch.tensor(False, dtype=torch.bool)).clone(),
             "earring_instance_mask": item.get(
                 "earring_instance_mask",
                 item.get("earring_confident_mask", item["source_earring_mask"]),
