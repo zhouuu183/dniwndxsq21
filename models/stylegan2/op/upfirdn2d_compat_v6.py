@@ -1,4 +1,6 @@
 import os
+import shutil
+import warnings
 
 import torch
 from torch.nn import functional as F
@@ -7,13 +9,30 @@ from torch.utils.cpp_extension import load
 
 
 module_path = os.path.dirname(__file__)
-upfirdn2d_op = load(
-    "upfirdn2d",
-    sources=[
-        os.path.join(module_path, "upfirdn2d.cpp"),
-        os.path.join(module_path, "upfirdn2d_kernel.cu"),
-    ],
-)
+upfirdn2d_op = None
+_upfirdn_load_attempted = False
+
+
+def _get_upfirdn_extension():
+    global upfirdn2d_op, _upfirdn_load_attempted
+    if _upfirdn_load_attempted:
+        return upfirdn2d_op
+    _upfirdn_load_attempted = True
+    if os.name == "nt" and shutil.which("cl") is None:
+        warnings.warn("MSVC cl.exe is unavailable; using the native PyTorch upfirdn2d fallback.")
+        return None
+    try:
+        upfirdn2d_op = load(
+            "upfirdn2d",
+            sources=[
+                os.path.join(module_path, "upfirdn2d.cpp"),
+                os.path.join(module_path, "upfirdn2d_kernel.cu"),
+            ],
+        )
+    except (OSError, RuntimeError) as error:
+        warnings.warn("Unable to load upfirdn2d CUDA extension; using PyTorch fallback: %s" % error)
+        upfirdn2d_op = None
+    return upfirdn2d_op
 
 
 class UpFirDn2dBackward(Function):
@@ -28,7 +47,10 @@ class UpFirDn2dBackward(Function):
 
         grad_output = grad_output.reshape(-1, out_size[0], out_size[1], 1)
 
-        grad_input = upfirdn2d_op.upfirdn2d(
+        extension = _get_upfirdn_extension()
+        if extension is None:
+            raise RuntimeError("CUDA upfirdn2d backward was selected without an available extension.")
+        grad_input = extension.upfirdn2d(
             grad_output,
             grad_kernel,
             down_x,
@@ -65,7 +87,10 @@ class UpFirDn2dBackward(Function):
 
         gradgrad_input = gradgrad_input.reshape(-1, ctx.in_size[2], ctx.in_size[3], 1)
 
-        gradgrad_out = upfirdn2d_op.upfirdn2d(
+        extension = _get_upfirdn_extension()
+        if extension is None:
+            raise RuntimeError("CUDA upfirdn2d double-backward was selected without an available extension.")
+        gradgrad_out = extension.upfirdn2d(
             gradgrad_input,
             kernel,
             ctx.up_x,
@@ -115,7 +140,10 @@ class UpFirDn2d(Function):
 
         ctx.g_pad = (g_pad_x0, g_pad_x1, g_pad_y0, g_pad_y1)
 
-        out = upfirdn2d_op.upfirdn2d(
+        extension = _get_upfirdn_extension()
+        if extension is None:
+            raise RuntimeError("CUDA upfirdn2d forward was selected without an available extension.")
+        out = extension.upfirdn2d(
             input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, pad_y0, pad_y1
         )
         # out = out.view(major, out_h, out_w, minor)
@@ -143,7 +171,8 @@ class UpFirDn2d(Function):
 
 
 def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
-    if input.device.type == "cpu":
+    extension = None if input.device.type == "cpu" else _get_upfirdn_extension()
+    if input.device.type == "cpu" or extension is None:
         out = upfirdn2d_native(
             input, kernel, up, up, down, down, pad[0], pad[1], pad[0], pad[1]
         )

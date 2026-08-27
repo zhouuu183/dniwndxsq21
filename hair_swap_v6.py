@@ -10,9 +10,10 @@ import torchvision.transforms.functional as F
 from PIL import Image
 from torchvision.io import ImageReadMode, read_image
 
-from models.Alignment_v8 import Alignment_v8
-from models.Blending_v5 import BlendingV5
-from models.Embedding_v5 import EmbeddingV5
+from models.Alignment import Alignment
+from models.Alignment_v6 import AlignmentV6
+from models.Blending_v6 import BlendingV6
+from models.Embedding import Embedding
 from models.Net import Net
 from utils.image_utils import equal_replacer
 from utils.seed import seed_setter
@@ -35,18 +36,25 @@ def str2bool(value):
     raise argparse.ArgumentTypeError(f"Unsupported boolean value: {value}")
 
 
-class HairFastV5:
+class HairFastV6:
     def __init__(self, args):
         self.args = args
         if getattr(self.args, "use_satd_v8", False) and not getattr(self.args, "satd_checkpoint_v8", ""):
-            print("[HairFastV5] use_satd_v8=True but satd_checkpoint_v8 is empty; disabling SATD_v8 cleanup.")
+            print("[HairFastV6] use_satd_v8=True but satd_checkpoint_v8 is empty; disabling SATD cleanup.")
             self.args.use_satd_v8 = False
         self.net = Net(self.args)
-        self.embed = EmbeddingV5(args, net=self.net)
-        # v5 now uses the v8 shadow-cleaned alignment path before the
-        # ear-aware post-process stage.
-        self.align = Alignment_v8(args, self.embed.get_e4e_embed, net=self.net)
-        self.blend = BlendingV5(args, net=self.net)
+        # The base transfer must be the actual no-suffix author object.  The
+        # V6 alignment object shares it only to construct an isolated SATD
+        # candidate after the author result is fixed.
+        self.embed = Embedding(args, net=self.net)
+        self.align = Alignment(args, self.embed.get_e4e_embed, net=self.net)
+        self.satd_align = AlignmentV6(
+            args,
+            self.embed.get_e4e_embed,
+            net=self.net,
+            base_alignment=self.align,
+        )
+        self.blend = BlendingV6(args, net=self.net)
 
     @seed_setter
     @bench_session
@@ -55,18 +63,41 @@ class HairFastV5:
         for name, image in (("face", face), ("shape", shape), ("color", color)):
             if image.dim() == 4 and image.shape[0] != 1:
                 raise ValueError(
-                    f"HairFastV5 currently supports one sample per call; {name} has batch {image.shape[0]}."
+                    f"HairFastV6 currently supports one sample per call; {name} has batch {image.shape[0]}."
                 )
         images_to_name = defaultdict(list)
         for image, name in zip((face, shape, color), ("face", "shape", "color")):
             images_to_name[image].append(name)
 
         name_to_embed = self.embed.embedding_images(images_to_name, **kwargs)
+        # These are calls to the original no-suffix methods, not V6 copies.
         align_shape = self.align.align_images("face", "shape", name_to_embed, **kwargs)
-        # The deterministic colour stage reads the colour image and its parsing
-        # directly.  A second face->colour shape alignment was unused and also
-        # overwrote the real shape HM_X debug files.
-        return self.blend.blend_images(align_shape, align_shape, name_to_embed, **kwargs)
+        if shape is not color:
+            align_color = self.align.shape_module(
+                "face", "color", name_to_embed, only_target=True, **kwargs
+            )
+        else:
+            align_color = align_shape
+        # Defer SATD until the author transfer and PP decode are complete.
+        # SATD itself performs generator calls; doing so earlier shifts the
+        # StyleGAN noise stream used by the author I_blend and changes the PP
+        # target despite no SATD tensor being explicitly injected into it.
+        def build_satd_alignment():
+            return self.satd_align.build_satd_background_candidate(
+                "face",
+                "shape",
+                name_to_embed,
+                align_shape,
+                **kwargs,
+            )
+
+        return self.blend.blend_images(
+            align_shape,
+            align_color,
+            name_to_embed,
+            satd_alignment_factory=build_satd_alignment,
+            **kwargs,
+        )
 
     def swap(self, face_img: TImage | TPath, shape_img: TImage | TPath, color_img: TImage | TPath,
              benchmark=False, align=False, seed=None, exp_name=None, **kwargs) -> TReturn:
@@ -98,7 +129,7 @@ class HairFastV5:
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description="HairFast V5")
+    parser = argparse.ArgumentParser(description="HairFast V6")
     parser.add_argument("--save_all_dir", type=Path, default=Path("output"))
     parser.add_argument("--size", type=int, default=1024)
     parser.add_argument("--ckpt", type=str, default="pretrained_models/StyleGAN/ffhq.pt")
@@ -122,11 +153,58 @@ def get_parser():
         ),
     )
     parser.add_argument("--pp_checkpoint", type=str, default="pretrained_models/PostProcess/pp_model.pth")
-    parser.add_argument("--pp_v5_checkpoint", type=str, default="pretrained_models/PostProcess/pp_model.pth")
+    parser.add_argument("--pp_v6_checkpoint", type=str, default="pretrained_models/PostProcess/pp_model.pth")
     parser.add_argument("--use_satd_v8", type=str2bool, default=False)
     parser.add_argument("--satd_checkpoint_v8", type=str, default="")
-    parser.add_argument("--satd_blend_v8", type=float, default=0.28)
+    # V6 applies SATD to the blended F feature before decoding, then feeds the
+    # resulting I_satd_blend_256 directly into PP.
+    parser.add_argument("--satd_blend_v8", type=float, default=0.75)
+    parser.add_argument(
+        "--direct_satd_pp_input",
+        type=str2bool,
+        default=True,
+        help="Use I_satd_blend_256 as the PP input and skip a second SATD pass.",
+    )
     parser.add_argument("--satd_boundary_v8", type=int, default=8)
+    parser.add_argument(
+        "--satd_background_exclude_dilate",
+        type=int,
+        default=1,
+        help="Background safety ring around the parsed subject for post-decode SATD residuals.",
+    )
+    parser.add_argument(
+        "--satd_background_earring_exclude_dilate",
+        type=int,
+        default=6,
+        help="Earring safety ring for post-decode SATD residuals.",
+    )
+    parser.add_argument(
+        "--satd_background_target_hair_protect_dilate",
+        type=int,
+        default=5,
+        help="Dilated author target-hair support protected before SATD removes ghost hair residue.",
+    )
+    parser.add_argument(
+        "--satd_background_cleanup_dilate",
+        type=int,
+        default=110,
+        help="Maximum expansion of M_remove support into parsed background.",
+    )
+    parser.add_argument(
+        "--satd_background_hair_edge_dilate",
+        type=int,
+        default=16,
+        help="Background-side support width around retained target hair.",
+    )
+    parser.add_argument(
+        "--satd_background_hair_edge_support_dilate",
+        type=int,
+        default=72,
+        help="How far M_remove support may authorize hair-edge background cleanup.",
+    )
+    parser.add_argument("--satd_background_hair_edge_strength", type=float, default=1.0)
+    parser.add_argument("--satd_background_residual_strength", type=float, default=1.25)
+    parser.add_argument("--satd_background_alpha_feather", type=int, default=7)
     parser.add_argument("--eq8_reference_blend_v8", type=float, default=0.0)
     parser.add_argument("--target_hair_close_kernel", type=int, default=9)
     parser.add_argument("--target_hair_hole_max_area", type=float, default=None)
@@ -162,8 +240,8 @@ def get_parser():
                              "the root fix is satd_hair_exclude_strength (keep SATD off hair). "
                              "Default 0 = off. Turn on only if residual hue drift remains "
                              "after the SATD-hair-exclude fix.")
-    parser.add_argument("--pp_v5_use_mod", type=str2bool, default=True)
-    parser.add_argument("--pp_v5_use_full", type=str2bool, default=True)
+    parser.add_argument("--pp_v6_use_mod", type=str2bool, default=True)
+    parser.add_argument("--pp_v6_use_full", type=str2bool, default=True)
     parser.add_argument("--ear_parse_size", type=int, default=512)
     parser.add_argument("--ear_feature_channels", type=int, default=128)
     parser.add_argument("--ear_low_alpha", type=float, default=0.1)
@@ -202,10 +280,10 @@ def get_parser():
     parser.add_argument("--earring_write_connectivity_kernel", type=int, default=5)
     parser.add_argument("--earring_write_bridge_dilate", type=int, default=17)
     parser.add_argument("--earring_anchor_visible_dilate", type=int, default=3)
-    # Face inputs are already aligned into one canonical frame before V5 runs.
-    # Use the same bounded attachment-point alignment as V5 dataset generation;
-    # it permits lobe differences without scaling or duplicating the object.
-    parser.add_argument("--earring_align_max_shift", type=int, default=24)
+    # Align only the source earring attachment to the final exposed target
+    # lobe.  The bounded shift handles a PP-reconstructed ear without letting
+    # an uncertain fragment jump to the opposite side of the face.
+    parser.add_argument("--earring_align_max_shift", type=int, default=32)
     parser.add_argument("--ear_fine_support_dilate", type=int, default=3)
     parser.add_argument("--earring_fine_mask_floor", type=float, default=0.18)
     parser.add_argument("--earring_fine_mask_dilate", type=int, default=5)
@@ -224,6 +302,12 @@ def get_parser():
     parser.add_argument("--output_target_hair_preserve_dilate", type=int, default=5)
     parser.add_argument("--output_face_hair_seam_preserve_dilate", type=int, default=7)
     parser.add_argument("--output_earring_keep_dilate", type=int, default=0)
+    parser.add_argument(
+        "--target_ear_accessory_clear_dilate",
+        type=int,
+        default=28,
+        help="Clear PP accessory hallucinations around an exposed target lobe before native write-back.",
+    )
     parser.add_argument("--output_preserve_blur", type=int, default=1)
     parser.add_argument("--output_hairline_feather", type=int, default=0)
     parser.add_argument("--hair_color_reference_strength_v8", type=float, default=0.9)
@@ -251,4 +335,4 @@ def get_parser():
 
 if __name__ == "__main__":
     args = get_parser().parse_args()
-    hair_fast = HairFastV5(args)
+    hair_fast = HairFastV6(args)

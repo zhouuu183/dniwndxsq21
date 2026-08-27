@@ -1,4 +1,6 @@
 import os
+import shutil
+import warnings
 
 import torch
 from torch import nn
@@ -7,13 +9,30 @@ from torch.autograd import Function
 from torch.utils.cpp_extension import load
 
 module_path = os.path.dirname(__file__)
-fused = load(
-    "fused",
-    sources=[
-        os.path.join(module_path, "fused_bias_act.cpp"),
-        os.path.join(module_path, "fused_bias_act_kernel.cu"),
-    ],
-)
+fused = None
+_fused_load_attempted = False
+
+
+def _get_fused_extension():
+    global fused, _fused_load_attempted
+    if _fused_load_attempted:
+        return fused
+    _fused_load_attempted = True
+    if os.name == "nt" and shutil.which("cl") is None:
+        warnings.warn("MSVC cl.exe is unavailable; using the PyTorch fused-leaky-ReLU fallback.")
+        return None
+    try:
+        fused = load(
+            "fused",
+            sources=[
+                os.path.join(module_path, "fused_bias_act.cpp"),
+                os.path.join(module_path, "fused_bias_act_kernel.cu"),
+            ],
+        )
+    except (OSError, RuntimeError) as error:
+        warnings.warn("Unable to load fused_bias_act CUDA extension; using PyTorch fallback: %s" % error)
+        fused = None
+    return fused
 
 
 class FusedLeakyReLUFunctionBackward(Function):
@@ -25,7 +44,10 @@ class FusedLeakyReLUFunctionBackward(Function):
 
         empty = grad_output.new_empty(0)
 
-        grad_input = fused.fused_bias_act(
+        extension = _get_fused_extension()
+        if extension is None:
+            raise RuntimeError("Fused CUDA backward was selected without an available extension.")
+        grad_input = extension.fused_bias_act(
             grad_output, empty, out, 3, 1, negative_slope, scale
         )
 
@@ -41,7 +63,10 @@ class FusedLeakyReLUFunctionBackward(Function):
     @staticmethod
     def backward(ctx, gradgrad_input, gradgrad_bias):
         (out,) = ctx.saved_tensors
-        gradgrad_out = fused.fused_bias_act(
+        extension = _get_fused_extension()
+        if extension is None:
+            raise RuntimeError("Fused CUDA double-backward was selected without an available extension.")
+        gradgrad_out = extension.fused_bias_act(
             gradgrad_input, gradgrad_bias, out, 3, 1, ctx.negative_slope, ctx.scale
         )
 
@@ -52,7 +77,10 @@ class FusedLeakyReLUFunction(Function):
     @staticmethod
     def forward(ctx, input, bias, negative_slope, scale):
         empty = input.new_empty(0)
-        out = fused.fused_bias_act(input, bias, empty, 3, 0, negative_slope, scale)
+        extension = _get_fused_extension()
+        if extension is None:
+            raise RuntimeError("Fused CUDA forward was selected without an available extension.")
+        out = extension.fused_bias_act(input, bias, empty, 3, 0, negative_slope, scale)
         ctx.save_for_backward(out)
         ctx.negative_slope = negative_slope
         ctx.scale = scale
@@ -83,11 +111,12 @@ class FusedLeakyReLU(nn.Module):
 
 
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
-    if input.device.type == "cpu":
+    extension = None if input.device.type == "cpu" else _get_fused_extension()
+    if input.device.type == "cpu" or extension is None:
         rest_dim = [1] * (input.ndim - bias.ndim - 1)
         return (
             F.leaky_relu(
-                input + bias.view(1, bias.shape[0], *rest_dim), negative_slope=0.2
+                input + bias.view(1, bias.shape[0], *rest_dim), negative_slope=negative_slope
             )
             * scale
         )

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -39,9 +40,12 @@ CLEANUP_MASK_KEYS = (
     "M_remove_neck",
     "M_remove_context",
 )
-# Must match ``scripts/pp_gen_v6.py``. Schema 32 stores the SATD-free author
-# pre-PP target only; every training/validation pass decodes its own PP S/F.
-PP_DATASET_SCHEMA_VERSION = 32
+# Must match ``scripts/pp_gen_v6.py``. Schema 34 stores the SATD-rendered
+# image as the direct PP target; every training/validation pass decodes its
+# own PP S/F and never applies a second SATD residual.
+# Schema 34 stores ``source_earring_object_mask`` in SOURCE_NATIVE
+# coordinates; schema-32 serialized the target-aligned mask under that name.
+PP_DATASET_SCHEMA_VERSION = 34
 PP_EXTRA_MASK_KEYS = (
     "cleanup_inner_edge",
     "revealed_skin_mask",
@@ -85,6 +89,7 @@ PP_DATASET_REQUIRED_ITEM_KEYS = (
     "left_ear_roi",
     "right_ear_roi",
     "presence_target",
+    "direct_satd_pp_input",
 )
 ONLINE_EARRING_AUX_KEYS = {
     "earring_confident_mask",
@@ -104,28 +109,35 @@ VAL_COLUMNS = (
 # ========================= User Config: edit here only =========================
 USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
-USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v6_author_noise_isolated_satd_background_100_r10")
-USER_OUTPUT_DIR_SMALL = Path("output/pp_v6_checkpoints_author_noise_isolated_satd_background_100_r10")
-USER_RUN_NAME_SMALL = "pp_v6_author_noise_isolated_satd_background_100_r10"
+USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v6_direct_satd_100_r17")
+USER_OUTPUT_DIR_SMALL = Path("output/pp_v6_checkpoints_direct_satd_100_r17")
+USER_RUN_NAME_SMALL = "pp_v6_direct_satd_100_r17"
 
-USER_DATASET_DIR_FULL = Path("images/pp_dataset_v6_author_noise_isolated_satd_background_full_r10")
-USER_OUTPUT_DIR_FULL = Path("output/pp_v6_checkpoints_author_noise_isolated_satd_background_full_r10")
-USER_RUN_NAME_FULL = "pp_v6_author_noise_isolated_satd_background_full_r10"
+USER_DATASET_DIR_FULL = Path("images/pp_dataset_v6_direct_satd_full_r17")
+USER_OUTPUT_DIR_FULL = Path("output/pp_v6_checkpoints_direct_satd_full_r17")
+USER_RUN_NAME_FULL = "pp_v6_direct_satd_full_r17"
 
 USER_FID_DATASET = "fid_images"
 USER_USE_FID = False
 USER_USE_WANDB = False
 USER_RESUME_CHECKPOINT = None
 USER_BASE_CHECKPOINT = "pretrained_models/PostProcess/pp_model.pth"
+USER_DIRECT_SATD_PP_INPUT = True
 
 USER_BATCH_SIZE = 4
 USER_NUM_WORKERS = 0
 USER_EPOCHS = 120
 # Reserve 50 of the 100 generated samples for validation.  Every validation
 # item is written once, without supplementing preview output from training.
-USER_VAL_SIZE = 30
-USER_VAL_PREVIEW_COUNT = 30
+USER_VAL_SIZE = 50
+USER_VAL_PREVIEW_COUNT = 50
 USER_VAL_SUPPLEMENT_TRAIN_PREVIEWS = False
+# Validation is a full 1024px observation pass, not a gradient update. Keep
+# epoch 0 and the final epoch, but avoid spending the same time every epoch.
+USER_VALIDATE_EVERY_N_EPOCHS = 5
+# Clearing the CUDA allocator after every validation batch forces a costly
+# synchronization. A single clear after validation does not change outputs.
+USER_EMPTY_CACHE_EACH_VALIDATION_BATCH = False
 USER_GRAD_ACCUM_STEPS = 2
 
 USER_TRAINING_STAGE = "joint_highres"  # "ear_only", "joint_highres", or "full"
@@ -155,11 +167,11 @@ USER_EARRING_COMPONENT_MAX_CUMULATIVE_COST = 1.85
 # SATD may remove parser-misclassified source-hair residue only outside this
 # dilated author target-hair geometry.  It never permits edits to actual hair.
 USER_SATD_BACKGROUND_TARGET_HAIR_PROTECT_DILATE = 5
-USER_SATD_BACKGROUND_CLEANUP_DILATE = 72
-USER_SATD_BACKGROUND_HAIR_EDGE_DILATE = 10
-USER_SATD_BACKGROUND_HAIR_EDGE_SUPPORT_DILATE = 40
+USER_SATD_BACKGROUND_CLEANUP_DILATE = 110
+USER_SATD_BACKGROUND_HAIR_EDGE_DILATE = 16
+USER_SATD_BACKGROUND_HAIR_EDGE_SUPPORT_DILATE = 72
 USER_SATD_BACKGROUND_HAIR_EDGE_STRENGTH = 1.0
-USER_SATD_BACKGROUND_RESIDUAL_STRENGTH = 1.0
+USER_SATD_BACKGROUND_RESIDUAL_STRENGTH = 1.25
 USER_SATD_BACKGROUND_ALPHA_FEATHER = 7
 
 USER_ITER_BEFORE_ADV = 10_000
@@ -209,9 +221,9 @@ USER_EARRING_WRITE_CONNECTIVITY_ITERS = 32
 USER_EARRING_WRITE_CONNECTIVITY_KERNEL = 5
 USER_EARRING_WRITE_BRIDGE_DILATE = 17
 USER_EARRING_ANCHOR_VISIBLE_DILATE = 3
-# Training data uses the same fixed source-face coordinate system as inference.
-# A non-zero parser-centroid shift teaches duplicate/offset accessories.
-USER_EARRING_ALIGN_MAX_SHIFT = 0
+# The source object attaches to the final exposed target lobe.  The bound is
+# deliberately finite so an uncertain source fragment cannot cross the face.
+USER_EARRING_ALIGN_MAX_SHIFT = 32
 USER_EAR_FINE_SUPPORT_DILATE = 3
 USER_EARRING_FINE_MASK_FLOOR = 0.18
 USER_EARRING_FINE_MASK_DILATE = 5
@@ -447,6 +459,8 @@ RESOLVED_USER_CONFIG = {
     "test_size": USER_VAL_SIZE,
     "val_preview_count": USER_VAL_PREVIEW_COUNT,
     "val_supplement_train_previews": USER_VAL_SUPPLEMENT_TRAIN_PREVIEWS,
+    "validate_every_n_epochs": USER_VALIDATE_EVERY_N_EPOCHS,
+    "empty_cache_each_validation_batch": USER_EMPTY_CACHE_EACH_VALIDATION_BATCH,
     "compute_fid": USER_USE_FID,
     "use_wandb": USER_USE_WANDB,
     "checkpoint_dir": ACTIVE_OUTPUT_DIR,
@@ -456,6 +470,7 @@ RESOLVED_USER_CONFIG = {
     "use_adv": USER_USE_ADV,
     "adv_coef": USER_ADV_COEF,
     "base_checkpoint": USER_BASE_CHECKPOINT,
+    "direct_satd_pp_input": USER_DIRECT_SATD_PP_INPUT,
     "resume_checkpoint": USER_RESUME_CHECKPOINT,
     "use_mod": USER_USE_MOD,
     "use_full": USER_USE_FULL,
@@ -704,6 +719,16 @@ def build_parser(defaults):
         type=str2bool,
         default=defaults["val_supplement_train_previews"],
     )
+    parser.add_argument(
+        "--validate_every_n_epochs",
+        type=int,
+        default=defaults["validate_every_n_epochs"],
+    )
+    parser.add_argument(
+        "--empty_cache_each_validation_batch",
+        type=str2bool,
+        default=defaults["empty_cache_each_validation_batch"],
+    )
     parser.add_argument("--compute_fid", type=str2bool, default=defaults["compute_fid"])
     parser.add_argument("--use_wandb", type=str2bool, default=defaults["use_wandb"])
     parser.add_argument("--checkpoint_dir", type=Path, default=defaults["checkpoint_dir"])
@@ -713,6 +738,12 @@ def build_parser(defaults):
     parser.add_argument("--use_adv", type=str2bool, default=defaults["use_adv"])
     parser.add_argument("--adv_coef", type=float, default=defaults["adv_coef"])
     parser.add_argument("--base_checkpoint", type=str, default=defaults["base_checkpoint"])
+    parser.add_argument(
+        "--direct_satd_pp_input",
+        type=str2bool,
+        default=defaults["direct_satd_pp_input"],
+        help="Treat the dataset target as I_satd_blend_256 and skip decoded-image SATD residuals.",
+    )
     parser.add_argument("--resume_checkpoint", type=str2path, default=defaults["resume_checkpoint"])
     parser.add_argument("--use_mod", type=str2bool, default=defaults["use_mod"])
     parser.add_argument("--use_full", type=str2bool, default=defaults["use_full"])
@@ -1299,12 +1330,32 @@ class TrainerV5:
         )
         source_full = batch["source"]
         source = self.downsample_256(source_full).clip(0, 1)
-        # This is the only image PP encodes: the SATD-free author-style
-        # shape/colour transfer. SATD is passed separately for a background
-        # residual after the PP decode and cannot alter face/hair features.
+        # This is the only image PP encodes.  In the V6 direct-SATD contract it
+        # is I_satd_blend_256, so SATD is already part of the PP input and must
+        # not be passed again as a decoded-image residual candidate.
         target = batch["target"]
         completed_hair_highres = batch["completed_hair_highres"].clamp(0, 1)
         satd_background_highres = batch["satd_background_highres"].clamp(0, 1)
+        direct_satd_pp_input = batch.get("direct_satd_pp_input")
+        if not torch.is_tensor(direct_satd_pp_input):
+            direct_satd_pp_input = torch.full(
+                (source.size(0), 1, 1, 1),
+                float(getattr(self.args, "direct_satd_pp_input", False)),
+                device=source.device,
+                dtype=source.dtype,
+            )
+        else:
+            direct_satd_pp_input = direct_satd_pp_input.to(
+                device=source.device, dtype=source.dtype
+            )
+            if direct_satd_pp_input.ndim == 1:
+                direct_satd_pp_input = direct_satd_pp_input.view(-1, 1, 1, 1)
+            elif direct_satd_pp_input.ndim == 0:
+                direct_satd_pp_input = direct_satd_pp_input.view(1, 1, 1, 1).expand(
+                    source.size(0), 1, 1, 1
+                )
+            direct_satd_pp_input = direct_satd_pp_input[:, :1]
+        direct_batch = bool((direct_satd_pp_input > 0.5).all().item())
         target_mask = batch["target_mask"]
         HT_E = batch["HT_E"]
         use_dataset_earring_aux = bool(getattr(self.args, "use_dataset_earring_aux", False))
@@ -1355,7 +1406,10 @@ class TrainerV5:
             source_face_reference=source_full,
             authoritative_hair_highres=self.normalize(completed_hair_highres),
             authoritative_target_highres=self.normalize(completed_hair_highres),
-            satd_background_highres=self.normalize(satd_background_highres),
+            satd_background_highres=(
+                None if direct_batch else self.normalize(satd_background_highres)
+            ),
+            direct_satd_pp_input=direct_satd_pp_input,
             query_mask=batch["query_mask"],
             source_ear_mask=source_ear_mask,
             source_earring_object_mask=source_earring_object_mask,
@@ -1646,7 +1700,7 @@ class TrainerV5:
 
             del source, target, target_mask, HT_E, gen_im_W, F_w, gen_im_F, latent_f, aux
             del gen_w_256, gen_f_256
-            if self.device == "cuda":
+            if self.device == "cuda" and bool(getattr(self.args, "empty_cache_each_validation_batch", False)):
                 torch.cuda.empty_cache()
 
         # Validation metrics above are computed exclusively from test_dataloader.
@@ -1683,7 +1737,7 @@ class TrainerV5:
 
                 del source, target, target_mask, HT_E, gen_im_W, F_w, gen_im_F, latent_f, aux
                 del gen_w_256, gen_f_256
-                if self.device == "cuda":
+                if self.device == "cuda" and bool(getattr(self.args, "empty_cache_each_validation_batch", False)):
                     torch.cuda.empty_cache()
                 if len(train_preview_items) >= missing_preview_count:
                     break
@@ -1745,18 +1799,27 @@ class TrainerV5:
                 highres_files=highres_preview_files,
             )
 
+        if self.device == "cuda" and not bool(getattr(self.args, "empty_cache_each_validation_batch", False)):
+            torch.cuda.empty_cache()
         return val_losses["loss"]
 
     def train_loop(self):
         self.validate("epoch_0000_initial")
+        validate_every = max(1, int(getattr(self.args, "validate_every_n_epochs", 1)))
         for epoch in range(self.args.epochs):
             self.current_epoch = epoch
             self.train_one_epoch()
-            loss = self.validate(f"epoch_{epoch + 1:04d}")
             self.save_model("last")
-            if loss <= self.best_loss:
-                self.best_loss = loss
-                self.save_model(f"best_{epoch}")
+            completed_epochs = epoch + 1
+            should_validate = (
+                completed_epochs % validate_every == 0
+                or completed_epochs == int(self.args.epochs)
+            )
+            if should_validate:
+                loss = self.validate(f"epoch_{completed_epochs:04d}")
+                if loss <= self.best_loss:
+                    self.best_loss = loss
+                    self.save_model(f"best_{epoch}")
 
 
 class DatasetPartIndexV5:
@@ -1901,7 +1964,7 @@ class PPDatasetV5(Dataset):
         if not torch.is_tensor(completed_hair_highres):
             raise RuntimeError(
                 "V6 dataset item is missing completed_hair_highres. "
-                "Regenerate the complete schema-32 V6 dataset before training."
+                "Regenerate the complete schema-34 V6 dataset before training."
             )
         if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
             raise RuntimeError(
@@ -1916,7 +1979,7 @@ class PPDatasetV5(Dataset):
         if not torch.is_tensor(satd_background_highres):
             raise RuntimeError(
                 "V6 dataset item is missing satd_background_highres. "
-                "Regenerate the complete schema-32 V6 dataset before training."
+                "Regenerate the complete schema-34 V6 dataset before training."
             )
         if satd_background_highres.ndim != 3 or satd_background_highres.size(0) != 3:
             raise RuntimeError(
@@ -1927,11 +1990,24 @@ class PPDatasetV5(Dataset):
             satd_background_highres = satd_background_highres.float().div(255)
         else:
             satd_background_highres = satd_background_highres.float().clamp(0, 1)
+        if "direct_satd_pp_input" not in item:
+            raise RuntimeError(
+                "V6 dataset item is missing direct_satd_pp_input. "
+                "Regenerate the schema-34 direct-SATD dataset before training."
+            )
+        direct_satd_pp_input = item["direct_satd_pp_input"]
+        if torch.is_tensor(direct_satd_pp_input):
+            direct_satd_pp_input = bool(direct_satd_pp_input.item())
+        else:
+            direct_satd_pp_input = bool(direct_satd_pp_input)
         sample = {
             "source": self.load_image(item["source_path"]),
             "target": item["target"].clone(),
             "completed_hair_highres": completed_hair_highres,
             "satd_background_highres": satd_background_highres,
+            "direct_satd_pp_input": torch.tensor(
+                direct_satd_pp_input, dtype=torch.bool
+            ),
             "target_mask": item["target_mask"].clone(),
             "HT_E": item["HT_E"].clone(),
             "source_parsing": item["source_parsing"].clone(),
@@ -2146,6 +2222,39 @@ def item_mask_area(item, key: str) -> float | None:
     return float(value.float().sum().item())
 
 
+def _mask_to_nchw(value: torch.Tensor) -> torch.Tensor:
+    """Normalize a saved mask to [N, C, H, W] for spatial comparisons."""
+    value = value.float()
+    if value.ndim == 2:
+        return value.unsqueeze(0).unsqueeze(0)
+    if value.ndim == 3:
+        # Dataset masks are [N,H,W] (usually N=1), not RGB tensors.
+        return value.unsqueeze(1)
+    if value.ndim == 4:
+        return value
+    raise ValueError(f"Unsupported mask rank: {tuple(value.shape)}")
+
+
+def _resize_mask_like(value: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Resize a binary/soft mask to the reference mask's H/W using nearest mode."""
+    value_nchw = _mask_to_nchw(value)
+    reference_nchw = _mask_to_nchw(reference)
+    target_hw = reference_nchw.shape[-2:]
+    if value_nchw.shape[-2:] != target_hw:
+        value_nchw = F.interpolate(value_nchw, size=target_hw, mode="nearest")
+    # Most saved items have one batch/channel. Expand singleton dimensions so
+    # masks from different branches can still be compared safely.
+    for dim in (0, 1):
+        if value_nchw.shape[dim] == 1 and reference_nchw.shape[dim] != 1:
+            value_nchw = value_nchw.expand(
+                reference_nchw.shape[0] if dim == 0 else value_nchw.shape[0],
+                reference_nchw.shape[1] if dim == 1 else value_nchw.shape[1],
+                value_nchw.shape[2],
+                value_nchw.shape[3],
+            )
+    return value_nchw
+
+
 def item_visible_earring_area(item) -> float:
     visible = item.get(
         "earring_valid_roi",
@@ -2153,7 +2262,6 @@ def item_visible_earring_area(item) -> float:
     )
     if not torch.is_tensor(visible):
         return 0.0
-    visible = visible.float()
     area = 0.0
     for key in (
         "source_earring_object_mask",
@@ -2163,7 +2271,17 @@ def item_visible_earring_area(item) -> float:
     ):
         value = item.get(key)
         if torch.is_tensor(value):
-            area = max(area, float((value.float() * visible).sum().item()))
+            visible_like = _resize_mask_like(visible, value)
+            value_like = _mask_to_nchw(value)
+            if value_like.shape[0] == 1 and visible_like.shape[0] != 1:
+                value_like = value_like.expand_as(visible_like)
+            if visible_like.shape[0] == 1 and value_like.shape[0] != 1:
+                visible_like = visible_like.expand_as(value_like)
+            if value_like.shape[1] == 1 and visible_like.shape[1] != 1:
+                value_like = value_like.expand_as(visible_like)
+            if visible_like.shape[1] == 1 and value_like.shape[1] != 1:
+                visible_like = visible_like.expand_as(value_like)
+            area = max(area, float((value_like * visible_like).sum().item()))
     return area
 
 

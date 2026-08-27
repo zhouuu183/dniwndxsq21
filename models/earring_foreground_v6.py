@@ -1,4 +1,4 @@
-"""Source-native earring instances for the V5 final compositor.
+"""Source-native earring instances for the V6 final compositor.
 
 The module has one coordinate rule: source-native evidence may create a source
 instance once; only that instance may be aligned into target coordinates.
@@ -37,7 +37,7 @@ class EarringCoordinateSpace(str, Enum):
 
 
 @dataclass(frozen=True)
-class EarringNativeInstanceV5:
+class EarringNativeInstanceV6:
     alpha: torch.Tensor
     rgb: torch.Tensor
     hole_alpha: torch.Tensor
@@ -265,7 +265,201 @@ def _component_angle(points: np.ndarray) -> float:
     return float(math.atan2(float(vector[0]), float(vector[1])))
 
 
-def extract_source_native_earring_v5(
+def retain_single_earring_group_v6(
+    mask: torch.Tensor,
+    lobe_anchor: torch.Tensor,
+    *,
+    max_gap: int = 48,
+    max_downward_extent: int | None = None,
+) -> torch.Tensor:
+    """Keep one lobe-connected source accessory group per side.
+
+    A native candidate can contain several disconnected visual components.
+    Keep the component attached to the lobe and only nearby, vertically
+    aligned continuation pieces. This preserves segmented long pendants while
+    rejecting a second same-side accessory or a detached background strand.
+    """
+    if cv2 is None:
+        return mask
+    value = _mask(mask, tuple(mask.shape[-2:]), mask).detach()
+    anchor = _mask(lobe_anchor, tuple(value.shape[-2:]), value).detach()
+    output = torch.zeros_like(value)
+    arrays = value[:, 0].cpu().numpy()
+    anchors = anchor[:, 0].cpu().numpy()
+    for batch_index, array in enumerate(arrays):
+        binary = array > 0.01
+        count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            binary.astype(np.uint8), 8
+        )
+        if count <= 2:
+            output[batch_index, 0] = torch.from_numpy(array).to(output.device, output.dtype)
+            continue
+        anchor_binary = anchors[batch_index] > 0.01
+        anchor_points = np.argwhere(anchor_binary)
+        candidates: list[tuple[float, float, float, int]] = []
+        for component_id in range(1, count):
+            component = labels == component_id
+            area = float(stats[component_id, cv2.CC_STAT_AREA])
+            anchor_overlap = float((component & anchor_binary).sum())
+            if anchor_points.size:
+                points = np.argwhere(component)
+                distance = float(
+                    np.min(
+                        np.linalg.norm(
+                            points[:, None, :].astype(np.float32)
+                            - anchor_points[None, :, :].astype(np.float32),
+                            axis=2,
+                        )
+                    )
+                )
+            else:
+                distance = float("inf")
+            candidates.append((anchor_overlap, distance, area, component_id))
+
+        # Select the component from its attachment, not its area.  The old
+        # score let a large detached label-9/background fragment outweigh the
+        # small component nearest the lobe, then its nearby fragments were
+        # treated as one earring.  That is the direct source of duplicate
+        # earrings and copied source backdrop.  A true dangling earring need
+        # only have one root close to the lobe; the continuation is admitted
+        # separately below.
+        touching = [value for value in candidates if value[0] > 0.0]
+        if touching:
+            root_id = max(touching, key=lambda value: (value[0], -value[1], value[2]))[3]
+        else:
+            nearest = min(candidates, key=lambda value: (value[1], -value[2]))
+            # Do not turn a remote parser fragment into an accessory merely
+            # because this side has no better candidate.
+            if nearest[1] > float(max_gap) * 1.75:
+                continue
+            root_id = nearest[3]
+        root = labels == root_id
+        root_x = float(centroids[root_id][0])
+        root_y = float(centroids[root_id][1])
+        root_x0 = float(stats[root_id, cv2.CC_STAT_LEFT])
+        root_x1 = root_x0 + float(stats[root_id, cv2.CC_STAT_WIDTH])
+        root_y0 = float(stats[root_id, cv2.CC_STAT_TOP])
+        root_y1 = root_y0 + float(stats[root_id, cv2.CC_STAT_HEIGHT])
+        keep = root.copy()
+        keep_x0, keep_x1 = root_x0, root_x1
+        keep_y0, keep_y1 = root_y0, root_y1
+        anchor_bottom = (
+            float(anchor_points[:, 0].max()) if anchor_points.size else root_y1
+        )
+        # Grow a long pendant from the already accepted root.  Comparing every
+        # candidate only with the root centroid rejects a legitimate lower
+        # segment once the first segment has extended downward.
+        for _, _, _, component_id in sorted(
+            (value for value in candidates if value[3] != root_id),
+            key=lambda value: float(stats[value[3], cv2.CC_STAT_TOP]),
+        ):
+            component = labels == component_id
+            x0 = float(stats[component_id, cv2.CC_STAT_LEFT])
+            x1 = x0 + float(stats[component_id, cv2.CC_STAT_WIDTH])
+            y0 = float(stats[component_id, cv2.CC_STAT_TOP])
+            y1 = y0 + float(stats[component_id, cv2.CC_STAT_HEIGHT])
+            gap_x = max(keep_x0 - x1, x0 - keep_x1, 0.0)
+            gap_y = max(y0 - keep_y1, keep_y0 - y1, 0.0)
+            component_x = float(centroids[component_id][0])
+            component_y = float(centroids[component_id][1])
+            # Long pendants extend downward from the lobe. A same-side second
+            # earring is normally lateral or starts alongside the accepted
+            # root, rather than below its lowest accepted segment.
+            if max(gap_x, gap_y) > float(max_gap):
+                continue
+            # A real pendant can curve or have a wide lower ornament.  Keep
+            # its reasonably local continuation here; duplicate prevention is
+            # a source-side ownership decision in
+            # ``enforce_exclusive_earring_sides_v6``, not an overly narrow
+            # contour crop that would throw away valid earring pixels.
+            if gap_x > float(max_gap) * 0.70:
+                continue
+            if component_y < keep_y1 - float(max_gap) * 0.25:
+                continue
+            if abs(component_x - root_x) > float(max_gap) * 1.50:
+                continue
+            if max_downward_extent is not None and y1 > anchor_bottom + float(max_downward_extent):
+                continue
+            keep |= component
+            keep_x0, keep_x1 = min(keep_x0, x0), max(keep_x1, x1)
+            keep_y0, keep_y1 = min(keep_y0, y0), max(keep_y1, y1)
+        output[batch_index, 0] = torch.from_numpy(array * keep.astype(np.float32)).to(
+            output.device, output.dtype
+        )
+    return output
+
+
+def enforce_exclusive_earring_sides_v6(
+    left_alpha: torch.Tensor,
+    right_alpha: torch.Tensor,
+    source_left_ear: torch.Tensor,
+    source_right_ear: torch.Tensor,
+    *,
+    proximity_radius: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ensure one physical source object is aligned to at most one target side."""
+    size = tuple(left_alpha.shape[-2:])
+    like = left_alpha
+    left = _mask(left_alpha, size, like)
+    right = _mask(right_alpha, size, like)
+    left_ear = _mask(source_left_ear, size, like)
+    right_ear = _mask(source_right_ear, size, like)
+    small_size = (min(256, size[0]), min(256, size[1]))
+    left_small = F.adaptive_max_pool2d((left > 0.01).to(like.dtype), small_size)
+    right_small = F.adaptive_max_pool2d((right > 0.01).to(like.dtype), small_size)
+    left_ear_small = F.adaptive_max_pool2d((left_ear > 0.01).to(like.dtype), small_size)
+    right_ear_small = F.adaptive_max_pool2d((right_ear > 0.01).to(like.dtype), small_size)
+    radius = max(6, int(round(40.0 * max(small_size) / 256.0)))
+    if proximity_radius is not None:
+        radius = max(1, int(round(float(proximity_radius) * max(small_size) / 256.0)))
+    near_right = F.max_pool2d(right_small, 2 * radius + 1, stride=1, padding=radius)
+    duplicate = (
+        (left_small.flatten(1).sum(dim=1, keepdim=True) > 0.5)
+        & (right_small.flatten(1).sum(dim=1, keepdim=True) > 0.5)
+        & ((left_small * near_right).flatten(1).sum(dim=1, keepdim=True) > 0.5)
+    ).view(-1, 1, 1, 1)
+    attach_radius = max(3, int(round(14.0 * max(small_size) / 256.0)))
+    left_band = F.max_pool2d(left_ear_small, 2 * attach_radius + 1, stride=1, padding=attach_radius)
+    right_band = F.max_pool2d(right_ear_small, 2 * attach_radius + 1, stride=1, padding=attach_radius)
+    left_own_contact = (left_small * left_band).flatten(1).sum(dim=1, keepdim=True)
+    left_cross_contact = (left_small * right_band).flatten(1).sum(dim=1, keepdim=True)
+    right_own_contact = (right_small * right_band).flatten(1).sum(dim=1, keepdim=True)
+    right_cross_contact = (right_small * left_band).flatten(1).sum(dim=1, keepdim=True)
+    left_score = 8.0 * left_own_contact - 3.0 * left_cross_contact + 0.001 * left_small.flatten(1).sum(dim=1, keepdim=True)
+    right_score = 8.0 * right_own_contact - 3.0 * right_cross_contact + 0.001 * right_small.flatten(1).sum(dim=1, keepdim=True)
+    keep_left = (left_score >= right_score).view(-1, 1, 1, 1)
+    remove_left = duplicate & ~keep_left
+    remove_right = duplicate & keep_left
+
+    # Near-overlap is not the only split failure.  A long source object can
+    # emit a lobe-attached root on one side and a detached fragment on the
+    # other, placing that fragment on a second target ear after alignment.
+    # A genuine bilateral pair has own-lobe contact on *both* sides.  Remove
+    # only an unanchored opposite-side fragment when the other side has a
+    # real source-ear attachment; this preserves true left/right earrings and
+    # does not alter target-side visibility.
+    association_radius = max(6, int(round(48.0 * max(small_size) / 256.0)))
+    left_association = F.max_pool2d(
+        left_ear_small, 2 * association_radius + 1, stride=1, padding=association_radius
+    )
+    right_association = F.max_pool2d(
+        right_ear_small, 2 * association_radius + 1, stride=1, padding=association_radius
+    )
+    left_associated_area = (left_small * left_association).flatten(1).sum(dim=1, keepdim=True)
+    right_associated_area = (right_small * right_association).flatten(1).sum(dim=1, keepdim=True)
+    left_present = left_small.flatten(1).sum(dim=1, keepdim=True) > 0.5
+    right_present = right_small.flatten(1).sum(dim=1, keepdim=True) > 0.5
+    left_rooted = left_associated_area > 0.5
+    right_rooted = right_associated_area > 0.5
+    remove_left_unanchored = left_present & right_present & ~left_rooted & right_rooted
+    remove_right_unanchored = left_present & right_present & left_rooted & ~right_rooted
+    remove_left = remove_left | remove_left_unanchored.view(-1, 1, 1, 1)
+    remove_right = remove_right | remove_right_unanchored.view(-1, 1, 1, 1)
+    dtype = like.dtype
+    return left * (1.0 - remove_left.to(dtype)), right * (1.0 - remove_right.to(dtype)), remove_left.to(dtype), remove_right.to(dtype)
+
+
+def extract_source_native_earring_v6(
     source_rgb: torch.Tensor,
     source_parsing: torch.Tensor | None,
     *,
@@ -275,6 +469,7 @@ def extract_source_native_earring_v5(
     recall_hint_space: EarringCoordinateSpace | str = EarringCoordinateSpace.SOURCE_CANONICAL,
     max_graph_depth: int = 3,
     max_cumulative_cost: float = 1.55,
+    allow_long_continuation: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Extract one source-native foreground instance per visible source side.
 
@@ -427,12 +622,47 @@ def extract_source_native_earring_v5(
                 # returning a broad label is worse than returning no alpha.
                 candidate = grabcut & probable & envelope
 
+            # A semantic label-9 component is already an accessory authority.
+            # GrabCut can nevertheless discard its low-contrast lower pendant
+            # after locking onto the bright root.  In V6, retain the parser
+            # component as an additional *candidate* when it is source-lobe
+            # associated; all later halo, hair, skin and hole checks still
+            # apply before it becomes RGB alpha.
+            parser_component = parser_side & envelope
+            parser_candidate_area = int(parser_component.sum())
+            candidate_area = int(candidate.sum())
+            parser_recovery_limit = int((0.10 if allow_long_continuation else 0.10) * height * width)
+            # A complete long pendant is often entirely label-9 but too flat
+            # for GrabCut's probable-foreground threshold.  Restore the full
+            # raw component only when it reaches the measured lower-lobe
+            # anchor; a detached background strand inside the broad envelope
+            # therefore cannot become an object.  The later halo/hair checks
+            # still remove fringe pixels before RGB compositing.
+            parser_anchor_support = cv2.dilate(
+                anchor.astype(np.uint8),
+                np.ones((2 * radius(24) + 1, 2 * radius(24) + 1), np.uint8),
+                1,
+            ).astype(bool)
+            parser_lobe_connected = bool((parser_component & parser_anchor_support).any())
+            if (
+                parser_lobe_connected
+                and parser_candidate_area > 0
+                and parser_candidate_area <= parser_recovery_limit
+            ):
+                # Label 9 is the only source-semantic foreground authority.
+                # GrabCut is useful for parser-missed pixels, but it commonly
+                # drops the low-contrast lower half of a long pendant.  Always
+                # retain the complete lobe-connected label-9 component; the
+                # component/root and semantic guards below still prevent an
+                # unrelated visual/background component from joining it.
+                candidate = candidate | parser_component
+
             count, component_labels, stats, _ = cv2.connectedComponentsWithStats(candidate.astype(np.uint8), 8)
             components: list[dict[str, object]] = []
             for component_id in range(1, count):
                 component = component_labels == component_id
                 area = int(stats[component_id, cv2.CC_STAT_AREA])
-                if area <= 0 or area > int(0.055 * height * width):
+                if area <= 0 or area > int((0.10 if allow_long_continuation else 0.055) * height * width):
                     continue
                 points = np.argwhere(component)
                 centroid_y, centroid_x = points.mean(axis=0)
@@ -528,6 +758,13 @@ def extract_source_native_earring_v5(
                     "recall_overlap": recall_overlap,
                     "material_score": material_score,
                     "edge_energy": edge_energy,
+                    # Keep semantic overlap scores on every component.  The
+                    # V6 long-pendant continuation pass uses these values to
+                    # reject hair/skin/background components; omitting them
+                    # made that pass fail with a KeyError during generation.
+                    "skin_overlap": skin_overlap,
+                    "hair_overlap": hair_overlap,
+                    "background_overlap": background_overlap,
                     "lobe_distance": lobe_distance,
                     "semantic_penalty": semantic_penalty,
                     "compact_near_lobe": compact_near_lobe,
@@ -548,6 +785,23 @@ def extract_source_native_earring_v5(
                 )
                 and item["score"] >= 0.85
             ]
+            # One source ear has at most one physical accessory.  Starting
+            # the graph from every parser/highlight component let unrelated
+            # background strands become a second object on the same side.
+            # Keep the strongest lobe-associated root and attach compatible
+            # lower pieces through the bounded graph below.
+            if len(roots) > 1:
+                roots.sort(
+                    key=lambda item: (
+                        float(item["score"]),
+                        float(item["parser_overlap"]),
+                        float(item["seed_overlap"]),
+                        float(item["material_score"]),
+                        int(item["area"]),
+                    ),
+                    reverse=True,
+                )
+                roots = roots[:1]
             if not roots:
                 # Evidence exists, but it did not form an object-consistent
                 # root.  Keep this side UNCERTAIN with alpha exactly zero.
@@ -584,7 +838,11 @@ def extract_source_native_earring_v5(
                     # A long pendant can contain separately detected metal,
                     # jewel and highlight components.  This is a connection
                     # test only; it never expands the final write alpha.
-                    max_gap = max(radius(6), radius(18) - 2 * depth)
+                    max_gap = max(
+                        radius(6),
+                        radius(28 if allow_long_continuation else 18)
+                        - 2 * depth,
+                    )
                     if gap > max_gap:
                         continue
                     lab_distance = float(np.linalg.norm(current["mean_lab"] - candidate_item["mean_lab"]))
@@ -593,10 +851,28 @@ def extract_source_native_earring_v5(
                     axis_consistency = 1.0 - axis_delta
                     vertical = 1.0 if float(candidate_item["centroid_y"]) >= float(current["centroid_y"]) - radius(8) else 0.45
                     edge_score = 0.44 * appearance + 0.30 * (1.0 - gap / max(1.0, max_gap)) + 0.16 * axis_consistency + 0.10 * vertical
-                    if edge_score < 0.56:
+                    if edge_score < (0.44 if allow_long_continuation else 0.56):
+                        continue
+                    # Once a semantic label-9 root exists, an unlabelled
+                    # component is allowed to continue it only with strong
+                    # native object evidence.  Broad visual components beside
+                    # the ear are the usual source of copied background
+                    # strands and duplicate earrings.
+                    if (
+                        float(current.get("parser_overlap", 0.0)) > 0.02
+                        and float(candidate_item.get("parser_overlap", 0.0)) <= 0.02
+                        and not (
+                            float(candidate_item.get("background_overlap", 1.0)) <= 0.18
+                            and float(candidate_item.get("hair_overlap", 1.0)) <= 0.10
+                            and float(candidate_item.get("material_score", 0.0)) >= 0.55
+                            and float(candidate_item.get("edge_energy", 0.0)) >= 0.25
+                            and gap <= radius(8)
+                        )
+                    ):
                         continue
                     next_cost = cumulative_cost + (1.0 - edge_score) + 0.18 * float(candidate_item["semantic_penalty"])
-                    if next_cost > float(max_cumulative_cost):
+                    cost_limit = float(max_cumulative_cost) * (1.8 if allow_long_continuation else 1.0)
+                    if next_cost > cost_limit:
                         continue
                     selected[candidate_id] = (depth + 1, next_cost)
                     frontier.append((candidate_item, depth + 1, next_cost))
@@ -618,6 +894,76 @@ def extract_source_native_earring_v5(
                     max_depth_used = max(max_depth_used, depth)
                     max_cost_used = max(max_cost_used, item_cost)
                     adaptive |= cv2.dilate(item_mask.astype(np.uint8), np.ones((2 * radius(2) + 1, 2 * radius(2) + 1), np.uint8), 1).astype(bool)
+
+            if allow_long_continuation and selected_mask.any():
+                # A long pendant is often split into several low-contrast
+                # components.  The graph above may reject a legitimate lower
+                # segment even after its distance/cost budget is relaxed.  Add
+                # only a component that is below an accepted segment, close in
+                # colour, narrow/elongated, and still materially distinct from
+                # the local background.  This is a source-lobe continuation,
+                # never a free rectangular rail; hair and broad background
+                # components remain excluded.
+                selected_items = [
+                    item for item in components if int(item["id"]) in selected
+                ]
+                continuation_limit = int(0.08 * height * width)
+                continuation_area = int(selected_mask.sum())
+                changed = True
+                while changed and continuation_area < continuation_limit:
+                    changed = False
+                    best_item = None
+                    best_score = -1.0
+                    for candidate_item in components:
+                        candidate_id = int(candidate_item["id"])
+                        if candidate_id in selected:
+                            continue
+                        if float(candidate_item["centroid_y"]) < min(
+                            float(item["centroid_y"]) for item in selected_items
+                        ) - radius(4):
+                            continue
+                        if float(candidate_item["background_overlap"] if "background_overlap" in candidate_item else 0.0) >= 0.86:
+                            continue
+                        if float(candidate_item["hair_overlap"]) >= 0.30:
+                            continue
+                        if float(candidate_item["skin_overlap"]) >= 0.78:
+                            continue
+                        if float(candidate_item["material_score"]) < 0.30 or float(candidate_item["edge_energy"]) < 0.10:
+                            continue
+                        nearest = min(
+                            selected_items,
+                            key=lambda item: _bbox_gap(item["bbox"], candidate_item["bbox"]),
+                        )
+                        gap = _bbox_gap(nearest["bbox"], candidate_item["bbox"])
+                        if gap > radius(32):
+                            continue
+                        lab_distance = float(np.linalg.norm(nearest["mean_lab"] - candidate_item["mean_lab"]))
+                        if lab_distance > 68.0:
+                            continue
+                        x_distance = abs(float(candidate_item["centroid_x"]) - float(nearest["centroid_x"]))
+                        if x_distance > radius(42):
+                            continue
+                        score = (
+                            0.45 * float(candidate_item["material_score"])
+                            + 0.35 * float(candidate_item["edge_energy"])
+                            + 0.20 * max(0.0, 1.0 - lab_distance / 68.0)
+                        )
+                        if score > best_score:
+                            best_item = candidate_item
+                            best_score = score
+                    if best_item is None:
+                        break
+                    best_id = int(best_item["id"])
+                    selected[best_id] = (1, 0.0)
+                    selected_items.append(best_item)
+                    selected_mask |= best_item["mask"]
+                    adaptive |= cv2.dilate(
+                        best_item["mask"].astype(np.uint8),
+                        np.ones((2 * radius(2) + 1, 2 * radius(2) + 1), np.uint8),
+                        1,
+                    ).astype(bool)
+                    continuation_area = int(selected_mask.sum())
+                    changed = True
 
             # Decontaminate the selected boundary before exporting RGB alpha.
             # GrabCut correctly finds the broad hoop, but antialiased source
@@ -641,7 +987,14 @@ def extract_source_native_earring_v5(
                     trim_kernel,
                     1,
                 ).astype(bool) & ~selected_mask
-                outside_background = outside & semantic_background
+                # The source backdrop behind an earring is not always parser
+                # label 0.  Long pendants frequently hang in front of source
+                # hair.  Treat that *outside* hair as a local matte backdrop
+                # too, so a mixed edge is reconstructed as jewellery over the
+                # target image rather than copied as a bright source-hair rim.
+                # Source skin is deliberately excluded: it is not a stable
+                # backdrop estimate and must remain target-owned.
+                outside_background = outside & (semantic_background | semantic_hair)
                 bg_support = cv2.boxFilter(
                     outside_background.astype(np.float32),
                     cv2.CV_32F,
@@ -684,10 +1037,10 @@ def extract_source_native_earring_v5(
                 )
                 # Parser/GrabCut often expands a label-9 seed into the
                 # neighbouring earlobe or fine source strands.  Those pixels
-                # are not an earring and must never become RGB alpha.  Keep
-                # only parser/seed-supported pixels inside semantic hair/skin;
-                # a real pendant outside the ear remains eligible through the
-                # measured material/edge continuation checks above.
+                # are not an earring and must never become RGB alpha.  A
+                # source-hair-backed edge is now matte-corrected below rather
+                # than copied verbatim, while a real pendant outside the ear
+                # remains eligible through the measured continuation checks.
                 trusted_object_pixels = parser_side | seed_side | trusted_core
                 hair_guard = cv2.dilate(
                     semantic_hair.astype(np.uint8),
@@ -807,6 +1160,72 @@ def extract_source_native_earring_v5(
             result_arrays["component_scores"][batch_index] = np.maximum(result_arrays["component_scores"][batch_index], score_debug)
             result_arrays["selected_components"][batch_index] = np.maximum(result_arrays["selected_components"][batch_index], selected_mask.astype(np.float32))
 
+    # The per-side inspection envelopes can overlap on near-frontal faces.
+    # Without a final arbitration, one physical source earring may be emitted
+    # in both side tensors and later aligned twice.  Resolve only genuinely
+    # overlapping/near-identical objects; distinct left/right earrings are
+    # left untouched.  This is a source-coordinate guard, so it cannot invent
+    # an object or alter target visibility.
+    for batch_index in range(batch):
+        left = result_arrays["source_native_left_alpha"][batch_index]
+        right = result_arrays["source_native_right_alpha"][batch_index]
+        left_binary = left > 0.01
+        right_binary = right > 0.01
+        overlap = left_binary & right_binary
+        if overlap.any():
+            labels = parsing_np[batch_index]
+            left_ear_support = float((left_binary & (labels == RAW_LEFT_EAR)).sum())
+            right_ear_support = float((right_binary & (labels == RAW_RIGHT_EAR)).sum())
+            left_area = float(left_binary.sum())
+            right_area = float(right_binary.sum())
+            # Keep the side with stronger native ear/parser support.  If both
+            # supports tie, retain the larger verified object and remove only
+            # the duplicate overlap pixels from the other side.
+            keep_left = (left_ear_support, left_area) >= (right_ear_support, right_area)
+            if keep_left:
+                right[overlap] = 0.0
+            else:
+                left[overlap] = 0.0
+
+        left_points = np.argwhere(left > 0.01)
+        right_points = np.argwhere(right > 0.01)
+        if left_points.size and right_points.size:
+            left_min = left_points.min(axis=0)
+            left_max = left_points.max(axis=0)
+            right_min = right_points.min(axis=0)
+            right_max = right_points.max(axis=0)
+            gap_y = max(int(left_min[0]) - int(right_max[0]), int(right_min[0]) - int(left_max[0]), 0)
+            gap_x = max(int(left_min[1]) - int(right_max[1]), int(right_min[1]) - int(left_max[1]), 0)
+            bbox_gap = math.hypot(gap_y, gap_x)
+            left_center = left_points.mean(axis=0)
+            right_center = right_points.mean(axis=0)
+            center_gap = float(np.linalg.norm(left_center - right_center))
+            # Two different ears are far apart in source coordinates.  A
+            # near-identical pair is the duplicated-envelope failure case.
+            duplicate_limit = max(8.0, 18.0 * scale)
+            if bbox_gap <= duplicate_limit and center_gap <= 28.0 * scale:
+                labels = parsing_np[batch_index]
+                left_score = float((left > 0.01).astype(np.float32)[labels == RAW_LEFT_EAR].sum())
+                right_score = float((right > 0.01).astype(np.float32)[labels == RAW_RIGHT_EAR].sum())
+                if (left_score, left_area) >= (right_score, right_area):
+                    right[...] = 0.0
+                    result_arrays["source_native_right_hole_alpha"][batch_index] = 0.0
+                else:
+                    left[...] = 0.0
+                    result_arrays["source_native_left_hole_alpha"][batch_index] = 0.0
+        # Keep the combined alpha consistent with the arbitrated per-side
+        # fields (the original loop populated it before this final guard).
+        result_arrays["source_native_earring_alpha"][batch_index] = np.maximum(left, right)
+        # Presence is published after arbitration as well.  Otherwise a
+        # duplicate side removed above would still be marked positive in the
+        # dataset and could reappear through the learned supervision path.
+        state[batch_index, 0] = 2.0 if np.any(left > 0.01) else 0.0
+        state[batch_index, 1] = 2.0 if np.any(right > 0.01) else 0.0
+        if state[batch_index, 0] == 0.0:
+            confidence[batch_index, 0] = 0.0
+        if state[batch_index, 1] == 0.0:
+            confidence[batch_index, 1] = 0.0
+
     for name, value in result_arrays.items():
         output[name] = torch.from_numpy(value).to(device=device, dtype=dtype).unsqueeze(1)
     output["source_native_earring_rgb"] = torch.from_numpy(foreground_rgb).to(
@@ -821,8 +1240,8 @@ def extract_source_native_earring_v5(
     return output
 
 
-def align_earring_instance_v5(
-    instance: EarringNativeInstanceV5,
+def align_earring_instance_v6(
+    instance: EarringNativeInstanceV6,
     source_left_ear: torch.Tensor,
     source_right_ear: torch.Tensor,
     target_left_ear: torch.Tensor,
@@ -874,7 +1293,7 @@ def align_earring_instance_v5(
     # multiplied before alignment and again during compositing, which happened
     # to be harmless for alpha 0/1 but squares a real matte edge into a dark,
     # broken-looking pendant.  Weight only while combining two possible sides;
-    # ``composite_earring_v5`` applies the one final target alpha.
+    # ``composite_earring_v6`` applies the one final target alpha.
     left_rgb = _shift_per_batch(source, left_dy, left_dx)
     right_rgb = _shift_per_batch(source, right_dy, right_dx)
     rgb_weight = (left_alpha + right_alpha).clamp_min(1e-6)
@@ -894,7 +1313,7 @@ def align_earring_instance_v5(
     }
 
 
-def composite_earring_v5(
+def composite_earring_v6(
     base: torch.Tensor,
     aligned: dict[str, torch.Tensor],
     target_left_ear: torch.Tensor,

@@ -14,7 +14,6 @@ from models.Encoders import ClipBlendingModel
 from models.Net import Net
 from models.postprocess_v5 import PostProcessModelV5, load_checkpoint_compat
 from utils.bicubic import BicubicDownSample
-from utils.blending_checkpoint_v8 import validate_blending_checkpoint_policy_v8
 from utils.hair_color_match_v8 import gaussian_blur2d, lab_to_rgb, rgb_to_lab
 from utils.image_utils import DilateErosion
 from utils.mask_delta_v8 import filter_parsing_to_primary_subject
@@ -101,11 +100,10 @@ class BlendingV5(Blending_v8):
         self.net = Net(self.opts) if net is None else net
 
         blending_checkpoint = load_blending_checkpoint_v5(self.opts.blending_checkpoint)
-        self.blending_color_policy_v8 = validate_blending_checkpoint_policy_v8(
-            blending_checkpoint,
-            self.opts,
-            checkpoint_path=self.opts.blending_checkpoint,
-        )
+        # The author checkpoint predates the V8 colour-policy metadata.  V5
+        # does not use that experimental policy, so do not validate/load it as
+        # part of the blending path.
+        self.blending_color_policy_v8 = None
         self.blending_encoder = ClipBlendingModel(blending_checkpoint.get("clip", "ViT-B/32"))
         blending_load = self.blending_encoder.load_state_dict(
             blending_checkpoint["model_state_dict"], strict=False
@@ -161,7 +159,7 @@ class BlendingV5(Blending_v8):
             # HairFast keeps the source face in the same image frame.  Moving
             # a recovered earring to chase two noisy parser centroids creates
             # a second earring; zero is the correct default contract.
-            earring_align_max_shift=pp_value("earring_align_max_shift", 0),
+            earring_align_max_shift=pp_value("earring_align_max_shift", 24),
             # V5 structural compositor controls.  They are runtime policy,
             # not checkpoint metadata, so an older V5 weight cannot reactivate
             # a source-face paste or target-aligned seed path.
@@ -209,7 +207,11 @@ class BlendingV5(Blending_v8):
             enable_source_content_gate=pp_policy_value("enable_source_content_gate", True),
             source_content_gate_dilate=pp_policy_value("source_content_gate_dilate", 3),
             source_hair_face_suppress_dilate=pp_policy_value("source_hair_face_suppress_dilate", 5),
-            source_hair_face_suppress_strength=pp_policy_value("source_hair_face_suppress_strength", 0.65),
+            # Keep the complete source face feature available to PP.  A
+            # source-hair overlap is not evidence that the corresponding
+            # target face is invalid; attenuating it is what made the
+            # bang-covered region decode as a separate soft band.
+            source_hair_face_suppress_strength=pp_policy_value("source_hair_face_suppress_strength", 0.0),
             source_hair_face_suppress_max_y=pp_policy_value("source_hair_face_suppress_max_y", 0.45),
             source_hair_face_suppress_ear_exclude_dilate=pp_policy_value(
                 "source_hair_face_suppress_ear_exclude_dilate",
@@ -232,7 +234,9 @@ class BlendingV5(Blending_v8):
                 "earring_learned_fallback_alpha",
                 0.0,
             ),
-            # V5 uses one PP face base; normal-face hard authority is disabled.
+            # Source RGB is never pasted into the PP face.  The decoder must
+            # produce one continuous face field; direct source copying creates
+            # the visible three-band boundary and can bring back clothing.
             enable_direct_face_skin_restore=False,
             output_target_hair_preserve_dilate=pp_policy_value(
                 "output_target_hair_preserve_dilate", 5
@@ -508,19 +512,14 @@ class BlendingV5(Blending_v8):
         # stale/raw crown topology.
         HM_X = align_shape.get("HM_X_repaired", align_shape["HM_X"])
         save_all = bool(getattr(self.opts, "save_all", False))
-        save_color_debug = save_all and bool(kwargs.get(
-            "debug_save_intermediate_color",
-            getattr(self.opts, "debug_save_intermediate_color", True),
-        ))
-        color_before_pp, color_transfer_debug = self._reference_dominant_color(
-            I_blend_256_raw,
-            I_3,
-            HM_X,
-            HM_3E,
-            kwargs,
-            return_debug=save_color_debug,
-        )
-        I_blend_256 = color_before_pp
+        # The author's blending checkpoint is the sole PP target.  The
+        # reference-dominant colour correction is a V5 experiment and changes
+        # the distribution before PP, flattening hair and face detail.  Keep
+        # the historical debug aliases, but make them identical to the raw
+        # author output so no option can re-enable that branch.
+        color_before_pp = I_blend_256_raw
+        color_transfer_debug = None
+        I_blend_256 = I_blend_256_raw
 
         delta_masks = align_shape.get("delta_masks", {}) if isinstance(align_shape, dict) else {}
         cleanup_masks = {

@@ -47,7 +47,9 @@ from models.earring_foreground_v6 import (
     EarringCoordinateSpace,
     EarringNativeInstanceV6,
     align_earring_instance_v6,
+    enforce_exclusive_earring_sides_v6,
     extract_source_native_earring_v6,
+    retain_single_earring_group_v6,
 )
 from utils.bicubic import BicubicDownSample
 from utils.image_utils import list_image_files
@@ -62,12 +64,13 @@ CLEANUP_MASK_KEYS = (
     "M_remove_neck",
     "M_remove_context",
 )
-# Schema 32 stores only the author pre-PP target. Every later PP image is
-# decoded live from that target and the source, so all prior V6 parts are
-# intentionally rejected.
-# SATD remains a post-PP background candidate, never a shape, colour, or PP
-# condition.
-DATASET_CONFIG_SCHEMA_VERSION = 32
+# Schema 34 stores the SATD-rendered image as the direct PP target.  PP then
+# decodes that image live with the source, and no decoded-image SATD residual
+# is applied a second time.  Older parts are intentionally rejected because
+# they represent a different PP input contract.
+# Schema 34 also fixes ``source_earring_object_mask`` to SOURCE_NATIVE
+# coordinates; ``source_earring_mask`` remains TARGET_CANONICAL.
+DATASET_CONFIG_SCHEMA_VERSION = 34
 DATASET_POLICY_FILES = (
     "scripts/pp_gen_v6.py",
     "hair_swap_v6.py",
@@ -98,10 +101,10 @@ USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full
 USER_FACE_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/ear/")
 USER_DONOR_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short/")
 # This directory is incompatible with all V5 targets and face compositors.
-USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v6_author_noise_isolated_satd_background_100_r10")
+USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v6_direct_satd_100_r17")
 # Generate 100 distinct source/shape/colour triplets.  The matching trainer
 # reserves 50 of these samples for validation and writes all 50 previews.
-USER_DATASET_SIZE_SMALL = 30
+USER_DATASET_SIZE_SMALL = 100
 # Chunk size now controls checkpoint frequency only.  Render/mask work streams
 # one mask batch at a time, so this does not retain a whole chunk in memory.
 USER_CHUNK_SIZE_SMALL = 256
@@ -111,11 +114,11 @@ USER_MASK_BATCH_SIZE_SMALL = 8
 # quota-limited training volume. gzip is lossless: it changes only the outer
 # file container, not a serialized tensor value.
 USER_DATASET_COMPRESSION = "gzip"  # "gzip" or "none"
-USER_DATASET_GZIP_LEVEL = 6  # valid only for gzip; choose an integer in [1, 9]
+USER_DATASET_GZIP_LEVEL = 1  # lossless and substantially faster than level 6
 
 USER_FACE_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
 USER_DONOR_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
-USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v6_author_noise_isolated_satd_background_full_r10")
+USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v6_direct_satd_full_r17")
 USER_DATASET_SIZE_FULL = 10_000
 USER_CHUNK_SIZE_FULL = 256
 USER_MASK_BATCH_SIZE_FULL = 16
@@ -131,18 +134,19 @@ USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/checkpoints
 # Match the inference blend used when SATD itself was trained.  The final
 # compositor applies this candidate exactly once instead of amplifying its RGB
 # difference after decoding.
-USER_SATD_BLEND_V8 = 0.50
+USER_SATD_BLEND_V8 = 0.75
+USER_DIRECT_SATD_PP_INPUT = True
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
 USER_SATD_HAIR_EXCLUDE_STRENGTH = 1.0
 # SATD is applied only as the candidate-minus-author residual in parsed
 # background.  These values widen M_remove support without authorizing any
 # face, hair, ear, neck, or earring pixel.
-USER_SATD_BACKGROUND_CLEANUP_DILATE = 72
-USER_SATD_BACKGROUND_HAIR_EDGE_DILATE = 10
-USER_SATD_BACKGROUND_HAIR_EDGE_SUPPORT_DILATE = 40
+USER_SATD_BACKGROUND_CLEANUP_DILATE = 110
+USER_SATD_BACKGROUND_HAIR_EDGE_DILATE = 16
+USER_SATD_BACKGROUND_HAIR_EDGE_SUPPORT_DILATE = 72
 USER_SATD_BACKGROUND_HAIR_EDGE_STRENGTH = 1.0
-USER_SATD_BACKGROUND_RESIDUAL_STRENGTH = 1.0
+USER_SATD_BACKGROUND_RESIDUAL_STRENGTH = 1.25
 USER_SATD_BACKGROUND_ALPHA_FEATHER = 7
 
 # These values define the authoritative v8 target distribution consumed by PP.
@@ -200,7 +204,10 @@ USER_EARRING_WRITE_BRIDGE_DILATE = 17
 USER_EARRING_ANCHOR_VISIBLE_DILATE = 3
 # Source identity geometry is preserved by HairFast.  Default to no spatial
 # movement so the target compositor cannot leave a second shifted earring.
-USER_EARRING_ALIGN_MAX_SHIFT = 0
+# Align the source earring attachment to the final visible target earlobe.
+# 32px is the 256px-reference limit; it permits a PP-reconstructed lobe to
+# move while preventing an accessory from jumping across the face.
+USER_EARRING_ALIGN_MAX_SHIFT = 32
 USER_EARRING_FINE_MASK_FLOOR = 0.18
 USER_EARRING_FINE_MASK_DILATE = 5
 # ============================================================================
@@ -254,6 +261,7 @@ RESOLVED_USER_CONFIG = {
     "satd_checkpoint_v8": USER_SATD_CHECKPOINT_V8,
     "satd_blend_v8": USER_SATD_BLEND_V8,
     "satd_boundary_v8": USER_SATD_BOUNDARY_V8,
+    "direct_satd_pp_input": USER_DIRECT_SATD_PP_INPUT,
     "eq8_reference_blend_v8": USER_EQ8_REFERENCE_BLEND_V8,
     "satd_hair_exclude_strength": USER_SATD_HAIR_EXCLUDE_STRENGTH,
     "satd_background_cleanup_dilate": USER_SATD_BACKGROUND_CLEANUP_DILATE,
@@ -413,6 +421,7 @@ def unpack_color_before_pp_stage(result):
             "satd_background_highres must be RGB [3,H,W], "
             f"got {tuple(satd_background_highres.shape)}."
         )
+    direct_satd_pp_input = bool(result.get("direct_satd_pp_input", False))
     return (
         image.clamp(0, 1),
         cleanup_masks,
@@ -420,6 +429,7 @@ def unpack_color_before_pp_stage(result):
         target_hair_mask,
         completed_hair_highres.clamp(0, 1),
         satd_background_highres.clamp(0, 1),
+        direct_satd_pp_input,
     )
 
 
@@ -454,6 +464,12 @@ def build_parser(defaults):
         help="Allow a pre-v8 blending checkpoint only while constructing PP data.",
     )
     parser.add_argument("--use_satd_v8", type=str2bool, default=defaults["use_satd_v8"])
+    parser.add_argument(
+        "--direct_satd_pp_input",
+        type=str2bool,
+        default=defaults["direct_satd_pp_input"],
+        help="Feed I_satd_blend_256 directly to PP and disable post-decode SATD residuals.",
+    )
     parser.add_argument("--satd_checkpoint_v8", type=str, default=defaults["satd_checkpoint_v8"])
     parser.add_argument("--satd_blend_v8", type=float, default=defaults["satd_blend_v8"])
     parser.add_argument("--satd_boundary_v8", type=int, default=defaults["satd_boundary_v8"])
@@ -970,7 +986,7 @@ class RenderedPairDataset(Dataset):
         if not torch.is_tensor(completed_hair_highres):
             raise RuntimeError(
                 "Rendered V6 dataset item is missing completed_hair_highres. "
-                "Regenerate this schema-32 dataset from the matching V6 generator."
+                "Regenerate this schema-34 dataset from the matching V6 generator."
             )
         if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
             raise RuntimeError(
@@ -985,7 +1001,7 @@ class RenderedPairDataset(Dataset):
         if not torch.is_tensor(satd_background_highres):
             raise RuntimeError(
                 "Rendered V6 dataset item is missing satd_background_highres. "
-                "Regenerate this schema-32 dataset from the matching V6 generator."
+                "Regenerate this schema-34 dataset from the matching V6 generator."
             )
         if satd_background_highres.ndim != 3 or satd_background_highres.size(0) != 3:
             raise RuntimeError(
@@ -996,6 +1012,11 @@ class RenderedPairDataset(Dataset):
             satd_background_highres = satd_background_highres.float().div(255)
         else:
             satd_background_highres = satd_background_highres.float().clamp(0, 1)
+        direct_satd_pp_input = item.get("direct_satd_pp_input")
+        if torch.is_tensor(direct_satd_pp_input):
+            direct_satd_pp_input = bool(direct_satd_pp_input.item())
+        else:
+            direct_satd_pp_input = bool(direct_satd_pp_input)
         return {
             "source_path": str(source_path),
             "shape_reference_path": str(self.donor_gallery_root / shape_name),
@@ -1010,6 +1031,7 @@ class RenderedPairDataset(Dataset):
             "pre_reference_color_full": pre_reference_color_full,
             "completed_hair_highres": completed_hair_highres,
             "satd_background_highres": satd_background_highres,
+            "direct_satd_pp_input": torch.tensor(direct_satd_pp_input, dtype=torch.bool),
             "cleanup_masks": item.get("cleanup_masks", {}),
             "target_hair_mask_override": item.get("target_hair_mask"),
         }
@@ -1101,6 +1123,10 @@ class DatasetItemBatchBuilder:
                     [item["satd_background_highres"] for item in batch_items],
                     dim=0,
                 ),
+                "direct_satd_pp_input": torch.stack(
+                    [item["direct_satd_pp_input"] for item in batch_items],
+                    dim=0,
+                ),
                 "target_hair_mask_override": torch.stack(
                     [
                         item.get(
@@ -1175,6 +1201,10 @@ class DatasetItemBatchBuilder:
                 non_blocking=False,
             )
             satd_background_highres = batch["satd_background_highres"].to(
+                self.device,
+                non_blocking=False,
+            )
+            direct_satd_pp_input = batch["direct_satd_pp_input"].to(
                 self.device,
                 non_blocking=False,
             )
@@ -1317,10 +1347,11 @@ class DatasetItemBatchBuilder:
                 # verifier below, not by chaining arbitrary visual fragments.
                 max_graph_depth=4,
                 max_cumulative_cost=1.85,
-                # Keep generated alpha to one verified source-native contour.
-                # The r9 continuation graph could join adjacent highlights or
-                # source background and deform long earrings.
-                allow_long_continuation=False,
+                # Match the final compositor's bounded continuation policy so
+                # long pendants are not shortened in the training target.
+                # Candidate components still pass the source-lobe, hair and
+                # background gates; no free-form ROI pixels are added.
+                allow_long_continuation=True,
             )
             # The native foreground extractor is conservative by design.  A
             # parser-missed pearl or a low-contrast long pendant can therefore
@@ -1358,10 +1389,20 @@ class DatasetItemBatchBuilder:
                 structured = structured * (1.0 - source_hair_full).clamp(0, 1)
                 direct_area = direct.flatten(1).sum(dim=1, keepdim=True)
                 structured_area = structured.flatten(1).sum(dim=1, keepdim=True)
-                use_structured = (
+                def vertical_extent(value: torch.Tensor) -> torch.Tensor:
+                    rows = (value > 0.01).amax(dim=3).float()
+                    height = value.shape[-2]
+                    ids = torch.arange(height, device=value.device, dtype=value.dtype).view(1, 1, height)
+                    first = torch.where(rows > 0, ids, torch.full_like(ids, float(height))).amin(dim=2)
+                    last = (rows * ids).amax(dim=2)
+                    return (last - first + 1.0).clamp_min(0).view(-1, 1)
+
+                direct_extent = vertical_extent(direct)
+                structured_extent = vertical_extent(structured)
+                use_structured_area = (
                     (structured_area >= minimum_structured_area)
                     & (structured_area <= maximum_structured_area)
-                ).view(-1, 1, 1, 1)
+                )
                 # The native GrabCut graph and the source-lobe structured
                 # verifier observe different parts of a long pendant.  The
                 # old replacement rule discarded whichever observer had the
@@ -1372,10 +1413,17 @@ class DatasetItemBatchBuilder:
                 # no ROI or unverified background pixels are introduced.
                 # Pick a complete verifier result
                 # only when the direct native contour is absent or truncated.
-                prefer_structured = use_structured & (
-                    (direct_area < minimum_fallback_area)
-                    | (structured_area >= direct_area * 1.15)
-                )
+                prefer_structured = (
+                    use_structured_area
+                    & (
+                        (direct_area < minimum_structured_area)
+                        | (structured_area >= direct_area * 1.15)
+                        | (
+                            (structured_extent >= direct_extent + max(3.0, 0.04 * source_native_size[0]))
+                            & (structured_area >= direct_area * 0.70)
+                        )
+                    )
+                ).view(-1, 1, 1, 1)
                 selected = torch.where(prefer_structured, structured, direct)
                 return selected, prefer_structured
 
@@ -1387,24 +1435,137 @@ class DatasetItemBatchBuilder:
                 source_foreground_v6["source_native_right_alpha"],
                 structured_source_instances["right_instance_mask"],
             )
+            # Match final V6 inference: raw label-9 is trusted only after it
+            # has been assigned to one real source ear and reduced to one
+            # lobe-connected vertical object chain.  This preserves a long
+            # pendant that the visual extractor kept only at its root, but it
+            # does not turn the surrounding source ear/background corridor
+            # into training RGB alpha.
+            source_left_ear_full = parsing_label_mask(source_parsing_full, (7,))
+            source_right_ear_full = parsing_label_mask(source_parsing_full, (8,))
+            parser_left_full, parser_right_full = assign_components_to_ear_sides(
+                parsing_label_mask(source_parsing_full, (RAW_EARRING,)),
+                source_left_ear_full,
+                source_right_ear_full,
+                source_left_ear_full,
+                source_right_ear_full,
+            )
+            pendant_gap = max(8, int(round(42.0 * max(source_native_size) / 256.0)))
+            pendant_extent = max(
+                pendant_gap,
+                int(round(240.0 * max(source_native_size) / 256.0)),
+            )
+            parser_left_full = retain_single_earring_group_v6(
+                parser_left_full,
+                source_left_ear_full,
+                max_gap=pendant_gap,
+                max_downward_extent=pendant_extent,
+            )
+            parser_right_full = retain_single_earring_group_v6(
+                parser_right_full,
+                source_right_ear_full,
+                max_gap=pendant_gap,
+                max_downward_extent=pendant_extent,
+            )
+
+            def prefer_complete_semantic_chain(
+                selected: torch.Tensor,
+                semantic_chain: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                selected_area = selected.flatten(1).sum(dim=1, keepdim=True)
+                chain_area = semantic_chain.flatten(1).sum(dim=1, keepdim=True)
+                selected_rows = (selected > 0.01).amax(dim=3).float().sum(dim=2)
+                chain_rows = (semantic_chain > 0.01).amax(dim=3).float().sum(dim=2)
+                prefer_chain = (
+                    (chain_area >= minimum_structured_area)
+                    & (
+                        (selected_area < minimum_structured_area)
+                        | (chain_area >= selected_area * 1.08)
+                        | (chain_rows >= selected_rows + max(3.0, 0.04 * source_native_size[0]))
+                    )
+                ).view(-1, 1, 1, 1)
+                return torch.where(prefer_chain, semantic_chain, selected), prefer_chain
+
+            selected_source_left, use_parser_left = prefer_complete_semantic_chain(
+                selected_source_left,
+                parser_left_full,
+            )
+            selected_source_right, use_parser_right = prefer_complete_semantic_chain(
+                selected_source_right,
+                parser_right_full,
+            )
+            # A single side may still contain several components from a weak
+            # detector.  Retain one root plus downward pendant segments only;
+            # a second side-by-side object can no longer become a duplicate
+            # earring in the serialized target.
+            selected_source_left = retain_single_earring_group_v6(
+                selected_source_left,
+                source_left_ear_full,
+                max_gap=pendant_gap,
+                max_downward_extent=pendant_extent,
+            )
+            selected_source_right = retain_single_earring_group_v6(
+                selected_source_right,
+                source_right_ear_full,
+                max_gap=pendant_gap,
+                max_downward_extent=pendant_extent,
+            )
             selected_source_left_hole = torch.where(
-                use_structured_left,
-                structured_source_instances["left_hoop_hole_mask"].to(
-                    device=source_full.device,
-                    dtype=source_full.dtype,
+                use_parser_left,
+                compute_earring_hole_mask(parser_left_full),
+                torch.where(
+                    use_structured_left,
+                    structured_source_instances["left_hoop_hole_mask"].to(
+                        device=source_full.device,
+                        dtype=source_full.dtype,
+                    ),
+                    source_foreground_v6["source_native_left_hole_alpha"],
                 ),
-                source_foreground_v6["source_native_left_hole_alpha"],
             )
             selected_source_right_hole = torch.where(
-                use_structured_right,
-                structured_source_instances["right_hoop_hole_mask"].to(
-                    device=source_full.device,
-                    dtype=source_full.dtype,
+                use_parser_right,
+                compute_earring_hole_mask(parser_right_full),
+                torch.where(
+                    use_structured_right,
+                    structured_source_instances["right_hoop_hole_mask"].to(
+                        device=source_full.device,
+                        dtype=source_full.dtype,
+                    ),
+                    source_foreground_v6["source_native_right_hole_alpha"],
                 ),
-                source_foreground_v6["source_native_right_hole_alpha"],
             )
+            # Keep source semantic regions out of the serialized alpha even
+            # when the structured fallback selected a parser-background
+            # continuation.  The native extractor/structured verifier has
+            # already made the object-vs-background decision; removing every
+            # label-0 tail here would truncate precisely the long pendants
+            # this fallback is meant to recover.
+            source_labels_full = source_parsing_full.long()
+            source_subject_block_full = (
+                (source_labels_full != 0) & (source_labels_full != RAW_EARRING)
+            ).to(source_full.dtype)
+            source_object_gate_full = (1.0 - source_subject_block_full).clamp(0, 1)
+            selected_source_left = selected_source_left * source_object_gate_full
+            selected_source_right = selected_source_right * source_object_gate_full
             selected_source_left = selected_source_left * (1.0 - selected_source_left_hole).clamp(0, 1)
             selected_source_right = selected_source_right * (1.0 - selected_source_right_hole).clamp(0, 1)
+            (
+                selected_source_left,
+                selected_source_right,
+                removed_source_left,
+                removed_source_right,
+            ) = enforce_exclusive_earring_sides_v6(
+                selected_source_left,
+                selected_source_right,
+                parsing_label_mask(source_parsing_full, (7,)),
+                parsing_label_mask(source_parsing_full, (8,)),
+            )
+            selected_source_left_hole = selected_source_left_hole * (
+                1.0 - removed_source_left
+            ).clamp(0, 1)
+            selected_source_right_hole = selected_source_right_hole * (
+                1.0 - removed_source_right
+            ).clamp(0, 1)
             source_foreground_v6["source_native_left_alpha"] = selected_source_left
             source_foreground_v6["source_native_right_alpha"] = selected_source_right
             source_foreground_v6["source_native_left_hole_alpha"] = selected_source_left_hole
@@ -1419,6 +1580,8 @@ class DatasetItemBatchBuilder:
                 0,
                 1,
             )
+            source_foreground_v6["source_native_left_label9_chain"] = parser_left_full
+            source_foreground_v6["source_native_right_label9_chain"] = parser_right_full
             structured_source_alpha = torch.clamp(
                 structured_source_instances["left_instance_mask"].to(
                     device=source_full.device,
@@ -1662,43 +1825,55 @@ class DatasetItemBatchBuilder:
                 corridor = (skin + hair).flatten(1).sum(dim=1, keepdim=True).clamp_min(1.0)
                 return (
                     (skin.flatten(1).sum(dim=1, keepdim=True) >= 1.0)
-                    & ((hair.flatten(1).sum(dim=1, keepdim=True) / corridor) <= 0.55)
+                    & ((hair.flatten(1).sum(dim=1, keepdim=True) / corridor) <= 0.25)
                 ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
 
+            # Query-time side flags may remain open after transferred hair
+            # covers an ear.  Use only final target parser/lobe evidence for
+            # both training visibility and the target attachment point.
             parser_min_visible_area = 2.0
-            left_open = torch.maximum(
-                side_is_open(
-                    query_info.get("left_target_side_open", query_info.get("left_side_active"))
-                ),
-                (
-                    target_left_parser_visible.flatten(1).sum(dim=1, keepdim=True)
-                    >= parser_min_visible_area
-                ).to(source_earring_mask.dtype).view(-1, 1, 1, 1),
-            )
+            left_open = (
+                target_left_parser_visible.flatten(1).sum(dim=1, keepdim=True)
+                >= parser_min_visible_area
+            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
             left_open = torch.maximum(
                 left_open,
                 exposed_lobe_fallback("left_lobe_anchor", "left_ear_roi"),
             )
-            right_open = torch.maximum(
-                side_is_open(
-                    query_info.get("right_target_side_open", query_info.get("right_side_active"))
-                ),
-                (
-                    target_right_parser_visible.flatten(1).sum(dim=1, keepdim=True)
-                    >= parser_min_visible_area
-                ).to(source_earring_mask.dtype).view(-1, 1, 1, 1),
-            )
+            right_open = (
+                target_right_parser_visible.flatten(1).sum(dim=1, keepdim=True)
+                >= parser_min_visible_area
+            ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
             right_open = torch.maximum(
                 right_open,
                 exposed_lobe_fallback("right_lobe_anchor", "right_ear_roi"),
             )
-            target_left_alignment = torch.maximum(
-                query_info["target_left_ear_mask"],
-                target_left_parser_visible,
+
+            def exposed_lobe_mask(lobe_key: str, roi_key: str) -> torch.Tensor:
+                lobe = query_info.get(lobe_key, query_info.get(roi_key))
+                if lobe is None:
+                    return torch.zeros_like(target_left_parser_visible)
+                lobe = resize_mask(lobe, target_left_parser_visible.shape[-2:]).to(
+                    device=target_left_parser_visible.device,
+                    dtype=target_left_parser_visible.dtype,
+                )
+                return (
+                    target_skin_surface
+                    * dilate_mask(lobe, 5)
+                    * (1.0 - target_hair_d).clamp(0, 1)
+                ).clamp(0, 1)
+
+            target_left_alignment = torch.clamp(
+                target_left_parser_visible
+                + exposed_lobe_mask("left_lobe_anchor", "left_ear_roi"),
+                0,
+                1,
             ) * left_open
-            target_right_alignment = torch.maximum(
-                query_info["target_right_ear_mask"],
-                target_right_parser_visible,
+            target_right_alignment = torch.clamp(
+                target_right_parser_visible
+                + exposed_lobe_mask("right_lobe_anchor", "right_ear_roi"),
+                0,
+                1,
             ) * right_open
 
             def ordinary_body_overrides_hoop(
@@ -1783,8 +1958,11 @@ class DatasetItemBatchBuilder:
                 area_scale = float(height * width) / float(256 * 256)
                 min_visible_area = 8.0 * area_scale  # ~8px² at 256res
 
-                left_visible = left_earring_valid_roi.flatten(1).sum(dim=1, keepdim=True) >= min_visible_area
-                right_visible = right_earring_valid_roi.flatten(1).sum(dim=1, keepdim=True) >= min_visible_area
+                # The final target-only decisions above are stricter than the
+                # broad query ROI and prevent hidden ears from becoming
+                # positive earring supervision.
+                left_visible = left_open
+                right_visible = right_open
 
                 # Gate by visibility (scalar decision per side, not pixel-wise multiply)
                 left_mask = left_source_instance * left_visible.view(-1, 1, 1, 1).float()
@@ -1972,9 +2150,13 @@ class DatasetItemBatchBuilder:
                     "satd_background_highres": png_uint8_tensor(
                         satd_background_highres[idx]
                     ),
-                    # Keep both stages for reproducible validation previews.  The
-                    # PP target is always the SATD-free color stage.  The SATD
-                    # candidate is serialised separately and is never encoded.
+                    "direct_satd_pp_input": torch.tensor(
+                        bool(direct_satd_pp_input[idx].item()),
+                        dtype=torch.bool,
+                    ),
+                    # Keep both stages for reproducible validation previews.  In
+                    # schema 34 the PP target is the SATD-rendered image itself;
+                    # the explicit flag below prevents any later residual pass.
                     "color_before_pp": target_256[idx].cpu(),
                     "target_mask": target_mask[idx].cpu(),
                     "HT_E": target_hair_e[idx].cpu(),
@@ -1984,7 +2166,16 @@ class DatasetItemBatchBuilder:
                     "target_hair_mask": query_info["target_hair_mask"][idx].cpu(),
                     "source_hair_block_mask": source_hair_block_mask[idx].cpu(),
                     "source_earring_mask": source_earring_mask[idx].cpu(),
-                    "source_earring_object_mask": source_earring_mask[idx].cpu(),
+                    # This field is consumed by the final compositor as a
+                    # SOURCE_NATIVE object alpha.  ``source_earring_mask``
+                    # above is TARGET_CANONICAL (the 256px aligned training
+                    # mask) and must never be reused for source extraction.
+                    # The old code serialized the target mask under both
+                    # names, which caused a second alignment and brought
+                    # source background/duplicate earrings back at inference.
+                    "source_earring_object_mask": source_foreground_v6[
+                        "source_native_earring_alpha"
+                    ][idx].cpu(),
                     # V5 coordinate contract: native extraction evidence
                     # and target-frame learned labels are separate fields.
                     "source_native_earring_alpha": source_foreground_v6["source_native_earring_alpha"][idx].cpu(),
@@ -1999,6 +2190,7 @@ class DatasetItemBatchBuilder:
                     "target_aligned_earring_alpha": earring_confident_mask[idx].cpu(),
                     "target_aligned_earring_rgb": earring_learning_reference[idx].cpu(),
                     "coordinate_manifest": {
+                        "source_earring_object_mask": "SOURCE_NATIVE",
                         "source_native_earring_alpha": "SOURCE_NATIVE",
                         "source_native_earring_rgb_reference": "SOURCE_NATIVE",
                         "target_aligned_earring_alpha": "TARGET_CANONICAL",
@@ -2252,6 +2444,7 @@ def main(args):
     model_args.blending_checkpoint = args.blending_checkpoint
     model_args.allow_legacy_blending_checkpoint_v8 = args.allow_legacy_blending_checkpoint_v8
     model_args.use_satd_v8 = args.use_satd_v8
+    model_args.direct_satd_pp_input = args.direct_satd_pp_input
     model_args.satd_checkpoint_v8 = args.satd_checkpoint_v8
     model_args.satd_blend_v8 = args.satd_blend_v8
     model_args.satd_boundary_v8 = args.satd_boundary_v8
@@ -2434,7 +2627,14 @@ def main(args):
                     target_hair_mask,
                     completed_hair_highres,
                     satd_background_highres,
+                    direct_satd_pp_input,
                 ) = unpack_color_before_pp_stage(result)
+                if bool(args.direct_satd_pp_input) != bool(direct_satd_pp_input):
+                    raise RuntimeError(
+                        "BlendingV6 returned a direct-SATD flag that does not "
+                        "match --direct_satd_pp_input. Regenerate with the "
+                        "matching V6 code/configuration."
+                    )
                 # The target used to be serialized to a temporary 8-bit PNG
                 # and read back.  Preserve that numerical distribution in RAM
                 # while avoiding the PNG encode/decode and filesystem latency.
@@ -2452,6 +2652,9 @@ def main(args):
                     "pre_reference_color_full": pre_reference_color_full,
                     "completed_hair_highres": png_uint8_tensor(completed_hair_highres),
                     "satd_background_highres": png_uint8_tensor(satd_background_highres),
+                    "direct_satd_pp_input": torch.tensor(
+                        bool(direct_satd_pp_input), dtype=torch.bool
+                    ),
                     "cleanup_masks": cleanup_masks,
                 }
                 if target_hair_mask is not None:

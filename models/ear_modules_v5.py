@@ -20,6 +20,7 @@ RAW_EARRING = 9
 RAW_FACE_SURFACE_LABELS = (1, 10)
 RAW_SKIN_SURFACE_LABELS = (1, 7, 8, 10)
 RAW_EAR_SURFACE_LABELS = (7, 8)
+RAW_NECK_SURFACE_LABELS = (14, 15)
 RAW_HAIR = 17
 RAW_HAT = 18
 RAW_DETAIL_LABELS = (2, 3, 4, 5, 6, 11, 12, 13)
@@ -1793,7 +1794,10 @@ def build_source_earring_instance_masks_v5(
     # attached to one lobe.  Keep a larger budget only for this semantic,
     # side-associated path; visual-only candidates retain their much smaller
     # object budget below and cannot use this relaxation to copy background.
-    association_maximum_area = max(1, int(round(0.055 * size[0] * size[1])))
+    # Large/long source earrings can legitimately exceed the old 5.5% cap;
+    # the one-root side association and source semantic filters below keep
+    # this larger allowance from admitting an entire background patch.
+    association_maximum_area = max(1, int(round(0.080 * size[0] * size[1])))
     # A 3px association dilation increases the temporary proxy area even when
     # the original label-9 component is within the final object budget.  Give
     # that proxy margin, then enforce ``association_maximum_area`` again on the
@@ -1808,7 +1812,10 @@ def build_source_earring_instance_masks_v5(
         association_support,
         minimum_area=max(1, int(round(0.50 * scale * scale))),
         maximum_area=association_proxy_maximum_area,
-        keep_per_side=3,
+        # One physical accessory is expected per ear.  Keeping several parser
+        # roots lets nearby source strands enter the same side as a second
+        # earring; a complete long pendant remains one connected raw object.
+        keep_per_side=1,
         left_context=left_context,
         right_context=right_context,
         left_lobe_anchor=left_lobe_anchor,
@@ -1831,7 +1838,7 @@ def build_source_earring_instance_masks_v5(
         association_support,
         minimum_area=max(1, int(round(0.50 * scale * scale))),
         maximum_area=association_proxy_maximum_area,
-        keep_per_side=3,
+        keep_per_side=1,
         left_context=left_context,
         right_context=right_context,
         left_lobe_anchor=left_lobe_anchor,
@@ -2019,15 +2026,23 @@ def build_source_earring_instance_masks_v5(
     reachable = seed * locator_roi
     for _ in range(2):
         reachable = torch.clamp(reachable + dilate_mask(reachable, scaled(3, 1)) * support, 0, 1)
+    # The compact locator is sufficient to find the attachment, but it is not
+    # long enough for a pendant body.  Extend only measured visual evidence
+    # through the source-lobe recall contexts; ``recall_source_gate`` already
+    # applies the source hair/background/material checks.
+    # Keep ordinary visual recall in the compact detector corridor.  The
+    # expanded lobe rail is reserved for parser-labelled long pendants; using
+    # it for generic visual candidates admitted source background strands and
+    # duplicated earrings in recent V6 outputs.
+    extended_visual = recall_visual_support * recall_source_gate * locator_roi
     object_pixels = torch.clamp(
-        reachable * visual_support + parser_earring,
+        reachable * visual_support + parser_earring + extended_visual,
         0,
         1,
-    )
-    object_pixels = object_pixels * locator_roi
+    ) * locator_roi
     proxy = dilate_mask(object_pixels, scaled(3, 1)) * locator_roi
     minimum_area = max(2, int(round(3.0 * scale * scale)))
-    maximum_area = max(minimum_area, int(round(0.025 * size[0] * size[1])))
+    maximum_area = max(minimum_area, int(round(0.040 * size[0] * size[1])))
     kept_proxy = _instance_filter_components(
         proxy,
         locator_roi,
@@ -2061,10 +2076,15 @@ def build_source_earring_instance_masks_v5(
     # that cut a verified long pendant or full ring back to a lobe-sized dot.
     # The side assignment retains complete components and is mutually exclusive
     # for the two real source ears.
+    # Parser label-9 components have already been associated with a real
+    # source lobe by ``_retain_raw_components_touching_proxy`` above.  Use the
+    # extended recall contexts for side assignment here; the compact context
+    # ends near the lobe and silently cuts the lower body of long earrings
+    # while leaving a misleading elongated mask rail.
     left_parser_instance, right_parser_instance = assign_components_to_ear_sides(
         parser_earring,
-        left_context,
-        right_context,
+        left_recall_context,
+        right_recall_context,
         left_lobe_anchor,
         right_lobe_anchor,
     )
@@ -2105,6 +2125,10 @@ def build_source_earring_instance_masks_v5(
     # by the helper.  Do not recrop them with ``locator_roi``: that low-res
     # detector corridor ends above a verified long pendant and was the last
     # geometric cause of missing lower tails.
+    # ``locator_roi`` is a detector corridor, not an object boundary.  The
+    # visual verifier has already produced source-lobe-associated native
+    # pixels; applying the compact ROI here cuts long pendants back to a thin
+    # rail and leaves a mask that is long but misses the actual body.
     left_visual_instance = left_visual_instance * locator_roi
     right_visual_instance = right_visual_instance * locator_roi
     # Ordinary accessories require an associated raw parser component for RGB
@@ -2123,8 +2147,41 @@ def build_source_earring_instance_masks_v5(
     # fragment so a parser-missed pendant tail is written back.  Keep its
     # topology solid here; hollow rings are authorised separately by the
     # paired-contour verifier below.
-    left_instance = torch.clamp(left_instance_base + left_visual_recall, 0, 1)
-    right_instance = torch.clamp(right_instance_base + right_visual_recall, 0, 1)
+    # A parser-confirmed source earring is normally the complete semantic
+    # object.  A parser fragment can still miss the lower half of a long
+    # pendant, so permit visual recall only when its *single* native component
+    # is actually adjacent to that parser fragment.  An unrelated visual
+    # highlight/strand is rejected instead of being added as a second earring.
+    left_parser_present = (
+        left_instance_base.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+    ).to(left_instance_base.dtype).view(-1, 1, 1, 1)
+    right_parser_present = (
+        right_instance_base.flatten(1).sum(dim=1, keepdim=True) >= 1.0
+    ).to(right_instance_base.dtype).view(-1, 1, 1, 1)
+    left_visual_linked = (
+        (left_visual_recall * dilate_mask(left_instance_base, 9))
+        .flatten(1)
+        .sum(dim=1, keepdim=True)
+        >= 1.0
+    ).to(left_instance_base.dtype).view(-1, 1, 1, 1)
+    right_visual_linked = (
+        (right_visual_recall * dilate_mask(right_instance_base, 9))
+        .flatten(1)
+        .sum(dim=1, keepdim=True)
+        >= 1.0
+    ).to(right_instance_base.dtype).view(-1, 1, 1, 1)
+    left_visual_allowed = (1.0 - left_parser_present) + left_parser_present * left_visual_linked
+    right_visual_allowed = (1.0 - right_parser_present) + right_parser_present * right_visual_linked
+    left_instance = torch.clamp(
+        left_instance_base + left_visual_recall * left_visual_allowed,
+        0,
+        1,
+    )
+    right_instance = torch.clamp(
+        right_instance_base + right_visual_recall * right_visual_allowed,
+        0,
+        1,
+    )
 
     # The hole is inferred only from a locally closed visual object.  It is
     # composed from the target output below, so it can never retain source
@@ -5196,6 +5253,54 @@ def _weighted_centroid(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, 
     return y_center.view(batch), x_center.view(batch), valid
 
 
+def _ear_bottom_attachment(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Measure the visible lower-lobe point used to hang an earring."""
+    mask = (ensure_mask_4d(mask).float() > 0.5).float()
+    height = mask.shape[-2]
+    y = torch.arange(height, device=mask.device, dtype=mask.dtype).view(1, 1, height, 1)
+    y_min = torch.where(
+        mask > 0,
+        y.expand_as(mask),
+        torch.full_like(mask, float(height)),
+    ).flatten(1).amin(dim=1, keepdim=True)
+    y_max = (mask * y).flatten(1).amax(dim=1, keepdim=True)
+    band_height = torch.maximum(
+        torch.full_like(y_max, 2.0),
+        (y_max - y_min).clamp_min(1.0) * 0.14,
+    )
+    bottom = mask * (y >= (y_max - band_height).view(-1, 1, 1, 1)).float()
+    bottom_area = bottom.flatten(1).sum(dim=1, keepdim=True)
+    use_bottom = (bottom_area > 0.5).float()
+    return _weighted_centroid(
+        bottom * use_bottom.view(-1, 1, 1, 1)
+        + mask * (1.0 - use_bottom.view(-1, 1, 1, 1))
+    )
+
+
+def _earring_top_attachment(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Measure the upper band of a confirmed source-native accessory."""
+    mask = (ensure_mask_4d(mask).float() > 0.5).float()
+    height = mask.shape[-2]
+    y = torch.arange(height, device=mask.device, dtype=mask.dtype).view(1, 1, height, 1)
+    y_min = torch.where(
+        mask > 0,
+        y.expand_as(mask),
+        torch.full_like(mask, float(height)),
+    ).flatten(1).amin(dim=1, keepdim=True)
+    y_max = (mask * y).flatten(1).amax(dim=1, keepdim=True)
+    band_height = torch.maximum(
+        torch.full_like(y_min, 2.0),
+        (y_max - y_min).clamp_min(1.0) * 0.10,
+    )
+    top = mask * (y <= (y_min + band_height).view(-1, 1, 1, 1)).float()
+    top_area = top.flatten(1).sum(dim=1, keepdim=True)
+    use_top = (top_area > 0.5).float()
+    return _weighted_centroid(
+        top * use_top.view(-1, 1, 1, 1)
+        + mask * (1.0 - use_top.view(-1, 1, 1, 1))
+    )
+
+
 def shift_tensor_per_batch(
     tensor: torch.Tensor,
     shift_y: torch.Tensor,
@@ -5296,18 +5401,15 @@ def align_earring_reference_to_target(
     right_ring = instance_or_roi(source_right_instance_mask, right_roi)
     left_hole = hole_or_zero(source_left_hole_mask)
     right_hole = hole_or_zero(source_right_hole_mask)
-    left_source_anchor = (source_left_ear_mask + left_ring).clamp(0, 1) * left_roi
-    right_source_anchor = (source_right_ear_mask + right_ring).clamp(0, 1) * right_roi
-    # Source ROIs describe where the object was found.  They are not valid in
-    # the target frame and must not crop the target ear before its centroid is
-    # measured; doing so produced spurious shifts and duplicated earrings.
-    left_target_anchor = target_left_ear_mask * target_left_roi
-    right_target_anchor = target_right_ear_mask * target_right_roi
-
-    left_src_y, left_src_x, left_src_valid = _weighted_centroid(left_source_anchor)
-    left_tgt_y, left_tgt_x, left_tgt_valid = _weighted_centroid(left_target_anchor)
-    right_src_y, right_src_x, right_src_valid = _weighted_centroid(right_source_anchor)
-    right_tgt_y, right_tgt_x, right_tgt_valid = _weighted_centroid(right_target_anchor)
+    # Use the source accessory's upper attachment band and the target ear's
+    # visible lower band.  A mixed ear/earring centroid is biased upward by a
+    # long pendant and places it in the middle of the target lobe.  Target
+    # ROIs are deliberately ignored for this measurement: they are source-
+    # side search envelopes and can crop the real target lobe.
+    left_src_y, left_src_x, left_src_valid = _earring_top_attachment(left_ring)
+    right_src_y, right_src_x, right_src_valid = _earring_top_attachment(right_ring)
+    left_tgt_y, left_tgt_x, left_tgt_valid = _ear_bottom_attachment(target_left_ear_mask)
+    right_tgt_y, right_tgt_x, right_tgt_valid = _ear_bottom_attachment(target_right_ear_mask)
 
     left_valid = left_src_valid & left_tgt_valid & (left_ring.flatten(1).sum(dim=1) > 1.0)
     right_valid = right_src_valid & right_tgt_valid & (right_ring.flatten(1).sum(dim=1) > 1.0)
@@ -5779,8 +5881,13 @@ class EarAnchoredQueryBuilder(nn.Module):
             ).flatten(1).sum(dim=1) / probe_area
             area_scale = float(side_roi.shape[-1] * side_roi.shape[-2]) / float(256 * 256)
 
+            # A narrow exposed lobe is still sufficient to recover an
+            # earring.  The old full ``min_target_ear_area`` threshold made
+            # one- to a few-pixel lobes look covered and suppressed the whole
+            # side during both dataset generation and inference.
             parser_visible = (
-                visible_ear_area >= float(self.min_target_ear_area) * area_scale
+                visible_ear_area
+                >= max(1.0, 0.10 * float(self.min_target_ear_area) * area_scale)
             )
             # Target-side openness is a hard safety contract.  Generic cheek
             # skin inside an expanded ear ROI is not proof that the target
