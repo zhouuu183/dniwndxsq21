@@ -589,6 +589,8 @@ class TrainerV5:
 
         vis_dir = self.args.checkpoint_dir / "val_images" / epoch_tag
         vis_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = self.args.checkpoint_dir / "val_final_images" / epoch_tag
+        final_dir.mkdir(parents=True, exist_ok=True)
         with open(vis_dir / "columns.txt", "w", encoding="utf-8") as file:
             file.write(" | ".join(VAL_COLUMNS) + "\n")
 
@@ -596,8 +598,16 @@ class TrainerV5:
         np.random.seed(1927)
         indices = np.random.choice(len(files), size=min(len(files), preview_count), replace=False)
         for order, idx in enumerate(indices):
-            image = image_grid(list(map(T.functional.to_pil_image, files[idx])), 1, len(files[idx]))
+            preview_row, final_image = files[idx]
+            image = image_grid(
+                list(map(T.functional.to_pil_image, preview_row)),
+                1,
+                len(preview_row),
+            )
             image.save(vis_dir / f"val_{order:03d}.png")
+            T.functional.to_pil_image(final_image).save(
+                final_dir / f"final_{order:03d}.png"
+            )
 
     @staticmethod
     def update_preview_buffer(buffer, sample, seen_count, max_count):
@@ -858,7 +868,10 @@ class TrainerV5:
                 ]
                 preview_seen = self.update_preview_buffer(
                     preview_files,
-                    preview_row,
+                    (
+                        preview_row,
+                        ((gen_im_F[idx] + 1) / 2).detach().cpu().clamp(0, 1),
+                    ),
                     preview_seen,
                     preview_count,
                 )
@@ -880,7 +893,7 @@ class TrainerV5:
             self.save_validation_images(preview_files, epoch_tag)
             np.random.seed(1927)
             indices = np.random.choice(len(preview_files), size=min(len(preview_files), preview_count), replace=False)
-            images_to_log = [image_grid(list(map(T.functional.to_pil_image, preview_files[idx])), 1, len(preview_files[idx]))
+            images_to_log = [image_grid(list(map(T.functional.to_pil_image, preview_files[idx][0])), 1, len(preview_files[idx][0]))
                              for idx in indices]
             self.logger.log_scalars({"val images": [wandb.Image(image) for image in images_to_log]})
 
