@@ -205,6 +205,12 @@ def get_parser():
     parser.add_argument("--satd_background_hair_edge_strength", type=float, default=1.0)
     parser.add_argument("--satd_background_residual_strength", type=float, default=1.25)
     parser.add_argument("--satd_background_alpha_feather", type=int, default=7)
+    parser.add_argument(
+        "--satd_earring_protect_dilate",
+        type=int,
+        default=7,
+        help="Source earring guard radius applied before SATD modifies the F feature.",
+    )
     parser.add_argument("--eq8_reference_blend_v8", type=float, default=0.0)
     parser.add_argument("--target_hair_close_kernel", type=int, default=9)
     parser.add_argument("--target_hair_hole_max_area", type=float, default=None)

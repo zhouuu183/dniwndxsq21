@@ -286,6 +286,8 @@ def retain_single_earring_group_v6(
     Keep the component attached to the lobe and only nearby, vertically
     aligned continuation pieces. This preserves segmented long pendants while
     rejecting a second same-side accessory or a detached background strand.
+    The accepted chain always has a finite downward extent; it is not an
+    unbounded vertical rail through the source background.
     """
     if cv2 is None:
         return torch.zeros_like(mask)
@@ -352,7 +354,15 @@ def retain_single_earring_group_v6(
         # Extend only downward, in short locally connected steps.  The extent
         # grows from the accepted object, so a remote lateral strand cannot be
         # admitted merely because it lies in a long fixed rail.
-        dynamic_limit = None if max_downward_extent is None else float(max_downward_extent)
+        # 150px at 256px resolution is large enough for an ordinary long
+        # pendant while still preventing a lobe-rooted component from walking
+        # down an arbitrary background chain.  Callers can request a smaller
+        # finite limit, but never an unbounded one.
+        dynamic_limit = (
+            max(16.0 * scale, min(150.0 * scale, 0.60 * value.shape[-2]))
+            if max_downward_extent is None
+            else max(1.0, float(max_downward_extent))
+        )
         accepted_ids = {root_id}
         changed = True
         while changed:
@@ -1077,25 +1087,14 @@ def extract_source_native_earring_v6(
                     & (bg_support >= 2.0)
                     & (bg_distance <= 20.0)
                 )
-                # Parser/GrabCut often expands a label-9 seed into the
-                # neighbouring earlobe or fine source strands.  Those pixels
-                # are not an earring and must never become RGB alpha.  A
-                # source-hair-backed edge is now matte-corrected below rather
-                # than copied verbatim, while a real pendant outside the ear
-                # remains eligible through the measured continuation checks.
-                trusted_object_pixels = parser_side | seed_side | trusted_core
-                hair_guard = cv2.dilate(
-                    semantic_hair.astype(np.uint8),
-                    np.ones((2 * matte_radius + 1, 2 * matte_radius + 1), np.uint8),
-                    1,
-                ).astype(bool)
-                hair_leak = hair_guard & ~trusted_object_pixels
-                # A verified visual component may be labelled ear/skin by the
-                # parser.  Do not delete those accepted pixels merely because
-                # they are not in the coarse label-9/seed prior; the component
-                # has already passed lobe, material and connectivity checks.
-                skin_leak = semantic_skin & ~trusted_object_pixels & ~selected_mask
-                selected_mask &= ~(background_halo | hair_leak | skin_leak)
+                # Parser labels were already considered while scoring the
+                # lobe-rooted components.  They must not become a final
+                # pixel-level veto: a valid long pendant is often labelled
+                # hair, neck or background after it leaves the ear shell.
+                # Keep only the measured local-background halo rejection;
+                # this removes source backdrop fringe without shaving a
+                # verified object contour.
+                selected_mask &= ~background_halo
 
             final_alpha = selected_mask.astype(np.float32)
             # The source boundary is generally antialiased over its original

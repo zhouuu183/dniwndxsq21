@@ -189,7 +189,7 @@ def main(args):
         raise RuntimeError(f"Dataset item is missing required keys: {', '.join(missing)}")
     if not bool(item["direct_satd_pp_input"]):
         raise RuntimeError(
-            "This trace expects a schema-35 direct-SATD dataset item. "
+            "This trace expects a schema-37 direct-SATD dataset item. "
             "Regenerate with pp_gen_v6.py --direct_satd_pp_input true."
         )
 
@@ -471,6 +471,8 @@ def main(args):
         ("source_component_labels", "19_source_component_ids.png", "SOURCE_NATIVE"),
         ("source_selected_components", "20_source_accepted_component_ids.png", "SOURCE_NATIVE"),
         ("final_hole_alpha", "21_final_hole_alpha.png", "TARGET_OUTPUT"),
+        ("pp_existing_earring_mask", "22_pp_existing_earring_mask.png", "TARGET_OUTPUT"),
+        ("pp_duplicate_clear_mask", "23_pp_duplicate_clear_mask.png", "TARGET_OUTPUT"),
     ):
         value = v6_aux.get(key) if isinstance(v6_aux, dict) else None
         if torch.is_tensor(value):
@@ -505,6 +507,9 @@ def main(args):
         "fallback_zero_shift_used_right",
         "target_lobe_hair_cover_ratio_left",
         "target_lobe_hair_cover_ratio_right",
+        "target_lobe_fully_covered_left",
+        "target_lobe_fully_covered_right",
+        "v6_outside_authorized_write_area",
         "source_root_component_id",
         "source_accepted_component_count",
         "source_rejected_component_count",
@@ -538,9 +543,11 @@ def main(args):
 10b_source_earring_structured_alpha.png: validated source-lobe structured instance used to complete native alpha.
 13/14_v6_source_selected_*_alpha.png: final per-side source masks before target anchoring.
 15/16_v6_target_aligned_*_alpha.png: each source side after its one target-lobe alignment.
+22_pp_existing_earring_mask.png: label-9 accessory already present in the raw PP image.
+23_pp_duplicate_clear_mask.png: only detached PP accessory pixels restored from the completed transfer.
 output_v19_target_left_visible_ear.png / output_v19_target_right_visible_ear.png: per-side target-ear visibility gates.
 metrics.txt also records raw/accepted alignment, source component counts/rejection
-reason, target lobe hair-cover ratios, and zero-shift fallback diagnostics.
+reason, target lobe hair-cover ratios, fully-covered decisions, and zero-shift fallback diagnostics.
 """
     (output / "README.txt").write_text(manifest, encoding="utf-8")
     (output / "metrics.txt").write_text(

@@ -40,12 +40,12 @@ CLEANUP_MASK_KEYS = (
     "M_remove_neck",
     "M_remove_context",
 )
-# Must match ``scripts/pp_gen_v6.py``. Schema 35 stores the SATD-rendered
+# Must match ``scripts/pp_gen_v6.py``. Schema 37 stores the SATD-rendered
 # image as the direct PP target; every training/validation pass decodes its
 # own PP S/F and never applies a second SATD residual.
-# Schema 35 stores ``source_earring_object_mask`` in SOURCE_NATIVE
+# Schema 37 stores ``source_earring_object_mask`` in SOURCE_NATIVE
 # coordinates; schema-32 serialized the target-aligned mask under that name.
-PP_DATASET_SCHEMA_VERSION = 35
+PP_DATASET_SCHEMA_VERSION = 37
 PP_EXTRA_MASK_KEYS = (
     "cleanup_inner_edge",
     "revealed_skin_mask",
@@ -1960,6 +1960,7 @@ class PPDatasetV5(Dataset):
             ("alignment_valid_left", "alignment_valid_right"),
             ("fallback_zero_shift_used_left", "fallback_zero_shift_used_right"),
             ("target_lobe_hair_cover_ratio_left", "target_lobe_hair_cover_ratio_right"),
+            ("target_lobe_fully_covered_left", "target_lobe_fully_covered_right"),
         ):
             if left_key in sample and right_key in sample:
                 sample[left_key], sample[right_key] = sample[right_key], sample[left_key]
@@ -1976,7 +1977,7 @@ class PPDatasetV5(Dataset):
         if not torch.is_tensor(completed_hair_highres):
             raise RuntimeError(
                 "V6 dataset item is missing completed_hair_highres. "
-                "Regenerate the complete schema-35 V6 dataset before training."
+                "Regenerate the complete schema-37 V6 dataset before training."
             )
         if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
             raise RuntimeError(
@@ -1991,7 +1992,7 @@ class PPDatasetV5(Dataset):
         if not torch.is_tensor(satd_background_highres):
             raise RuntimeError(
                 "V6 dataset item is missing satd_background_highres. "
-                "Regenerate the complete schema-35 V6 dataset before training."
+                "Regenerate the complete schema-37 V6 dataset before training."
             )
         if satd_background_highres.ndim != 3 or satd_background_highres.size(0) != 3:
             raise RuntimeError(
@@ -2005,7 +2006,7 @@ class PPDatasetV5(Dataset):
         if "direct_satd_pp_input" not in item:
             raise RuntimeError(
                 "V6 dataset item is missing direct_satd_pp_input. "
-                "Regenerate the schema-35 direct-SATD dataset before training."
+                "Regenerate the schema-37 direct-SATD dataset before training."
             )
         direct_satd_pp_input = item["direct_satd_pp_input"]
         if torch.is_tensor(direct_satd_pp_input):
@@ -2076,6 +2077,12 @@ class PPDatasetV5(Dataset):
             ).clone(),
             "target_lobe_hair_cover_ratio_right": item.get(
                 "target_lobe_hair_cover_ratio_right", torch.zeros(1)
+            ).clone(),
+            "target_lobe_fully_covered_left": item.get(
+                "target_lobe_fully_covered_left", torch.zeros(1)
+            ).clone(),
+            "target_lobe_fully_covered_right": item.get(
+                "target_lobe_fully_covered_right", torch.zeros(1)
             ).clone(),
             "fallback_zero_shift_used_left": item.get(
                 "fallback_zero_shift_used_left", torch.zeros(1)

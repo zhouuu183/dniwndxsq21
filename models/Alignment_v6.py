@@ -6,6 +6,11 @@ from models.CtrlHair.shape_branch.solver import get_hair_face_code, get_new_shap
 from models.Net import get_segmentation
 from models.SATD_v8 import SATD_v8
 from models.sean_codes.models.pix2pix_model import decode_sean, encode_sean
+from models.earring_foreground_v6 import (
+    EarringCoordinateSpace,
+    extract_source_native_earring_v6,
+)
+from models.ear_modules_v5 import build_source_earring_instance_masks_v5
 from utils.mask_delta_v8 import (
     build_delta_masks,
     drop_parsing_labels,
@@ -121,6 +126,111 @@ class AlignmentV6(Alignment):
         support = (support * (1.0 - 0.84 * body_preserve)).clamp(0, 1)
         support = (support * (1.0 - 0.72 * detail_protect)).clamp(0, 1)
         return F.interpolate(support.float(), size=out_hw, mode="bicubic", align_corners=False).clamp(0, 1)
+
+    def _source_earring_satd_protection(
+        self,
+        name_to_embed: dict[str, dict[str, torch.Tensor]],
+        image_key: str,
+        out_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a source-coordinate earring guard for the SATD F edit.
+
+        ``M_remove`` describes source-hair pixels that disappear in the target
+        hairstyle.  A source earring can occupy those same pixels, especially
+        a long pendant over source hair/background.  SATD must not rewrite that
+        evidence before the later native-object compositor has a chance to
+        restore it.  The guard is source-only and therefore never authorizes
+        an ear/face/background crop as output alpha.
+        """
+        image = name_to_embed[image_key]["image_256"]
+        source_mask = name_to_embed[image_key].get("mask")
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if source_mask is None:
+            zero = torch.zeros(
+                image.size(0), 1, *image.shape[-2:],
+                device=image.device,
+                dtype=image.dtype,
+            )
+            return zero, F.interpolate(zero, size=out_hw, mode="nearest")
+        parsing = source_mask
+        if parsing.ndim == 3:
+            parsing = parsing.unsqueeze(1)
+        parsing = parsing.to(device=image.device).long()
+        # Keep the parser's native resolution for thin pendants.  Reducing a
+        # 512px label map to 256px before extraction can erase a one-pixel
+        # wire/pendant, which would let SATD edit precisely the region that
+        # later needs earring recovery.
+        if parsing.shape[-2:] != image.shape[-2:]:
+            work_image = F.interpolate(
+                image,
+                size=parsing.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            work_image = image
+
+        # Label 9 is the strongest parser evidence.  The native extractor adds
+        # parser-missed high-contrast pendant pixels while retaining its normal
+        # one-side/connected-component/background checks.
+        parser_seed = (parsing == 9).to(dtype=work_image.dtype)
+        source_object = parser_seed
+        try:
+            extracted = extract_source_native_earring_v6(
+                work_image,
+                parsing,
+                source_native_seed=parser_seed,
+                seed_space=EarringCoordinateSpace.SOURCE_CANONICAL,
+                max_graph_depth=4,
+                max_cumulative_cost=1.85,
+                allow_long_continuation=True,
+            )
+            source_object = torch.maximum(
+                source_object,
+                extracted["source_native_earring_alpha"].to(
+                    device=work_image.device,
+                    dtype=work_image.dtype,
+                ),
+            ).clamp(0, 1)
+            structured = build_source_earring_instance_masks_v5(
+                work_image,
+                parsing,
+                source_hair_mask=(parsing == 17).to(dtype=work_image.dtype),
+                source_seed_mask=parser_seed,
+            )
+            for key in ("left_instance_mask", "right_instance_mask", "instance_mask"):
+                value = structured.get(key)
+                if torch.is_tensor(value):
+                    source_object = torch.maximum(
+                        source_object,
+                        value.to(device=work_image.device, dtype=work_image.dtype),
+                    ).clamp(0, 1)
+        except (RuntimeError, ValueError, KeyError):
+            # The parser seed remains a valid conservative guard if optional
+            # OpenCV/native extraction is unavailable during data inspection.
+            pass
+
+        protect_radius = max(1, int(getattr(self.opts, "satd_earring_protect_dilate", 7)))
+        protect_radius = max(
+            1,
+            int(round(protect_radius * max(parsing.shape[-2:]) / 256.0)),
+        )
+        protected_256 = F.max_pool2d(
+            source_object,
+            kernel_size=2 * protect_radius + 1,
+            stride=1,
+            padding=protect_radius,
+        ).clamp(0, 1)
+        protected_256 = F.adaptive_max_pool2d(
+            protected_256,
+            output_size=(image.shape[-2], image.shape[-1]),
+        ).clamp(0, 1)
+        protected_feature = F.adaptive_max_pool2d(
+            protected_256,
+            output_size=out_hw,
+        ).clamp(0, 1)
+        return protected_256, protected_feature
 
     @torch.inference_mode()
     def shape_module(self, im_name1: str, im_name2: str, name_to_embed, only_target=True, **kwargs):
@@ -475,30 +585,81 @@ class AlignmentV6(Alignment):
             and self.satd_model_v8 is not None
             and name_to_embed[im_name1]["image_256"] is not name_to_embed[im_name2]["image_256"]
         ):
+            # Prevent SATD from editing an earring that happens to overlap
+            # M_remove.  This guard must be applied to the network's input
+            # masks, not only to the residual after SATD has already changed F.
+            earring_protect_256, earring_protect_feature = self._source_earring_satd_protection(
+                name_to_embed,
+                im_name1,
+                out_hw=latent_F_base.shape[-2:],
+            )
+            satd_masks_256 = satd_features["cleanup_masks_256"]
+            if tuple(earring_protect_256.shape[-2:]) != tuple(satd_masks_256.shape[-2:]):
+                earring_protect_256 = F.interpolate(
+                    earring_protect_256,
+                    size=satd_masks_256.shape[-2:],
+                    mode="nearest",
+                )
+            satd_masks_256 = satd_masks_256 * (1.0 - earring_protect_256).clamp(0, 1)
             satd_out, _ = self.satd_model_v8(
                 F_base=latent_F_base,
                 F_src=satd_features["latent_F_src"],
                 F_src_inpaint=satd_features["latent_F_src_inpaint"],
-                cleanup_masks_256=satd_features["cleanup_masks_256"],
+                cleanup_masks_256=satd_masks_256,
                 source_rgb_256=satd_features["source_image_256"],
             )
+            protected_delta_masks = dict(satd_features["delta_masks"])
+            for key in (
+                "M_boundary", "M_remove", "M_remove_halo", "M_remove_tail",
+                "M_remove_face", "M_remove_neck", "M_remove_context",
+            ):
+                value = protected_delta_masks.get(key)
+                if torch.is_tensor(value):
+                    guard = earring_protect_256
+                    if tuple(guard.shape[-2:]) != tuple(value.shape[-2:]):
+                        guard = F.interpolate(guard, size=value.shape[-2:], mode="nearest")
+                    protected_delta_masks[key] = value * (1.0 - guard).clamp(0, 1)
             cleanup_support = self._cleanup_support_from_delta_masks(
-                satd_features["delta_masks"],
+                protected_delta_masks,
                 out_hw=latent_F_base.shape[-2:],
             )
+            # This is the critical ordering: protect the source earring before
+            # applying SATD's residual to F.  The later target-side compositor
+            # still decides whether the lobe is visible, but an earring that
+            # happens to overlap M_remove is no longer erased upstream.
+            cleanup_support = (
+                cleanup_support * (1.0 - earring_protect_feature).clamp(0, 1)
+            ).clamp(0, 1)
             satd_blend = kwargs.get("satd_blend_v8", getattr(self.opts, "satd_blend_v8", 0.28))
             latent_F_satd = latent_F_base + satd_blend * cleanup_support * (satd_out - latent_F_base)
             satd_applied = True
+            satd_delta_masks = protected_delta_masks
+        else:
+            earring_protect_256 = torch.zeros(
+                name_to_embed[im_name1]["image_256"].size(0),
+                1,
+                *name_to_embed[im_name1]["image_256"].shape[-2:],
+                device=latent_F_base.device,
+                dtype=latent_F_base.dtype,
+            )
+            earring_protect_feature = torch.zeros(
+                latent_F_base.size(0), 1, *latent_F_base.shape[-2:],
+                device=latent_F_base.device,
+                dtype=latent_F_base.dtype,
+            )
+            satd_delta_masks = satd_features["delta_masks"]
 
         return {
             "latent_F_base": latent_F_base,
             "latent_F_satd": latent_F_satd,
             "satd_applied": satd_applied,
             "HM_X": baseline_alignment["HM_X"],
-            "delta_masks": satd_features["delta_masks"],
+            "delta_masks": satd_delta_masks,
             "source_image_256": satd_features["source_image_256"],
             "source_inpaint_256": satd_features["source_inpaint_256"],
             "shape_inpaint_256": satd_features["shape_inpaint_256"],
+            "earring_protect_mask_256": earring_protect_256,
+            "earring_protect_mask_feature": earring_protect_feature,
         }
 
     @torch.inference_mode()

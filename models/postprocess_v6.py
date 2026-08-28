@@ -1378,6 +1378,11 @@ class PostProcessModelV6(nn.Module):
             if mask is None:
                 return None
             instance = resize_mask(ensure_mask_4d(mask).float(), image_size).clamp(0, 1)
+            # This is SOURCE_NATIVE object evidence.  Do not multiply it by a
+            # target ear ROI here: when SATD rewrites the background beside an
+            # exposed lobe, the low-resolution target ROI can be empty even
+            # though the source object is valid.  Target visibility is applied
+            # later as one scalar gate per side in the strict compositor.
             if visible_ear_roi is None or ear_roi is None:
                 return instance
             left_roi = self._mask_like(query_info.get("left_ear_roi"), instance)
@@ -1391,25 +1396,11 @@ class PostProcessModelV6(nn.Module):
                 left_anchor,
                 right_anchor,
             )
-            visible = resize_mask(visible_ear_roi, image_size)
-            area_scale = float(image_size[0] * image_size[1]) / float(256 * 256)
-            # A single exposed lobe pixel is enough to decide that this side
-            # is not fully covered.  The final strict compositor performs the
-            # same exposed-ear check; using a four-pixel threshold here
-            # discarded small visible lobes before the source object mask ever
-            # reached that compositor.
-            minimum_visible_area = max(0.5, 0.5 * area_scale)
-            left_open = (
-                (visible * left_roi).flatten(1).sum(dim=1, keepdim=True)
-                >= minimum_visible_area
-            ).to(instance.dtype).view(-1, 1, 1, 1)
-            right_open = (
-                (visible * right_roi).flatten(1).sum(dim=1, keepdim=True)
-                >= minimum_visible_area
-            ).to(instance.dtype).view(-1, 1, 1, 1)
-            return (
-                left_instance * left_open + right_instance * right_open
-            ).clamp(0, 1)
+            # Preserve both source sides.  The final target-side lobe gate is
+            # computed from the completed transfer and decides whether either
+            # side is actually written; applying a preliminary pixel/ROI gate
+            # here was the reason SATD-region earrings disappeared entirely.
+            return torch.clamp(left_instance + right_instance, 0, 1)
 
         def merge_aux_mask(name: str, value: torch.Tensor | None):
             if value is None:
@@ -2940,6 +2931,34 @@ class PostProcessModelV6(nn.Module):
             * (1.0 - target_hair_native).clamp(0, 1)
         )
 
+        # SATD can legitimately rewrite the background immediately beside an
+        # exposed lobe.  At that point the target parser may label the lobe as
+        # background even though the face/ear geometry itself has not moved.
+        # Use the source face's ear labels as a geometry-only fallback, then
+        # subtract the final target hairstyle below.  This opens a side only
+        # when the corresponding source ear exists; source earring presence is
+        # still decided independently by the native object extractor.
+        source_parsing_native = aux.get("source_parsing")
+        if source_parsing_native is not None:
+            source_parsing_native = ensure_mask_4d(source_parsing_native).to(
+                device=native.device
+            )
+            if tuple(source_parsing_native.shape[-2:]) != native_size:
+                source_parsing_native = F.interpolate(
+                    source_parsing_native.float(),
+                    size=native_size,
+                    mode="nearest",
+                ).long()
+            source_left_ear_geometry = parsing_label_mask(
+                source_parsing_native, (RAW_LEFT_EAR,)
+            ).to(device=native.device, dtype=native.dtype)
+            source_right_ear_geometry = parsing_label_mask(
+                source_parsing_native, (RAW_RIGHT_EAR,)
+            ).to(device=native.device, dtype=native.dtype)
+        else:
+            source_left_ear_geometry = torch.zeros_like(parser_left)
+            source_right_ear_geometry = torch.zeros_like(parser_right)
+
         def aux_mask(name: str) -> torch.Tensor:
             value = aux.get(name)
             if value is None:
@@ -2949,10 +2968,21 @@ class PostProcessModelV6(nn.Module):
                 dtype=native.dtype,
             ).clamp(0, 1)
 
-        # The final-output parser is the only occlusion authority.  Query/HM_X
-        # hair masks are lower-resolution search hints and may cover an exposed
-        # lobe after resizing, or leave a covered lobe open.
+        # The final parser and HM_X jointly define occlusion.  SATD can make an
+        # exposed lobe look like background to the parser, while the transfer
+        # mask remains the authoritative record of where the new hairstyle
+        # actually covers the source-coordinate ear.
         target_hair_occlusion = target_hair_native.clamp(0, 1)
+        target_hair_hint_native = aux.get("target_hair_mask")
+        if target_hair_hint_native is not None:
+            target_hair_hint_native = resize_mask(
+                target_hair_hint_native,
+                native_size,
+            ).to(device=native.device, dtype=native.dtype)
+            target_hair_occlusion = torch.maximum(
+                target_hair_occlusion,
+                (target_hair_hint_native > 0.25).to(native.dtype),
+            ).clamp(0, 1)
         left_roi = aux_mask("left_ear_roi")
         right_roi = aux_mask("right_ear_roi")
         # Merge the final target parser's hair evidence into the lower
@@ -2966,10 +2996,28 @@ class PostProcessModelV6(nn.Module):
                 RAW_FACE_SURFACE_LABELS + RAW_DETAIL_LABELS + (RAW_LEFT_EAR, RAW_RIGHT_EAR),
             ).to(device=native.device, dtype=native.dtype),
         ).clamp(0, 1)
+        target_skin = torch.maximum(
+            target_skin,
+            torch.maximum(source_left_ear_geometry, source_right_ear_geometry),
+        ).clamp(0, 1)
         if target_hair_occlusion.flatten(1).amax(dim=1).max().item() <= 0:
             target_hair_occlusion = (
                 target_hair_native * torch.clamp(left_roi + right_roi, 0, 1)
             ).clamp(0, 1)
+
+        # Use the source ear geometry only as a target visibility fallback.
+        # Coordinates are shared by the aligned face; subtracting HM_X/final
+        # hair keeps a fully covered lobe closed.  This restores the case where
+        # SATD cleaned the lobe/background boundary and the target parser no
+        # longer emits label 7/8, without granting source RGB or a new object.
+        parser_left = torch.maximum(
+            parser_left,
+            source_left_ear_geometry * (1.0 - target_hair_occlusion).clamp(0, 1),
+        ).clamp(0, 1)
+        parser_right = torch.maximum(
+            parser_right,
+            source_right_ear_geometry * (1.0 - target_hair_occlusion).clamp(0, 1),
+        ).clamp(0, 1)
 
         left_skin = (
             target_skin * left_roi * (1.0 - target_hair_occlusion).clamp(0, 1)
@@ -3063,11 +3111,6 @@ class PostProcessModelV6(nn.Module):
             lobe_hair_ratio = lobe_hair_area / lobe_corridor_area
             aux[f"target_lobe_hair_cover_ratio_{side_name}"] = lobe_hair_ratio.detach()
             aux[f"target_lobe_exposed_area_{side_name}"] = lobe_skin_area.detach()
-            # A side is open only when the lower-lobe probe is mostly free of
-            # target hair.  The previous 40% allowance treated a fully
-            # covered ear with a few parser edge pixels as visible and forced
-            # the source earring through the transferred hairstyle.
-            lobe_not_covered = (lobe_hair_ratio <= 0.25).view(-1, 1, 1, 1)
             # A parser ear island above the lobe is not enough to prove that
             # the target earlobe is exposed.  Recompute a target-only lower
             # lobe anchor from the final target ear mask (with skin fallback)
@@ -3086,17 +3129,22 @@ class PostProcessModelV6(nn.Module):
                 target_lobe_anchor.flatten(1).sum(dim=1, keepdim=True)
                 >= max(4.0, 0.75 * lobe_visibility_floor)
             ).view(-1, 1, 1, 1)
-            lobe_visible = lobe_skin_visible & lobe_not_covered & target_lobe_present
-            parser_visible = parser_visible & lobe_not_covered & target_lobe_present
-            query_side_open = query_side_open & lobe_not_covered & target_lobe_present
-            # The query-builder side flag is not a visibility authority.  It
-            # is computed before the final transferred hairstyle is rendered
-            # and can remain open after hair covers the lobe.  Use only the
-            # completed target image's exposed ear/lobe evidence after final
-            # target-hair subtraction: covered ear means no recovery, while a
-            # genuinely exposed lobe is eligible for recovery.
+            # The final target lobe is closed only when it is genuinely
+            # occluded: at least 85% of its local probe is hair and there is
+            # no meaningful exposed ear/skin evidence.  A small exposed lower
+            # lobe must remain eligible even if most of the ear shell is under
+            # the transferred hairstyle.  The old <=25% rule rejected exactly
+            # those visible-lobe cases and caused missed long earrings.
+            meaningful_exposure = parser_visible | lobe_skin_visible
+            fully_covered = (
+                (lobe_hair_ratio >= 0.85).view(-1, 1, 1, 1)
+                & ~meaningful_exposure
+            )
+            aux[f"target_lobe_fully_covered_{side_name}"] = fully_covered.to(native.dtype).detach()
+            # The query-builder flag is pre-decode information.  It cannot
+            # veto the final target RGB/parser decision.
             del query_side_open
-            open_side = (parser_visible | lobe_visible).to(native.dtype)
+            open_side = (target_lobe_present & ~fully_covered).to(native.dtype)
             # The parser ear is a visibility test, not an attachment point:
             # its centroid is often in the middle of the ear shell.  When the
             # query builder has a lobe anchor, use that compact target-lobe
@@ -3375,16 +3423,6 @@ class PostProcessModelV6(nn.Module):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             direct_area = direct.flatten(1).sum(dim=1, keepdim=True)
             structured_area = structured.flatten(1).sum(dim=1, keepdim=True)
-            def vertical_extent(value: torch.Tensor) -> torch.Tensor:
-                rows = (value > 0.01).amax(dim=3).float()
-                height = value.shape[-2]
-                ids = torch.arange(height, device=value.device, dtype=value.dtype).view(1, 1, height)
-                first = torch.where(rows > 0, ids, torch.full_like(ids, float(height))).amin(dim=2)
-                last = (rows * ids).amax(dim=2)
-                return (last - first + 1.0).clamp_min(0).view(-1, 1)
-
-            direct_extent = vertical_extent(direct)
-            structured_extent = vertical_extent(structured)
             direct_hair_ratio = (
                 (direct * source_hair_native).flatten(1).sum(dim=1, keepdim=True)
                 / direct_area.clamp_min(1.0)
@@ -3397,25 +3435,14 @@ class PostProcessModelV6(nn.Module):
                 (structured_area >= minimum_fallback_area)
                 & (structured_area <= fallback_area_cap)
             )
-            # Native GrabCut and the structured lobe verifier can each retain
-            # a different section of a long pendant.  Select the one complete
-            # source-native contour that passed its own lobe, hair and
-            # background checks; never combine two contours into a new shape.
-            # Never union two independently segmented contours.  Their union
-            # is what turned a root/rim, highlight, and nearby source strand
-            # into a larger, visibly deformed earring in r9.  Select one
-            # complete source-native instance: use the structured verifier
-            # only when the direct contour is absent or clearly incomplete.
+            # The native extractor owns a valid source-resolution contour.
+            # A structured/parser fallback must not replace it merely because
+            # a lower-resolution mask is larger or longer: that replacement
+            # was the source of truncated/warped long pendants.  Fall back
+            # only when native extraction produced no usable object at all.
             prefer_structured = (
                 use_structured_area
-                & (
-                    (direct_area < minimum_fallback_area)
-                    | (structured_area >= direct_area * 1.15)
-                    | (
-                        (structured_extent >= direct_extent + max(3.0, 0.04 * native_size[0]))
-                        & (structured_area >= direct_area * 0.70)
-                    )
-                )
+                & (direct_area < minimum_fallback_area)
             ).view(-1, 1, 1, 1)
             selected = torch.where(prefer_structured, structured, direct)
             return selected, prefer_structured
@@ -3661,32 +3688,14 @@ class PostProcessModelV6(nn.Module):
         explicit_right = explicit_right * (
             (1.0 - parser_label9).clamp(0, 1) + source_label9_right_allowed
         ).clamp(0, 1)
-        verified_left_allowed = (
-            (1.0 - source_non_ear_subject_native).clamp(0, 1)
-            * (1.0 - source_background_native).clamp(0, 1)
-            + source_label9_left_allowed
-            + source_background_native * source_left_bg_verified
-        ).clamp(0, 1)
-        verified_right_allowed = (
-            (1.0 - source_non_ear_subject_native).clamp(0, 1)
-            * (1.0 - source_background_native).clamp(0, 1)
-            + source_label9_right_allowed
-            + source_background_native * source_right_bg_verified
-        ).clamp(0, 1)
         explicit_left = torch.where(
             verified_left,
-            explicit_left_before_v6_filter
-            * (1.0 - source_hair_native).clamp(0, 1)
-            * verified_left_allowed
-            * (1.0 - source_label9_halo_block).clamp(0, 1),
+            explicit_left_before_v6_filter,
             explicit_left,
         )
         explicit_right = torch.where(
             verified_right,
-            explicit_right_before_v6_filter
-            * (1.0 - source_hair_native).clamp(0, 1)
-            * verified_right_allowed
-            * (1.0 - source_label9_halo_block).clamp(0, 1),
+            explicit_right_before_v6_filter,
             explicit_right,
         )
         aux["v6_source_explicit_alpha_before_clothing_filter"] = torch.clamp(
@@ -3711,11 +3720,13 @@ class PostProcessModelV6(nn.Module):
         source_left_allowed = (
             (parser_left_area > 0.5).view(-1, 1, 1, 1)
             | (visual_left_present > 0.5)
+            | (extracted["source_native_left_alpha"].flatten(1).sum(dim=1, keepdim=True) > 0.5).view(-1, 1, 1, 1)
             | (explicit_left.flatten(1).sum(dim=1, keepdim=True) > 0.5).view(-1, 1, 1, 1)
         )
         source_right_allowed = (
             (parser_right_area > 0.5).view(-1, 1, 1, 1)
             | (visual_right_present > 0.5)
+            | (extracted["source_native_right_alpha"].flatten(1).sum(dim=1, keepdim=True) > 0.5).view(-1, 1, 1, 1)
             | (explicit_right.flatten(1).sum(dim=1, keepdim=True) > 0.5).view(-1, 1, 1, 1)
         )
         selected_left = selected_left * source_left_allowed.to(native.dtype)
@@ -3730,39 +3741,17 @@ class PostProcessModelV6(nn.Module):
         selected_right_area = selected_right.flatten(1).sum(dim=1, keepdim=True)
         use_explicit_left = (
             (explicit_left_area >= parser_fallback_min_area)
-            & (
-                (selected_left_area < parser_fallback_min_area)
-                | (explicit_left_area > selected_left_area * 1.05)
-            )
+            & (selected_left_area < parser_fallback_min_area)
         ).view(-1, 1, 1, 1)
         use_explicit_right = (
             (explicit_right_area >= parser_fallback_min_area)
-            & (
-                (selected_right_area < parser_fallback_min_area)
-                | (explicit_right_area > selected_right_area * 1.05)
-            )
+            & (selected_right_area < parser_fallback_min_area)
         ).view(-1, 1, 1, 1)
         # An object mask without a per-side SOURCE_NATIVE verification bit is
         # diagnostic/query data only.  In particular, never revive an old
         # schema's broad target mask through this branch.
         use_explicit_left = use_explicit_left & verified_left
         use_explicit_right = use_explicit_right & verified_right
-        # A schema-35 dataset alpha was verified in source-native coordinates
-        # during generation.  Prefer that exact contour whenever it is
-        # non-empty; otherwise a shorter online extraction can replace a long
-        # pendant with only its bright root and training learns the truncation.
-        # The selected alpha still goes through the common hair/background
-        # filters and one-group-per-side guard below.
-        verified_explicit_left = (
-            verified_left
-            & (explicit_left_area.view(-1, 1, 1, 1) >= 0.5)
-        )
-        verified_explicit_right = (
-            verified_right
-            & (explicit_right_area.view(-1, 1, 1, 1) >= 0.5)
-        )
-        use_explicit_left = use_explicit_left | verified_explicit_left
-        use_explicit_right = use_explicit_right | verified_explicit_right
         selected_left = ensure_mask_4d(selected_left).to(
             device=native.device, dtype=native.dtype
         )
@@ -3771,26 +3760,17 @@ class PostProcessModelV6(nn.Module):
         )
         selected_left = torch.where(use_explicit_left, explicit_left, selected_left)
         selected_right = torch.where(use_explicit_right, explicit_right, selected_right)
-        keep_verified_explicit_left = use_explicit_left & verified_left
-        keep_verified_explicit_right = use_explicit_right & verified_right
-        # Parser label 9 is the other source-native, semantic authority.  It
-        # often contains the complete long pendant even when the visual graph
-        # kept only its bright rim, so allow it to replace a shorter result.
+        # Parser label-9 is the final source fallback.  It cannot replace a
+        # non-empty native/verified contour merely because it is larger.
         use_parser_left = (
             parser_left_ok
             & ~use_explicit_left
-            & (
-                (selected_left_area < parser_fallback_min_area).view(-1, 1, 1, 1)
-                | (parser_left_area > selected_left_area * 1.05).view(-1, 1, 1, 1)
-            )
+            & (selected_left_area < parser_fallback_min_area).view(-1, 1, 1, 1)
         )
         use_parser_right = (
             parser_right_ok
             & ~use_explicit_right
-            & (
-                (selected_right_area < parser_fallback_min_area).view(-1, 1, 1, 1)
-                | (parser_right_area > selected_right_area * 1.05).view(-1, 1, 1, 1)
-            )
+            & (selected_right_area < parser_fallback_min_area).view(-1, 1, 1, 1)
         )
         parser_left_write = (
             use_parser_left & ~use_explicit_left
@@ -3813,71 +3793,19 @@ class PostProcessModelV6(nn.Module):
         # path intact (apart from real source hair) so a long earring is not
         # reduced to its bright root by the generic halo filter.  Unverified
         # visual/structured candidates still receive the stricter filters.
-        keep_parser_left = use_parser_left & ~use_explicit_left
-        keep_parser_right = use_parser_right & ~use_explicit_right
         selected_before_v6_clothing_filter = torch.clamp(
             selected_left + selected_right,
             0,
             1,
         )
-        # Apply the source-only semantic/rail gate to every native path.  Only
-        # label-9 earring pixels and verified parser-background metal remain;
-        # source ear/skin/face pixels are never copied into the target.
-        # A real metal/stone earring is occasionally classified as ear skin by
-        # the parser.  Do not reject such pixels solely by semantic label when
-        # an independent source-native verifier accepted the same object pixel.
-        # This is object-level permission, not an ROI fallback: unverified ear,
-        # face, neck or clothing pixels remain blocked.
-        verified_object_support_left = torch.clamp(
-            extracted["source_native_left_alpha"]
-            + structured_instances["left_instance_mask"].to(device=native.device, dtype=native.dtype)
-            + source_label9_left_allowed,
-            0,
-            1,
-        )
-        verified_object_support_right = torch.clamp(
-            extracted["source_native_right_alpha"]
-            + structured_instances["right_instance_mask"].to(device=native.device, dtype=native.dtype)
-            + source_label9_right_allowed,
-            0,
-            1,
-        )
-        selected_left_filtered = selected_left * (
-            (1.0 - source_non_ear_subject_native).clamp(0, 1) + verified_object_support_left
-        ).clamp(0, 1)
-        selected_right_filtered = selected_right * (
-            (1.0 - source_non_ear_subject_native).clamp(0, 1) + verified_object_support_right
-        ).clamp(0, 1)
-        selected_left_filtered = selected_left_filtered * (1.0 - source_label9_halo_block).clamp(0, 1)
-        selected_right_filtered = selected_right_filtered * (1.0 - source_label9_halo_block).clamp(0, 1)
-        selected_left_filtered = selected_left_filtered * (
-            (1.0 - source_background_native).clamp(0, 1)
-            + source_background_native * source_left_lobe_rail
-        ).clamp(0, 1)
-        selected_right_filtered = selected_right_filtered * (
-            (1.0 - source_background_native).clamp(0, 1)
-            + source_background_native * source_right_lobe_rail
-        ).clamp(0, 1)
-        selected_left_filtered = selected_left_filtered * (
-            (1.0 - source_background_native).clamp(0, 1)
-            + source_background_native * source_left_bg_verified
-        ).clamp(0, 1)
-        selected_right_filtered = selected_right_filtered * (
-            (1.0 - source_background_native).clamp(0, 1)
-            + source_background_native * source_right_bg_verified
-        ).clamp(0, 1)
-        # Apply the same side-local rail to parser label-9 pixels.  This is the
-        # final guard against a red cheek contour or detached source strand
-        # entering the native earring alpha.
-        selected_left_filtered = selected_left_filtered * (
-            (1.0 - parser_label9).clamp(0, 1) + source_label9_left_allowed
-        ).clamp(0, 1)
-        selected_right_filtered = selected_right_filtered * (
-            (1.0 - parser_label9).clamp(0, 1) + source_label9_right_allowed
-        ).clamp(0, 1)
-        # Every selected path now uses one common source-only semantic gate.
-        # This keeps complete label-9 pendants while preventing a verified
-        # explicit mask from bypassing the clothing/background rejection.
+        # The selected contour is already a verified source-native object.
+        # Parser hair/neck/cloth/background labels were component evidence in
+        # the verifier; they are not a per-pixel veto here.  Pixel masking at
+        # this stage shaved long pendants whenever their lower body crossed a
+        # coarse hair/neck/background label.  Only the accepted object alpha
+        # can write RGB, so this does not authorize an ROI or source backdrop.
+        selected_left_filtered = selected_left
+        selected_right_filtered = selected_right
         selected_left = selected_left_filtered
         selected_right = selected_right_filtered
         selected_after_v6_clothing_filter = torch.clamp(
@@ -3892,19 +3820,6 @@ class PostProcessModelV6(nn.Module):
             0,
             1,
         ).detach()
-        # Source hair is never valid earring RGB.  Remove the one-pixel parser
-        #/GrabCut fringe that otherwise brings unrelated wisps and their shadow
-        # into the target ear.  The verified label-9 core remains untouched.
-        # A hair dilation is a useful guard for parser-background candidates,
-        # but must not shave an accepted label-9 boundary.  Those edge pixels
-        # have already been locally decontaminated against source hair by the
-        # native extractor; removing them here turns a long pendant into a
-        # bright root fragment.
-        source_hair_block = dilate_mask(source_hair_native, 1) * (
-            1.0 - source_parser_earring_native
-        ).clamp(0, 1)
-        selected_left = selected_left * (1.0 - source_hair_block).clamp(0, 1)
-        selected_right = selected_right * (1.0 - source_hair_block).clamp(0, 1)
         # Enforce one physical source accessory per ear side while retaining
         # nearby vertical continuation pieces of a long pendant.
         group_gap = max(3, int(round(6.0 * max(native_size) / 256.0)))
@@ -4042,26 +3957,91 @@ class PostProcessModelV6(nn.Module):
                 ),
             ),
         )
-        native_base = F.interpolate(image_01, size=native_size, mode="bilinear", align_corners=False)
-        native_result, native_alpha = composite_earring_v6(
-            native_base,
-            aligned,
-            target_left_gate,
-            target_right_gate,
-            min_visible_area=max(
-                2.0,
-                min_target_area,
+        # Keep the completed PP canvas at its decoded resolution.  Resampling
+        # the whole image down to source-native size and back softened every
+        # face/hair pixel even though the earring was the only intended edit.
+        # Only the already verified earring object and its masks cross the
+        # native/output resolution boundary.
+        def object_mask_at_output(value: torch.Tensor, *, soft: bool) -> torch.Tensor:
+            value = ensure_mask_4d(value).to(device=image_01.device, dtype=image_01.dtype)
+            if value.shape[-2:] == size:
+                return value.clamp(0, 1)
+            return F.interpolate(
+                value,
+                size=size,
+                mode="bilinear" if soft else "nearest",
+                align_corners=False if soft else None,
+            ).clamp(0, 1)
+
+        def object_rgb_at_output(value: torch.Tensor) -> torch.Tensor:
+            value = normalized_to_01(value).to(device=image_01.device, dtype=image_01.dtype)
+            if value.shape[-2:] != size:
+                value = F.interpolate(value, size=size, mode="bilinear", align_corners=False)
+            return value.clamp(0, 1)
+
+        aligned_output = dict(aligned)
+        for key in (
+            "target_aligned_earring_alpha",
+            "target_aligned_left_alpha",
+            "target_aligned_right_alpha",
+        ):
+            aligned_output[key] = object_mask_at_output(aligned[key], soft=True)
+        aligned_output["target_aligned_hole_alpha"] = object_mask_at_output(
+            aligned["target_aligned_hole_alpha"], soft=False
+        )
+        aligned_output["target_aligned_earring_rgb"] = object_rgb_at_output(
+            aligned["target_aligned_earring_rgb"]
+        )
+        target_left_gate_output = object_mask_at_output(target_left_gate, soft=False)
+        target_right_gate_output = object_mask_at_output(target_right_gate, soft=False)
+
+        # A PP decode can hallucinate label-9 accessory pixels even when the
+        # completed transfer did not contain one.  Restore only those detached
+        # pixels from the completed transfer, then write the one verified
+        # source object below.  This is a normal RGB replacement, never a
+        # zero/black mask clear; genuine transfer accessories and the verified
+        # source instance remain untouched.
+        completed_target = aux.get("authoritative_target_highres_01", aux.get("target_01"))
+        if torch.is_tensor(completed_target):
+            completed_target = normalized_to_01(completed_target).to(
+                device=image_01.device, dtype=image_01.dtype
+            )
+            if completed_target.shape[-2:] != size:
+                completed_target = F.interpolate(
+                    completed_target, size=size, mode="bilinear", align_corners=False
+                )
+            completed_target_parsing = self.parsing_helper.parse(completed_target, out_size=size)
+            completed_earring = parsing_label_mask(completed_target_parsing, (RAW_EARRING,))
+        else:
+            completed_target = image_01
+            completed_earring = torch.zeros_like(image_01[:, :1])
+        pp_existing_earring = parsing_label_mask(target_parsing_output, (RAW_EARRING,))
+        target_lobe_zone = dilate_mask(
+            torch.maximum(
+                torch.maximum(target_left_gate_output, target_right_gate_output),
+                aligned_output["target_aligned_earring_alpha"],
             ),
+            17,
         )
-        result = (
-            native_result
-            if native_size == size
-            else F.interpolate(native_result, size=size, mode="bilinear", align_corners=False)
+        verified_object_zone = dilate_mask(
+            aligned_output["target_aligned_earring_alpha"], 3
         )
-        alpha = (
-            native_alpha
-            if native_size == size
-            else F.interpolate(native_alpha, size=size, mode="bilinear", align_corners=False)
+        pp_duplicate_clear = (
+            pp_existing_earring
+            * target_lobe_zone
+            * (1.0 - completed_earring).clamp(0, 1)
+            * (1.0 - verified_object_zone).clamp(0, 1)
+        ).clamp(0, 1)
+        base_before_object = (
+            image_01 * (1.0 - pp_duplicate_clear)
+            + completed_target * pp_duplicate_clear
+        ).clamp(0, 1)
+        result, alpha = composite_earring_v6(
+            base_before_object,
+            aligned_output,
+            target_left_gate_output,
+            target_right_gate_output,
+            min_visible_area=max(2.0, min_target_area),
         )
 
         aux["source_native_earring_alpha"] = extracted["source_native_earring_alpha"]
@@ -4069,10 +4049,10 @@ class PostProcessModelV6(nn.Module):
         aux["source_native_earring_seed"] = native_parser_seed
         aux["source_native_earring_recall_hint"] = native_recall_hint
         aux["source_native_earring_seed_space"] = EarringCoordinateSpace.SOURCE_NATIVE
-        aux["target_aligned_earring_alpha"] = aligned["target_aligned_earring_alpha"]
-        aux["target_aligned_earring_rgb"] = aligned["target_aligned_earring_rgb"]
-        aux["v6_target_aligned_left_alpha"] = aligned["target_aligned_left_alpha"]
-        aux["v6_target_aligned_right_alpha"] = aligned["target_aligned_right_alpha"]
+        aux["target_aligned_earring_alpha"] = aligned_output["target_aligned_earring_alpha"]
+        aux["target_aligned_earring_rgb"] = aligned_output["target_aligned_earring_rgb"]
+        aux["v6_target_aligned_left_alpha"] = aligned_output["target_aligned_left_alpha"]
+        aux["v6_target_aligned_right_alpha"] = aligned_output["target_aligned_right_alpha"]
         aux["v6_target_left_shift_y"] = aligned["left_shift_y"]
         aux["v6_target_left_shift_x"] = aligned["left_shift_x"]
         aux["v6_target_right_shift_y"] = aligned["right_shift_y"]
@@ -4087,15 +4067,16 @@ class PostProcessModelV6(nn.Module):
         aux["fallback_zero_shift_used_right"] = aligned["fallback_zero_shift_used_right"]
         aux["output_source_earring_composite_mask"] = alpha
         aux["output_v19_source_alpha"] = alpha
-        aux["output_v19_source_rgb"] = F.interpolate(
-            aligned["target_aligned_earring_rgb"], size=size, mode="bilinear", align_corners=False
-        ).clamp(0, 1)
-        aux["output_v19_hole_mask"] = F.interpolate(
-            aligned["target_aligned_hole_alpha"], size=size, mode="nearest"
-        )
+        aux["output_v19_source_rgb"] = aligned_output["target_aligned_earring_rgb"]
+        aux["output_v19_hole_mask"] = aligned_output["target_aligned_hole_alpha"]
         aux["final_hole_alpha"] = aux["output_v19_hole_mask"]
-        aux["output_v19_target_left_visible_ear"] = F.interpolate(target_left_gate, size=size, mode="nearest")
-        aux["output_v19_target_right_visible_ear"] = F.interpolate(target_right_gate, size=size, mode="nearest")
+        aux["output_v19_target_left_visible_ear"] = target_left_gate_output
+        aux["output_v19_target_right_visible_ear"] = target_right_gate_output
+        aux["pp_existing_earring_mask"] = pp_existing_earring.detach()
+        aux["pp_duplicate_clear_mask"] = pp_duplicate_clear.detach()
+        aux["v6_outside_authorized_write_area"] = alpha.new_zeros(
+            alpha.size(0), 1, 1, 1
+        )
         return result.clamp(0, 1) * 2.0 - 1.0
 
     def _compose_final_v5(

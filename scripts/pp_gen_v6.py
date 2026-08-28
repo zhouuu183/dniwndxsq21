@@ -65,13 +65,13 @@ CLEANUP_MASK_KEYS = (
     "M_remove_neck",
     "M_remove_context",
 )
-# Schema 35 stores the SATD-rendered image as the direct PP target.  PP then
+# Schema 37 stores the SATD-rendered image as the direct PP target.  PP then
 # decodes that image live with the source, and no decoded-image SATD residual
 # is applied a second time.  Older parts are intentionally rejected because
 # they represent a different PP input contract.
-# Schema 35 also fixes ``source_earring_object_mask`` to SOURCE_NATIVE
+# Schema 37 also fixes ``source_earring_object_mask`` to SOURCE_NATIVE
 # coordinates; ``source_earring_mask`` remains TARGET_CANONICAL.
-DATASET_CONFIG_SCHEMA_VERSION = 35
+DATASET_CONFIG_SCHEMA_VERSION = 37
 DATASET_POLICY_FILES = (
     "scripts/pp_gen_v6.py",
     "hair_swap_v6.py",
@@ -987,7 +987,7 @@ class RenderedPairDataset(Dataset):
         if not torch.is_tensor(completed_hair_highres):
             raise RuntimeError(
                 "Rendered V6 dataset item is missing completed_hair_highres. "
-                "Regenerate this schema-35 dataset from the matching V6 generator."
+                "Regenerate this schema-37 dataset from the matching V6 generator."
             )
         if completed_hair_highres.ndim != 3 or completed_hair_highres.size(0) != 3:
             raise RuntimeError(
@@ -1002,7 +1002,7 @@ class RenderedPairDataset(Dataset):
         if not torch.is_tensor(satd_background_highres):
             raise RuntimeError(
                 "Rendered V6 dataset item is missing satd_background_highres. "
-                "Regenerate this schema-35 dataset from the matching V6 generator."
+                "Regenerate this schema-37 dataset from the matching V6 generator."
             )
         if satd_background_highres.ndim != 3 or satd_background_highres.size(0) != 3:
             raise RuntimeError(
@@ -1376,54 +1376,24 @@ class DatasetItemBatchBuilder:
             native_scale = max(source_native_size) / 256.0
             minimum_structured_area = max(8.0, 2.0 * native_scale * native_scale)
             maximum_structured_area = 0.10 * native_area
-            source_hair_full = parsing_label_mask(source_parsing_full, (RAW_HAIR,)).to(
-                device=source_full.device,
-                dtype=source_full.dtype,
-            )
-
             def prefer_structured_source_instance(
                 direct: torch.Tensor,
                 structured: torch.Tensor,
             ) -> tuple[torch.Tensor, torch.Tensor]:
                 structured = structured.to(device=source_full.device, dtype=source_full.dtype)
-                # A real source-hair pixel is not recoverable earring RGB.
-                structured = structured * (1.0 - source_hair_full).clamp(0, 1)
                 direct_area = direct.flatten(1).sum(dim=1, keepdim=True)
                 structured_area = structured.flatten(1).sum(dim=1, keepdim=True)
-                def vertical_extent(value: torch.Tensor) -> torch.Tensor:
-                    rows = (value > 0.01).amax(dim=3).float()
-                    height = value.shape[-2]
-                    ids = torch.arange(height, device=value.device, dtype=value.dtype).view(1, 1, height)
-                    first = torch.where(rows > 0, ids, torch.full_like(ids, float(height))).amin(dim=2)
-                    last = (rows * ids).amax(dim=2)
-                    return (last - first + 1.0).clamp_min(0).view(-1, 1)
-
-                direct_extent = vertical_extent(direct)
-                structured_extent = vertical_extent(structured)
                 use_structured_area = (
                     (structured_area >= minimum_structured_area)
                     & (structured_area <= maximum_structured_area)
                 )
-                # The native GrabCut graph and the source-lobe structured
-                # verifier observe different parts of a long pendant.  The
-                # old replacement rule discarded whichever observer had the
-                # shorter contour, which serialized only a root/rim into
-                # ``source_native_earring_alpha``.  A validated structured
-                # instance is object-only and source-lobe connected, so merge
-                # it only when the direct contour is absent or truncated;
-                # no ROI or unverified background pixels are introduced.
-                # Pick a complete verifier result
-                # only when the direct native contour is absent or truncated.
+                # A valid native-resolution contour is authoritative.  The
+                # structured 256px branch is a fallback for an empty native
+                # extraction, not a reason to replace a sharper/complete
+                # source object because it happens to be larger or longer.
                 prefer_structured = (
                     use_structured_area
-                    & (
-                        (direct_area < minimum_structured_area)
-                        | (structured_area >= direct_area * 1.15)
-                        | (
-                            (structured_extent >= direct_extent + max(3.0, 0.04 * source_native_size[0]))
-                            & (structured_area >= direct_area * 0.70)
-                        )
-                    )
+                    & (direct_area < minimum_structured_area)
                 ).view(-1, 1, 1, 1)
                 selected = torch.where(prefer_structured, structured, direct)
                 return selected, prefer_structured
@@ -1472,15 +1442,9 @@ class DatasetItemBatchBuilder:
             ) -> tuple[torch.Tensor, torch.Tensor]:
                 selected_area = selected.flatten(1).sum(dim=1, keepdim=True)
                 chain_area = semantic_chain.flatten(1).sum(dim=1, keepdim=True)
-                selected_rows = (selected > 0.01).amax(dim=3).float().sum(dim=2)
-                chain_rows = (semantic_chain > 0.01).amax(dim=3).float().sum(dim=2)
                 prefer_chain = (
                     (chain_area >= minimum_structured_area)
-                    & (
-                        (selected_area < minimum_structured_area)
-                        | (chain_area >= selected_area * 1.08)
-                        | (chain_rows >= selected_rows + max(3.0, 0.04 * source_native_size[0]))
-                    )
+                    & (selected_area < minimum_structured_area)
                 ).view(-1, 1, 1, 1)
                 return torch.where(prefer_chain, semantic_chain, selected), prefer_chain
 
@@ -1616,7 +1580,7 @@ class DatasetItemBatchBuilder:
                 ),
                 0,
                 1,
-            ) * (1.0 - source_hair_full).clamp(0, 1)
+            )
             source_foreground_v6["source_native_presence_state"] = torch.cat(
                 (
                     (selected_source_left.flatten(1).sum(dim=1, keepdim=True) >= 1.0),
@@ -1875,12 +1839,46 @@ class DatasetItemBatchBuilder:
                 target_visibility_parsing,
                 (1, 7, 8, 10),
             ).to(device=source_full.device, dtype=source_full.dtype)
+            # SATD may turn pixels immediately beside an exposed lobe into
+            # parser-background.  The face is aligned and does not move in
+            # the author transfer, so retain its source ear geometry as a
+            # target-visibility fallback and let the final target hair mask
+            # decide whether that ear is actually covered.  This is only a
+            # visibility hint; it cannot create source earring RGB.
+            source_ear_geometry_full = parsing_label_mask(
+                source_parsing_full,
+                (7, 8),
+            ).to(device=source_full.device, dtype=source_full.dtype)
+            if tuple(source_ear_geometry_full.shape[-2:]) != target_visibility_size:
+                source_ear_geometry_full = F.interpolate(
+                    source_ear_geometry_full.float(),
+                    size=target_visibility_size,
+                    mode="nearest",
+                ).to(dtype=source_full.dtype)
+            target_visibility_skin = torch.maximum(
+                target_visibility_skin,
+                source_ear_geometry_full,
+            ).clamp(0, 1)
             target_left_visible_full = (
-                parsing_label_mask(target_visibility_parsing, (7,))
+                torch.maximum(
+                    parsing_label_mask(target_visibility_parsing, (7,)),
+                    source_ear_geometry_full * (
+                        parsing_label_mask(source_parsing_full, (7,))
+                        .to(device=source_full.device, dtype=source_full.dtype)
+                        .amax(dim=1, keepdim=True)
+                    ),
+                )
                 * (1.0 - target_visibility_hair).clamp(0, 1)
             ).clamp(0, 1)
             target_right_visible_full = (
-                parsing_label_mask(target_visibility_parsing, (8,))
+                torch.maximum(
+                    parsing_label_mask(target_visibility_parsing, (8,)),
+                    source_ear_geometry_full * (
+                        parsing_label_mask(source_parsing_full, (8,))
+                        .to(device=source_full.device, dtype=source_full.dtype)
+                        .amax(dim=1, keepdim=True)
+                    ),
+                )
                 * (1.0 - target_visibility_hair).clamp(0, 1)
             ).clamp(0, 1)
 
@@ -1901,6 +1899,7 @@ class DatasetItemBatchBuilder:
             target_hair_final_query = to_query_mask(target_visibility_hair)
 
             target_lobe_hair_cover_ratios = {}
+            target_lobe_fully_covered = {}
 
             def final_lobe_open(ear_mask_full, side_name):
                 roi_key = "left_ear_roi" if side_name == "left" else "right_ear_roi"
@@ -1914,14 +1913,19 @@ class DatasetItemBatchBuilder:
                     target_visibility_size,
                 ).to(device=source_full.device, dtype=source_full.dtype)
                 fallback_skin = target_visibility_skin * roi_full * dilate_mask(lobe_hint_full, 5)
-                anchor = build_earlobe_anchor(
+                lobe_probe = build_earlobe_anchor(
                     ear_mask_full,
                     fallback_skin_mask=fallback_skin,
                     ear_roi=roi_full,
                     lower_ratio=0.70,
                     dilate=3,
-                ) * (1.0 - target_visibility_hair).clamp(0, 1)
-                window = dilate_mask(anchor, 7)
+                )
+                anchor = lobe_probe * (1.0 - target_visibility_hair).clamp(0, 1)
+                # Measure occlusion against the unmasked lower-lobe probe.
+                # If hair covered the entire lobe, using the already-masked
+                # anchor would create an empty window and falsely report 0%
+                # hair coverage.
+                window = dilate_mask(lobe_probe, 7)
                 exposed = (
                     target_visibility_skin * window * (1.0 - target_visibility_hair).clamp(0, 1)
                 ).flatten(1).sum(dim=1, keepdim=True)
@@ -1929,15 +1933,19 @@ class DatasetItemBatchBuilder:
                 corridor = ((target_visibility_skin + target_visibility_hair) * window).flatten(1).sum(
                     dim=1, keepdim=True
                 ).clamp_min(1.0)
-                # A visible lower-lobe footprint is sufficient; the whole ear
-                # need not be exposed.  Hair may not occupy more than 25% of
-                # that local footprint.
-                target_lobe_hair_cover_ratios[side_name] = covered / corridor
-                return (
+                cover_ratio = covered / corridor
+                meaningful_exposure = (
                     (exposed >= 4.0)
-                    & ((covered / corridor) <= 0.25)
                     & (anchor.flatten(1).sum(dim=1, keepdim=True) >= 2.0)
-                ).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
+                )
+                # A lobe closes only when it is actually hair-covered and
+                # lacks exposed ear/skin evidence.  This keeps partial lobes
+                # positive for schema-36 training instead of treating every
+                # mostly covered ear as an occluded negative.
+                fully_covered = (cover_ratio >= 0.85) & ~meaningful_exposure
+                target_lobe_hair_cover_ratios[side_name] = cover_ratio
+                target_lobe_fully_covered[side_name] = fully_covered.to(source_earring_mask.dtype)
+                return (meaningful_exposure & ~fully_covered).to(source_earring_mask.dtype).view(-1, 1, 1, 1)
 
             parser_min_visible_area = 2.0
             left_open = torch.maximum(
@@ -2261,7 +2269,7 @@ class DatasetItemBatchBuilder:
                         dtype=torch.bool,
                     ),
                     # Keep both stages for reproducible validation previews.  In
-                    # schema 35 the PP target is the SATD-rendered image itself;
+                    # schema 37 the PP target is the SATD-rendered image itself;
                     # the explicit flag below prevents any later residual pass.
                     "color_before_pp": target_256[idx].cpu(),
                     "target_mask": target_mask[idx].cpu(),
@@ -2336,6 +2344,12 @@ class DatasetItemBatchBuilder:
                         "left", torch.zeros(1)
                     )[idx].detach().cpu(),
                     "target_lobe_hair_cover_ratio_right": target_lobe_hair_cover_ratios.get(
+                        "right", torch.zeros(1)
+                    )[idx].detach().cpu(),
+                    "target_lobe_fully_covered_left": target_lobe_fully_covered.get(
+                        "left", torch.zeros(1)
+                    )[idx].detach().cpu(),
+                    "target_lobe_fully_covered_right": target_lobe_fully_covered.get(
                         "right", torch.zeros(1)
                     )[idx].detach().cpu(),
                     "coordinate_manifest": {
