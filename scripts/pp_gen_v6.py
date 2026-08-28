@@ -105,7 +105,7 @@ USER_DONOR_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/i
 USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v6_direct_satd_100_r17")
 # Generate 100 distinct source/shape/colour triplets.  The matching trainer
 # reserves 50 of these samples for validation and writes all 50 previews.
-USER_DATASET_SIZE_SMALL = 100
+USER_DATASET_SIZE_SMALL = 60
 # Chunk size now controls checkpoint frequency only.  Render/mask work streams
 # one mask batch at a time, so this does not retain a whole chunk in memory.
 USER_CHUNK_SIZE_SMALL = 256
@@ -1353,6 +1353,10 @@ class DatasetItemBatchBuilder:
                 # Candidate components still pass the source-lobe, hair and
                 # background gates; no free-form ROI pixels are added.
                 allow_long_continuation=True,
+                # A verified lobe/root may continue through source pixels that
+                # the parser calls hair only when the native component is a
+                # close, thin, material-consistent pendant segment.
+                allow_semantic_hair_continuation=True,
             )
             # The native foreground extractor is conservative by design.  A
             # parser-missed pearl or a low-contrast long pendant can therefore

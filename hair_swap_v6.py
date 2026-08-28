@@ -211,6 +211,15 @@ def get_parser():
         default=7,
         help="Source earring guard radius applied before SATD modifies the F feature.",
     )
+    parser.add_argument(
+        "--satd_earring_hair_continuation_protect_dilate",
+        type=int,
+        default=2,
+        help=(
+            "Narrow guard radius for verified long-earring segments that the "
+            "source parser labels as hair; kept smaller to preserve SATD cleanup."
+        ),
+    )
     parser.add_argument("--eq8_reference_blend_v8", type=float, default=0.0)
     parser.add_argument("--target_hair_close_kernel", type=int, default=9)
     parser.add_argument("--target_hair_hole_max_area", type=float, default=None)

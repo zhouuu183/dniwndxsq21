@@ -17,8 +17,12 @@ class BlendingV6(nn.Module):
     The base path keeps the author hair-shape alignment and colour blending,
     then runs SATD on the blended ``F`` feature and decodes
     ``I_satd_blend``.  Its 256px image is the direct PP input for one StyleGAN
-    decode.  SATD is therefore not applied again after PP.
+    decode.  SATD's learned candidate delta is not applied again after PP;
+    only a background-only continuity field may harmonize the already cleaned
+    region with neighbouring visible background.
     """
+
+    RUNTIME_REVISION = "v6-e5-canonical-object-20260828"
 
     def __init__(self, opts, net=None):
         super().__init__()
@@ -42,7 +46,7 @@ class BlendingV6(nn.Module):
 
         # The V6 model owns the live, author-compatible PP decode. Its final
         # compositor only writes the verified earring alpha after that decode;
-        # direct-SATD mode deliberately has no second background residual.
+        # direct-SATD mode never reapplies the learned SATD candidate delta.
         pp_args = argparse.Namespace(**vars(opts))
         pp_args.use_mod = getattr(
             opts,
@@ -62,6 +66,14 @@ class BlendingV6(nn.Module):
         pp_args.enable_direct_face_skin_restore = False
         pp_args.enable_native_source_detail = False
         self.post_process = PostProcessModelV6(pp_args).to(opts.device).eval()
+
+        if bool(getattr(opts, "v6_runtime_diagnostics", True)):
+            print(
+                "[V6-RUNTIME] "
+                f"revision={self.RUNTIME_REVISION} "
+                "entry=models.Blending_v6.BlendingV6 "
+                "post=models.postprocess_v6.PostProcessModelV6"
+            )
 
         pp_checkpoint = (
             getattr(opts, "pp_v6_checkpoint", None)
@@ -88,6 +100,73 @@ class BlendingV6(nn.Module):
         if missing_base:
             print(f"[BlendingV6] Missing PP base keys: {len(missing_base)}")
             print(missing_base[:20])
+
+    def _print_runtime_trace(self, aux: dict[str, torch.Tensor]) -> None:
+        """Print one compact proof that the production compositor executed."""
+        if not bool(getattr(self.opts, "v6_runtime_diagnostics", True)):
+            return
+
+        def area(name: str) -> float:
+            value = aux.get(name)
+            if not torch.is_tensor(value):
+                return -1.0
+            return float(value.detach().float().sum().item())
+
+        def scalar(name: str) -> float:
+            value = aux.get(name)
+            if not torch.is_tensor(value) or value.numel() == 0:
+                return -1.0
+            return float(value.detach().float().flatten()[0].item())
+
+        print(
+            "[V6-TRACE] "
+            f"revision={self.RUNTIME_REVISION} "
+            f"strong_seed={area('source_native_earring_strong_seed'):.1f} "
+            f"source_alpha={area('source_native_earring_alpha'):.1f} "
+            f"left_open={scalar('v6_canonical_left_open'):.0f} "
+            f"right_open={scalar('v6_canonical_right_open'):.0f} "
+            f"left_hair={scalar('v6_canonical_left_hair_cover_ratio'):.3f} "
+            f"right_hair={scalar('v6_canonical_right_hair_cover_ratio'):.3f} "
+            f"visible_alpha={area('v6_canonical_visible_earring_alpha'):.1f} "
+            f"final_alpha={area('output_source_earring_composite_mask'):.1f} "
+            f"satd_alpha={area('satd_background_cleanup_alpha'):.1f}"
+        )
+
+    @staticmethod
+    def _save_runtime_debug(output_dir, aux: dict[str, torch.Tensor]) -> None:
+        """Save production masks in their real coordinate spaces."""
+        fields = (
+            ("satd_pp_before_01", "01_satd_pp_before.png"),
+            ("satd_pp_after_01", "02_satd_pp_after.png"),
+            ("satd_background_cleanup_alpha", "03_satd_cleanup_alpha.png"),
+            ("satd_background_continuity_confidence", "04_satd_continuity_confidence.png"),
+            ("source_native_earring_parser_seed", "05_source_parser_seed.png"),
+            ("source_native_earring_strong_seed", "06_source_v5_strong_seed.png"),
+            ("source_native_earring_recall_hint", "07_source_v5_recall_hint.png"),
+            ("source_native_earring_alpha", "08_source_selected_alpha.png"),
+            ("v6_target_hair_authority_native", "09_target_hair_authority.png"),
+            ("v6_canonical_left_lobe_probe", "10_left_lobe_probe.png"),
+            ("v6_canonical_right_lobe_probe", "11_right_lobe_probe.png"),
+            ("v6_canonical_visible_earring_alpha", "12_target_visible_alpha.png"),
+            ("output_source_earring_composite_mask", "13_final_write_alpha.png"),
+        )
+        for key, filename in fields:
+            value = aux.get(key)
+            if not torch.is_tensor(value) or value.ndim not in (3, 4):
+                continue
+            image = value.detach().float().clamp(0, 1)
+            if image.ndim == 3:
+                image = image.unsqueeze(0)
+            if image.size(1) == 1:
+                image = image.repeat(1, 3, 1, 1)
+            elif image.size(1) != 3:
+                continue
+            save_gen_image(
+                output_dir,
+                "V6RuntimeTrace",
+                filename,
+                image * 2.0 - 1.0,
+            )
 
     @torch.inference_mode()
     def _author_transfer(self, align_shape, align_color, name_to_embed):
@@ -281,6 +360,11 @@ class BlendingV6(nn.Module):
             target_hair_mask=HM_X,
             authoritative_hair_highres=I_blend_satd if direct_satd_pp_input else I_blend,
             authoritative_target_highres=I_blend_satd if direct_satd_pp_input else I_blend,
+            # Keep the SATD render available to the background-only final
+            # continuity pass.  In direct mode it is not applied a second
+            # time as a residual; it supplies geometry/diagnostics while the
+            # final PP background is matched to nearby clean background.
+            satd_background_highres=I_blend_satd,
             direct_satd_pp_input=direct_satd_pp_input,
             earring_reference=name_to_embed["face"].get("image_1024"),
             source_face_reference=name_to_embed["face"].get("image_1024"),
@@ -304,12 +388,14 @@ class BlendingV6(nn.Module):
         for key, value in cleanup_masks.items():
             aux[key] = value
         I_final, _ = self.post_process.compose_post_decode(pp_image, aux)
+        self._print_runtime_trace(aux)
 
         if bool(getattr(self.opts, "save_all", False)):
             output_dir = self.opts.save_all_dir / (kwargs.get("exp_name") or "")
             save_gen_image(output_dir, "BlendingV6", "author_transfer.png", I_blend)
             save_gen_image(output_dir, "BlendingV6", "satd_background_candidate.png", I_blend_satd)
             save_gen_image(output_dir, "FinalV6", "final.png", I_final)
+            self._save_runtime_debug(output_dir, aux)
             save_latents(output_dir, "BlendingV6", "blending.npz", S_blend=S_blend)
 
         return ((I_final[0] + 1.0) * 0.5).clamp(0, 1)

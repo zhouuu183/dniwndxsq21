@@ -273,6 +273,63 @@ def _component_angle(points: np.ndarray) -> float:
     return float(math.atan2(float(vector[0]), float(vector[1])))
 
 
+def _verified_hair_continuation_v6(
+    root: dict[str, object],
+    current: dict[str, object],
+    candidate: dict[str, object],
+    *,
+    gap: float,
+    scale: float,
+    enabled: bool,
+) -> bool:
+    """Accept only jewellery-like continuation pixels mislabeled as source hair.
+
+    This is deliberately narrower than generic long-object continuation.  A
+    verified lobe root must already exist, and the new component must be a
+    close, downward, axis-aligned, high-material/high-edge segment.  The rule
+    never promotes a hair-labelled component into a root by itself.
+    """
+    if not enabled or float(candidate.get("hair_overlap", 0.0)) < 0.30:
+        return False
+    root_authority = (
+        float(root.get("parser_overlap", 0.0)) > 0.02
+        or float(root.get("seed_overlap", 0.0)) > 0.02
+        or (
+            float(root.get("recall_overlap", 0.0)) > 0.05
+            and float(root.get("material_score", 0.0)) >= 0.55
+            and float(root.get("edge_energy", 0.0)) >= 0.22
+        )
+    )
+    if not root_authority:
+        return False
+    if gap > max(2.0, 6.0 * scale):
+        return False
+    if float(candidate.get("centroid_y", 0.0)) < float(current.get("centroid_y", 0.0)) - 2.0 * scale:
+        return False
+    if abs(float(candidate.get("centroid_x", 0.0)) - float(current.get("centroid_x", 0.0))) > 10.0 * scale:
+        return False
+    material = float(candidate.get("material_score", 0.0))
+    edge = float(candidate.get("edge_energy", 0.0))
+    elongation = float(candidate.get("elongation", 0.0))
+    fill_ratio = float(candidate.get("fill_ratio", 1.0))
+    area = float(candidate.get("area", float("inf")))
+    # Long earrings are often segmented into a thin hook plus one or more
+    # compact pearls/stones.  Permit a small, very strong compact pendant as
+    # well as a thin wire; the root, direction, gap and x-axis checks above
+    # still prevent an unrelated bright hair/background speck from becoming
+    # a second object.
+    compact_jewel = (
+        area <= max(4.0, 140.0 * scale * scale)
+        and material >= 0.82
+        and edge >= 0.30
+    )
+    return (
+        material >= 0.70
+        and edge >= 0.26
+        and (elongation >= 1.65 or fill_ratio <= 0.42 or compact_jewel)
+    )
+
+
 def retain_single_earring_group_v6(
     mask: torch.Tensor,
     lobe_anchor: torch.Tensor,
@@ -493,6 +550,7 @@ def extract_source_native_earring_v6(
     max_graph_depth: int = 3,
     max_cumulative_cost: float = 1.55,
     allow_long_continuation: bool = False,
+    allow_semantic_hair_continuation: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Extract one source-native foreground instance per visible source side.
 
@@ -860,6 +918,7 @@ def extract_source_native_earring_v6(
                 continue
 
             root_component_id_out[batch_index, side_index] = float(roots[0]["id"])
+            root = roots[0]
 
             selected: dict[int, tuple[int, float]] = {}
             frontier: list[tuple[dict[str, object], int, float]] = []
@@ -899,15 +958,26 @@ def extract_source_native_earring_v6(
                     # native object evidence.  Broad visual components beside
                     # the ear are the usual source of copied background
                     # strands and duplicate earrings.
+                    hair_continuation_ok = _verified_hair_continuation_v6(
+                        root,
+                        current,
+                        candidate_item,
+                        gap=gap,
+                        scale=scale,
+                        enabled=allow_semantic_hair_continuation,
+                    )
                     if (
-                        float(current.get("parser_overlap", 0.0)) > 0.02
+                        float(root.get("parser_overlap", 0.0)) > 0.02
                         and float(candidate_item.get("parser_overlap", 0.0)) <= 0.02
                         and not (
-                            float(candidate_item.get("background_overlap", 1.0)) <= 0.18
-                            and float(candidate_item.get("hair_overlap", 1.0)) <= 0.10
-                            and float(candidate_item.get("material_score", 0.0)) >= 0.55
-                            and float(candidate_item.get("edge_energy", 0.0)) >= 0.25
-                            and gap <= radius(8)
+                            (
+                                float(candidate_item.get("background_overlap", 1.0)) <= 0.18
+                                and float(candidate_item.get("hair_overlap", 1.0)) <= 0.10
+                                and float(candidate_item.get("material_score", 0.0)) >= 0.55
+                                and float(candidate_item.get("edge_energy", 0.0)) >= 0.25
+                                and gap <= radius(8)
+                            )
+                            or hair_continuation_ok
                         )
                     ):
                         continue
@@ -965,8 +1035,6 @@ def extract_source_native_earring_v6(
                             continue
                         if float(candidate_item["background_overlap"] if "background_overlap" in candidate_item else 0.0) >= 0.86:
                             continue
-                        if float(candidate_item["hair_overlap"]) >= 0.30:
-                            continue
                         if float(candidate_item["skin_overlap"]) >= 0.78:
                             continue
                         if float(candidate_item["material_score"]) < 0.30 or float(candidate_item["edge_energy"]) < 0.10:
@@ -977,6 +1045,18 @@ def extract_source_native_earring_v6(
                         )
                         gap = _bbox_gap(nearest["bbox"], candidate_item["bbox"])
                         if gap > radius(8):
+                            continue
+                        if (
+                            float(candidate_item["hair_overlap"]) >= 0.30
+                            and not _verified_hair_continuation_v6(
+                                root,
+                                nearest,
+                                candidate_item,
+                                gap=gap,
+                                scale=scale,
+                                enabled=allow_semantic_hair_continuation,
+                            )
+                        ):
                             continue
                         lab_distance = float(np.linalg.norm(nearest["mean_lab"] - candidate_item["mean_lab"]))
                         if lab_distance > 68.0:

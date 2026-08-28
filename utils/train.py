@@ -108,7 +108,7 @@ def load_images_to_torch(paths, imgs=None, use_tqdm=True):
             pbar = tqdm(pbar)
 
         for img_name in pbar:
-            if '.jpg' in img_name or '.png' in img_name:
+            if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
                 img_path = os.path.join(path, img_name)
                 img = Image.open(img_path).resize((299, 299), resample=Image.LANCZOS)
                 tensor.append(transform(img))

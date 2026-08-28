@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -8,12 +9,46 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm.auto import tqdm
+from PIL import Image
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from models.Encoders import ClipModel
 from utils.seed import set_seed
 from utils.train import parallel_load_images
 from utils.image_utils import list_image_files
+
+
+def valid_image_files(directory: Path, label: str):
+    """Return readable images and skip files PIL cannot decode.
+
+    FID should not abort because a dataset directory contains one truncated
+    or otherwise invalid image.  The skipped paths are returned so they can be
+    written next to the metric CSV for auditability.
+    """
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Dataset directory does not exist: {directory}")
+
+    valid = []
+    skipped = []
+    for name in list_image_files(directory):
+        path = directory / name
+        try:
+            # verify() checks the file structure; load() forces actual pixel
+            # decoding, which catches truncated JPEG/PNG files as well.
+            with Image.open(path) as image:
+                image.verify()
+            with Image.open(path) as image:
+                image.load()
+                image.convert("RGB")
+        except Exception as error:  # noqa: BLE001 - retain the exact bad file
+            skipped.append({"file": str(path), "reason": str(error)})
+            continue
+        valid.append(name)
+
+    print(f"{label}: valid images={len(valid)}; skipped={len(skipped)}")
+    if not valid:
+        raise RuntimeError(f"No readable images remain in {directory}")
+    return valid, skipped
 
 
 def name_path(pair):
@@ -52,12 +87,17 @@ def compute_fid_datasets(datasets, target='celeba', device=torch.device('cuda'),
 
 def main(args):
     datasets = {}
+    skipped = {}
 
     source = args.source_dataset.name
-    datasets[source] = parallel_load_images(args.source_dataset, list_image_files(args.source_dataset))
+    source_files, source_skipped = valid_image_files(args.source_dataset, "source")
+    datasets[source] = parallel_load_images(args.source_dataset, source_files)
+    skipped[source] = source_skipped
 
     for method, path_dataset in args.methods_dataset:
-        datasets[method] = parallel_load_images(path_dataset, list_image_files(path_dataset))
+        method_files, method_skipped = valid_image_files(path_dataset, method)
+        datasets[method] = parallel_load_images(path_dataset, method_files)
+        skipped[method] = method_skipped
 
     FIDs = compute_fid_datasets(datasets, target=source, CLIP=False)
     df_fid = pd.DataFrame.from_dict(FIDs, orient='index', columns=['FID'])
@@ -70,6 +110,13 @@ def main(args):
 
     os.makedirs(args.output.parent, exist_ok=True)
     df_result.to_csv(args.output, index=True)
+
+    skipped_path = args.output.with_suffix(".skipped.json")
+    skipped_path.write_text(
+        json.dumps(skipped, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Skipped-image log: {skipped_path}")
 
 
 if __name__ == '__main__':

@@ -25,9 +25,16 @@ USER_MODE = "both"  # "both" or "full"
 USER_DEVICE = "cuda"
 USER_CUDA_VISIBLE_DEVICES = "0"
 
-# This must point to a separate untouched author checkout.  The baseline code
-# loads several assets using paths relative to this directory.
+# This must point to a separate untouched author checkout.  Relative weight
+# paths below are resolved from this directory; absolute paths may be entered.
 USER_BASELINE_ROOT = Path("/data/coding/HairFastGAN/HairFastGAN-main")
+
+# Fill these with the exact baseline weights you want to evaluate.  These four
+# are the method/checkpoint inputs passed directly to hair_swap.HairFast.
+USER_STYLEGAN_CHECKPOINT = Path("pretrained_models/StyleGAN/ffhq.pt")
+USER_ROTATE_CHECKPOINT = Path("pretrained_models/Rotate/rotate_best.pth")
+USER_BLENDING_CHECKPOINT = Path("pretrained_models/Blending/checkpoint.pth")
+USER_PP_CHECKPOINT = Path("pretrained_models/PostProcess/pp_model.pth")
 USER_CELEBA_HQ_DIR = Path("/root/shared-nvme/HairFastGAN/celeba-1024")
 # None derives input/eval_pairs_v5/celeba_hq_<USER_MODE>_seed3407_3000.jsonl.
 # Set an explicit path only when deliberately using a non-default manifest.
@@ -200,6 +207,11 @@ def require_file(path: Path, label: str) -> None:
         raise FileNotFoundError(f"{label} is missing: {path}")
 
 
+def resolve_baseline_file(root: Path, configured: Path) -> Path:
+    path = configured.expanduser()
+    return path if path.is_absolute() else root / path
+
+
 def import_baseline(baseline_root: Path):
     require_file(baseline_root / "hair_swap.py", "Official baseline hair_swap.py")
     sys.path.insert(0, str(baseline_root))
@@ -211,10 +223,10 @@ def import_baseline(baseline_root: Path):
 def build_baseline(baseline_root: Path, device: str):
     HairFast, get_parser = import_baseline(baseline_root)
     checkpoint_paths = {
-        "StyleGAN checkpoint": baseline_root / "pretrained_models/StyleGAN/ffhq.pt",
-        "rotate checkpoint": baseline_root / "pretrained_models/Rotate/rotate_best.pth",
-        "blending checkpoint": baseline_root / "pretrained_models/Blending/checkpoint.pth",
-        "author PP checkpoint": baseline_root / "pretrained_models/PostProcess/pp_model.pth",
+        "StyleGAN checkpoint": resolve_baseline_file(baseline_root, USER_STYLEGAN_CHECKPOINT),
+        "rotate checkpoint": resolve_baseline_file(baseline_root, USER_ROTATE_CHECKPOINT),
+        "blending checkpoint": resolve_baseline_file(baseline_root, USER_BLENDING_CHECKPOINT),
+        "author PP checkpoint": resolve_baseline_file(baseline_root, USER_PP_CHECKPOINT),
     }
     for label, path in checkpoint_paths.items():
         require_file(path, label)

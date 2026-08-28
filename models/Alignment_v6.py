@@ -16,6 +16,7 @@ from utils.mask_delta_v8 import (
     drop_parsing_labels,
     enrich_delta_masks_with_halo,
     filter_parsing_to_primary_subject,
+    protect_cleanup_masks_v8,
     stack_cleanup_masks_v8,
 )
 
@@ -142,34 +143,40 @@ class AlignmentV6(Alignment):
         restore it.  The guard is source-only and therefore never authorizes
         an ear/face/background crop as output alpha.
         """
-        image = name_to_embed[image_key]["image_256"]
+        image_256 = name_to_embed[image_key]["image_256"]
+        # SATD consumes a 256px mask, but the evidence used to build that mask
+        # must come from the original aligned source.  Running the object
+        # verifier on ``image_256`` permanently removes thin wires and small
+        # stones before the guard is constructed; those are exactly the
+        # earrings that disappear when they overlap M_remove.
+        image = name_to_embed[image_key].get("image_1024", image_256)
         source_mask = name_to_embed[image_key].get("mask")
         if image.ndim == 3:
             image = image.unsqueeze(0)
+        if image_256.ndim == 3:
+            image_256 = image_256.unsqueeze(0)
         if source_mask is None:
             zero = torch.zeros(
-                image.size(0), 1, *image.shape[-2:],
-                device=image.device,
-                dtype=image.dtype,
+                image_256.size(0), 1, *image_256.shape[-2:],
+                device=image_256.device,
+                dtype=image_256.dtype,
             )
             return zero, F.interpolate(zero, size=out_hw, mode="nearest")
         parsing = source_mask
         if parsing.ndim == 3:
             parsing = parsing.unsqueeze(1)
         parsing = parsing.to(device=image.device).long()
-        # Keep the parser's native resolution for thin pendants.  Reducing a
-        # 512px label map to 256px before extraction can erase a one-pixel
-        # wire/pendant, which would let SATD edit precisely the region that
-        # later needs earring recovery.
-        if parsing.shape[-2:] != image.shape[-2:]:
-            work_image = F.interpolate(
-                image,
-                size=parsing.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            work_image = image
+        # Preserve the original RGB sampling grid.  The parsing labels are
+        # categorical and can be enlarged safely with nearest-neighbour; the
+        # reverse operation (shrinking native RGB to the parser/PP grid) loses
+        # the very foreground evidence this guard exists to preserve.
+        work_image = image.to(device=image_256.device, dtype=image_256.dtype)
+        if parsing.shape[-2:] != work_image.shape[-2:]:
+            parsing = F.interpolate(
+                parsing.float(),
+                size=work_image.shape[-2:],
+                mode="nearest",
+            ).long()
 
         # Label 9 is the strongest parser evidence.  The native extractor adds
         # parser-missed high-contrast pendant pixels while retaining its normal
@@ -224,7 +231,7 @@ class AlignmentV6(Alignment):
         ).clamp(0, 1)
         protected_256 = F.adaptive_max_pool2d(
             protected_256,
-            output_size=(image.shape[-2], image.shape[-1]),
+            output_size=(image_256.shape[-2], image_256.shape[-1]),
         ).clamp(0, 1)
         protected_feature = F.adaptive_max_pool2d(
             protected_256,
@@ -600,7 +607,15 @@ class AlignmentV6(Alignment):
                     size=satd_masks_256.shape[-2:],
                     mode="nearest",
                 )
-            satd_masks_256 = satd_masks_256 * (1.0 - earring_protect_256).clamp(0, 1)
+            # ``stack_cleanup_masks_v8`` stores six edit-authority channels
+            # followed by M_body_preserve.  The previous blanket multiply also
+            # erased that preserve channel at the earring, giving SATD an
+            # internally contradictory input.  Remove earring support only
+            # from edit channels and explicitly add it to the preserve channel.
+            satd_masks_256 = protect_cleanup_masks_v8(
+                satd_masks_256,
+                earring_protect_256,
+            )
             satd_out, _ = self.satd_model_v8(
                 F_base=latent_F_base,
                 F_src=satd_features["latent_F_src"],
@@ -619,6 +634,17 @@ class AlignmentV6(Alignment):
                     if tuple(guard.shape[-2:]) != tuple(value.shape[-2:]):
                         guard = F.interpolate(guard, size=value.shape[-2:], mode="nearest")
                     protected_delta_masks[key] = value * (1.0 - guard).clamp(0, 1)
+            # Preserve channels have the opposite polarity from M_remove.
+            # Publish the same contract to every downstream consumer so a
+            # serialized dataset or residual pass cannot re-authorize cleanup
+            # at the protected source earring.
+            for key in ("M_body_preserve", "M_detail_protect"):
+                value = protected_delta_masks.get(key)
+                if torch.is_tensor(value):
+                    guard = earring_protect_256
+                    if tuple(guard.shape[-2:]) != tuple(value.shape[-2:]):
+                        guard = F.interpolate(guard, size=value.shape[-2:], mode="nearest")
+                    protected_delta_masks[key] = torch.maximum(value, guard).clamp(0, 1)
             cleanup_support = self._cleanup_support_from_delta_masks(
                 protected_delta_masks,
                 out_hw=latent_F_base.shape[-2:],

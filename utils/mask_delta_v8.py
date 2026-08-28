@@ -314,6 +314,44 @@ def stack_cleanup_masks_v8(delta_masks: dict[str, torch.Tensor]) -> torch.Tensor
     )
 
 
+def protect_cleanup_masks_v8(
+    cleanup_masks: torch.Tensor,
+    protect_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Remove edit authority and add preserve authority on protected pixels.
+
+    V8 cleanup tensors contain six edit channels followed by
+    ``M_body_preserve``.  These channel groups have opposite polarity and must
+    never be masked with the same multiplication.
+    """
+    cleanup_masks = _ensure_batch(cleanup_masks)
+    protect_mask = _ensure_batch(protect_mask).to(
+        device=cleanup_masks.device,
+        dtype=cleanup_masks.dtype,
+    )
+    if cleanup_masks.size(1) != 7:
+        raise ValueError(
+            "cleanup_masks must contain six edit channels plus M_body_preserve; "
+            f"got {cleanup_masks.size(1)} channels."
+        )
+    if protect_mask.size(1) != 1:
+        protect_mask = protect_mask[:, :1]
+    if protect_mask.shape[-2:] != cleanup_masks.shape[-2:]:
+        protect_mask = F.interpolate(
+            protect_mask,
+            size=cleanup_masks.shape[-2:],
+            mode="nearest",
+        )
+    protect_mask = protect_mask.clamp(0, 1)
+    channels = list(torch.chunk(cleanup_masks, 7, dim=1))
+    for channel_index in range(6):
+        channels[channel_index] = (
+            channels[channel_index] * (1.0 - protect_mask)
+        ).clamp(0, 1)
+    channels[6] = torch.maximum(channels[6], protect_mask).clamp(0, 1)
+    return torch.cat(channels, dim=1)
+
+
 __all__ = [
     "apply_subject_support",
     "build_delta_masks",
@@ -321,6 +359,7 @@ __all__ = [
     "drop_parsing_labels",
     "enrich_delta_masks_with_halo",
     "filter_parsing_to_primary_subject",
+    "protect_cleanup_masks_v8",
     "restrict_hair_mask_to_subject",
     "stack_satd_masks",
     "stack_cleanup_masks_v8",

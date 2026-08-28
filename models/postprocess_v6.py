@@ -2910,6 +2910,7 @@ class PostProcessModelV6(nn.Module):
     def _resolve_v6_target_ear_masks(
         target_parsing_native: torch.Tensor,
         target_hair_native: torch.Tensor,
+        source_parsing_native: torch.Tensor | None,
         aux: dict[str, torch.Tensor],
         native: torch.Tensor,
         native_size: tuple[int, int],
@@ -2938,16 +2939,16 @@ class PostProcessModelV6(nn.Module):
         # subtract the final target hairstyle below.  This opens a side only
         # when the corresponding source ear exists; source earring presence is
         # still decided independently by the native object extractor.
-        source_parsing_native = aux.get("source_parsing")
+        # Use the same source-native parse that the object extractor consumes.
+        # The former aux fallback was normally a 256px PP parse enlarged to
+        # 1024px.  When SATD removed a thin earring/lobe edge, that coarse map
+        # contained no usable ear geometry and the target side was closed even
+        # though the final image visibly exposed the lobe.
         if source_parsing_native is not None:
-            source_parsing_native = ensure_mask_4d(source_parsing_native).to(
-                device=native.device
-            )
+            source_parsing_native = ensure_mask_4d(source_parsing_native).to(device=native.device)
             if tuple(source_parsing_native.shape[-2:]) != native_size:
                 source_parsing_native = F.interpolate(
-                    source_parsing_native.float(),
-                    size=native_size,
-                    mode="nearest",
+                    source_parsing_native.float(), size=native_size, mode="nearest"
                 ).long()
             source_left_ear_geometry = parsing_label_mask(
                 source_parsing_native, (RAW_LEFT_EAR,)
@@ -3233,6 +3234,7 @@ class PostProcessModelV6(nn.Module):
         ) = self._resolve_v6_target_ear_masks(
             target_parsing_native,
             target_hair_native,
+            source_parsing_native,
             aux,
             native,
             native_size,

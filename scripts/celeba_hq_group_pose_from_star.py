@@ -160,6 +160,7 @@ def pose_score(
 
 def make_group_manifest(
     rows: list[dict[str, Any]],
+    transfer_mode: str,
     group: str,
     output_path: Path,
 ) -> None:
@@ -167,6 +168,9 @@ def make_group_manifest(
     with output_path.open("w", encoding="utf-8", newline="\n") as handle:
         for index, original in enumerate(rows, start=1):
             row = dict(original)
+            # ``mode`` remains the original pairing contract (full/both).
+            # The pose difficulty belongs only in ``pose_group``.
+            row["mode"] = transfer_mode
             row["index"] = index
             row["output_file"] = f"{index:06d}.png"
             row["pose_group"] = group
@@ -255,6 +259,7 @@ def main() -> None:
         group_rows = [item["row"] for item in records]
         make_group_manifest(
             group_rows,
+            mode,
             group,
             output_root / f"celeba_hq_{mode}_seed3407_pose_{group}.jsonl",
         )
