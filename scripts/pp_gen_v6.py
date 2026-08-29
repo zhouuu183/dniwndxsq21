@@ -114,7 +114,7 @@ USER_MASK_BATCH_SIZE_SMALL = 8
 # torch container makes 100 samples need roughly 1.7 GB and can fail on a
 # quota-limited training volume. gzip is lossless: it changes only the outer
 # file container, not a serialized tensor value.
-USER_DATASET_COMPRESSION = "none"  # "gzip" or "none"
+USER_DATASET_COMPRESSION = "gzip"  # "gzip" or "none"
 USER_DATASET_GZIP_LEVEL = 1  # lossless and substantially faster than level 6
 
 USER_FACE_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
@@ -2585,10 +2585,6 @@ def validate_pp_dataset_resume(args, model_args) -> None:
             current_without_code.pop("identity_sha256", None)
             previous_without_code.pop("code_sha256", None)
             current_without_code.pop("code_sha256", None)
-            for metadata in (previous_without_code, current_without_code):
-                generator_args = metadata.get("generator_args")
-                if isinstance(generator_args, dict):
-                    generator_args.pop("allow_resume_policy_mismatch", None)
             if not (args.allow_resume_policy_mismatch and previous_without_code == current_without_code):
                 raise RuntimeError(
                     f"Cannot mix PP dataset policies in {output}: code, checkpoint, or generation "
@@ -2747,6 +2743,9 @@ def main(args):
             }
         )
 
+    # Build the complete deterministic pairing list before slicing.  Both
+    # servers therefore see identical source/shape/colour assignments and
+    # process disjoint sample indices.
     experiments = [
         experiment
         for index, experiment in enumerate(all_experiments)
