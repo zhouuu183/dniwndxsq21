@@ -467,7 +467,7 @@ def build_parser(defaults):
     parser.add_argument(
         "--allow_resume_policy_mismatch",
         action="store_true",
-        help="Allow resume when only policy-file hashes changed.",
+        help="Allow resume when only code/model-policy fields changed; data and weights must match.",
     )
     parser.add_argument(
         "--allow_legacy_blending_checkpoint_v8",
@@ -2487,6 +2487,43 @@ def _jsonable_config(value):
     return str(value)
 
 
+def _resume_policy_differences(previous, current, prefix=""):
+    """Return readable leaf-level differences between two config objects."""
+
+    differences = []
+    if isinstance(previous, dict) and isinstance(current, dict):
+        for key in sorted(set(previous) | set(current)):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            if key not in previous:
+                differences.append((child_prefix, "<missing>", current[key]))
+            elif key not in current:
+                differences.append((child_prefix, previous[key], "<missing>"))
+            else:
+                differences.extend(
+                    _resume_policy_differences(previous[key], current[key], child_prefix)
+                )
+        return differences
+    if isinstance(previous, list) and isinstance(current, list):
+        if previous != current:
+            differences.append((prefix, previous, current))
+        return differences
+    if previous != current:
+        differences.append((prefix, previous, current))
+    return differences
+
+
+def _resume_distribution_identity(identity):
+    """Fields that must match when appending to an existing dataset."""
+
+    comparable = {
+        "schema_version": identity.get("schema_version"),
+        "generator_args": dict(identity.get("generator_args") or {}),
+        "checkpoints": identity.get("checkpoints"),
+    }
+    comparable["generator_args"].pop("allow_resume_policy_mismatch", None)
+    return comparable
+
+
 def build_dataset_identity(args, model_args) -> dict[str, object]:
     """Fingerprint the exact target distribution used by resumable PP data."""
 
@@ -2579,18 +2616,41 @@ def validate_pp_dataset_resume(args, model_args) -> None:
 
     if previous is not None and part_files_exist:
         if previous.get("identity_sha256") != identity["identity_sha256"]:
-            previous_without_code = dict(previous)
-            current_without_code = dict(identity)
-            previous_without_code.pop("identity_sha256", None)
-            current_without_code.pop("identity_sha256", None)
-            previous_without_code.pop("code_sha256", None)
-            current_without_code.pop("code_sha256", None)
-            if not (args.allow_resume_policy_mismatch and previous_without_code == current_without_code):
+            previous_distribution = _resume_distribution_identity(previous)
+            current_distribution = _resume_distribution_identity(identity)
+            distribution_differences = _resume_policy_differences(
+                previous_distribution,
+                current_distribution,
+            )
+            if distribution_differences:
+                for key, old_value, new_value in distribution_differences[:40]:
+                    print(f"[resume-mismatch] {key}: existing={old_value!r}, current={new_value!r}")
+                if len(distribution_differences) > 40:
+                    print(
+                        f"[resume-mismatch] ... and {len(distribution_differences) - 40} more difference(s)"
+                    )
                 raise RuntimeError(
-                    f"Cannot mix PP dataset policies in {output}: code, checkpoint, or generation "
-                    "settings changed. Use a fresh output directory and regenerate all parts."
+                    f"Cannot mix PP dataset policies in {output}: data paths, weights, or generation "
+                    "settings changed. Use the exact original command or a fresh output directory."
                 )
-            print("[resume] only policy-file hashes changed; continuing explicitly.")
+            if not args.allow_resume_policy_mismatch:
+                previous_without_identity = dict(previous)
+                current_without_identity = dict(identity)
+                previous_without_identity.pop("identity_sha256", None)
+                current_without_identity.pop("identity_sha256", None)
+                differences = _resume_policy_differences(
+                    previous_without_identity,
+                    current_without_identity,
+                )
+                for key, old_value, new_value in differences[:40]:
+                    print(f"[resume-mismatch] {key}: existing={old_value!r}, current={new_value!r}")
+                if len(differences) > 40:
+                    print(f"[resume-mismatch] ... and {len(differences) - 40} more difference(s)")
+                raise RuntimeError(
+                    f"Cannot resume {output}: code/model-policy fields changed. "
+                    "Re-run with --allow_resume_policy_mismatch after verifying the files."
+                )
+            print("[resume] code/model-policy fields changed; data and checkpoint policy match.")
 
     temporary = config_path.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
