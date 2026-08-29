@@ -197,6 +197,113 @@ def _earring_top_attachment(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     )
 
 
+def canonical_target_visibility_v6(
+    source_ear: torch.Tensor,
+    source_earring_alpha: torch.Tensor,
+    target_hair: torch.Tensor,
+    *,
+    covered_threshold: float = 0.85,
+    probe_dilate: int = 3,
+) -> dict[str, torch.Tensor]:
+    """Decide target visibility in HairFast's shared canonical coordinates.
+
+    HairFast changes hairstyle while retaining the source face geometry.  A
+    final target ear parser is therefore unnecessary for positioning the
+    source accessory and can be actively harmful after SATD changes the local
+    ear/background contrast.  Probe the source lower lobe (or, if the parser
+    missed it, the verified earring's top attachment) against the *target hair
+    authority*.  The side closes only when that attachment is almost fully
+    covered.  Visibility is object-level rather than pixel-level: clipping the
+    upper half of an otherwise valid stud/pendant makes it look smaller and
+    lower than the source.  A closed side writes nothing; an open side writes
+    the complete verified jewellery object only, never source ear/background.
+    """
+    if source_ear.ndim == 3:
+        source_ear = source_ear.unsqueeze(1)
+    if source_earring_alpha.ndim == 3:
+        source_earring_alpha = source_earring_alpha.unsqueeze(1)
+    if target_hair.ndim == 3:
+        target_hair = target_hair.unsqueeze(1)
+    reference = source_earring_alpha[:, :1]
+    size = tuple(reference.shape[-2:])
+    ear = _mask(source_ear, size, reference)
+    earring = _mask(source_earring_alpha, size, reference)
+    hair = _mask(target_hair, size, reference)
+    hair = (hair > 0.35).to(reference.dtype)
+
+    height = size[0]
+    y = torch.arange(
+        height,
+        device=reference.device,
+        dtype=reference.dtype,
+    ).view(1, 1, height, 1)
+
+    # Lower source-ear band: the actual attachment neighbourhood, not the
+    # whole ear shell or a broad ear ROI.
+    ear_binary = (ear > 0.5).to(reference.dtype)
+    ear_y_min = torch.where(
+        ear_binary > 0,
+        y.expand_as(ear_binary),
+        torch.full_like(ear_binary, float(height)),
+    ).flatten(1).amin(dim=1, keepdim=True)
+    ear_y_max = (ear_binary * y).flatten(1).amax(dim=1, keepdim=True)
+    lower_start = ear_y_min + 0.62 * (ear_y_max - ear_y_min).clamp_min(1.0)
+    lobe_probe = ear_binary * (
+        y >= lower_start.view(-1, 1, 1, 1)
+    ).to(reference.dtype)
+
+    # Parser-missed ear fallback: only the verified object's narrow top band.
+    # This is a visibility probe and never becomes output RGB alpha.
+    object_binary = (earring > 0.01).to(reference.dtype)
+    object_y_min = torch.where(
+        object_binary > 0,
+        y.expand_as(object_binary),
+        torch.full_like(object_binary, float(height)),
+    ).flatten(1).amin(dim=1, keepdim=True)
+    object_y_max = (object_binary * y).flatten(1).amax(dim=1, keepdim=True)
+    top_height = torch.maximum(
+        torch.full_like(object_y_min, 2.0),
+        0.10 * (object_y_max - object_y_min).clamp_min(1.0),
+    )
+    object_top = object_binary * (
+        y <= (object_y_min + top_height).view(-1, 1, 1, 1)
+    ).to(reference.dtype)
+
+    lobe_present = (
+        lobe_probe.flatten(1).sum(dim=1, keepdim=True) >= 2.0
+    ).view(-1, 1, 1, 1)
+    probe = torch.where(lobe_present, lobe_probe, object_top)
+    radius = max(0, int(probe_dilate))
+    if radius > 0:
+        probe = F.max_pool2d(
+            probe,
+            kernel_size=2 * radius + 1,
+            stride=1,
+            padding=radius,
+        )
+    probe = probe.clamp(0, 1)
+    probe_area = probe.flatten(1).sum(dim=1, keepdim=True)
+    hair_cover_ratio = (
+        (probe * hair).flatten(1).sum(dim=1, keepdim=True)
+        / probe_area.clamp_min(1.0)
+    )
+    threshold = max(0.0, min(1.0, float(covered_threshold)))
+    side_open = (
+        (probe_area >= 1.0)
+        & (hair_cover_ratio < threshold)
+    ).view(-1, 1, 1, 1)
+    visible_alpha = (
+        earring * side_open.to(reference.dtype)
+    ).clamp(0, 1)
+    return {
+        "probe": probe,
+        "hair_cover_ratio": hair_cover_ratio.view(-1, 1, 1, 1),
+        "side_open": side_open.to(reference.dtype),
+        "visible_alpha": visible_alpha,
+        "target_hair": hair,
+    }
+
+
 def _side_open(mask: torch.Tensor, min_visible_area: float) -> torch.Tensor:
     """Open a side only from final-resolution visible ear/lobe pixels.
 
@@ -551,6 +658,8 @@ def extract_source_native_earring_v6(
     max_cumulative_cost: float = 1.55,
     allow_long_continuation: bool = False,
     allow_semantic_hair_continuation: bool = False,
+    native_matte_radius_px: int = 1,
+    native_boundary_alpha_floor: float = 0.85,
 ) -> dict[str, torch.Tensor]:
     """Extract one source-native foreground instance per visible source side.
 
@@ -1108,7 +1217,11 @@ def extract_source_native_earring_v6(
                 # image, which visibly shrinks small studs and softens long
                 # pendant edges.  The wider trim window above is only a local
                 # background estimator and does not change the matte width.
-                matte_radius = max(1, min(2, int(round(scale * 0.5))))
+                # Keep the matte to one *native* pixel by default.  Scaling a
+                # one-pixel operation with image resolution turns a thin
+                # pendant into nothing but boundary and makes the recovered
+                # object look smaller/translucent.
+                matte_radius = max(1, min(2, int(native_matte_radius_px)))
                 boundary = selected_mask & ~cv2.erode(
                     selected_mask.astype(np.uint8),
                     np.ones((2 * matte_radius + 1, 2 * matte_radius + 1), np.uint8),
@@ -1234,16 +1347,31 @@ def extract_source_native_earring_v6(
                     matte_alpha = np.clip(matte_alpha, 0.0, 1.0)
                     if matte_region.any():
                         alpha_values = matte_alpha[matte_region]
+                        stable_alpha = np.maximum(alpha_values, 1e-3)
                         reconstructed = (
                             observed[matte_region]
                             - (1.0 - alpha_values[:, None]) * bg_rgb[matte_region]
-                        ) / alpha_values[:, None]
+                        ) / stable_alpha[:, None]
                         foreground_rgb[batch_index, matte_region] = np.clip(
                             reconstructed,
                             0.0,
                             255.0,
                         ) / 255.0
-                        final_alpha[matte_region] = alpha_values
+                        # After unmixing, the RGB no longer contains the source
+                        # backdrop.  Retain a visible coverage floor for a
+                        # verified one-pixel wire/stone edge; discard only a
+                        # nearly pure-background subpixel.  This restores the
+                        # object's apparent size without pasting a background
+                        # halo or filling a hoop centre.
+                        alpha_floor = max(
+                            0.0,
+                            min(1.0, float(native_boundary_alpha_floor)),
+                        )
+                        final_alpha[matte_region] = np.where(
+                            alpha_values >= 0.08,
+                            np.maximum(alpha_values, alpha_floor),
+                            0.0,
+                        )
             parser_or_seed = parser_side | seed_side
             has_native_object = final_alpha.any()
             if not has_native_object:
@@ -1297,10 +1425,10 @@ def extract_source_native_earring_v6(
         right = result_arrays["source_native_right_alpha"][batch_index]
         left_binary = left > 0.01
         right_binary = right > 0.01
-        # These areas are also used by the later near-duplicate arbitration
-        # when both sides are present but do not overlap pixel-for-pixel.
-        # Compute them before the overlap-only branch so a valid two-earring
-        # sample cannot hit an uninitialised local variable.
+        # These areas are used by duplicate-side arbitration below even when
+        # the two candidate masks do not overlap.  Compute them before the
+        # overlap-only branch so valid single/two-earring samples never hit an
+        # uninitialised local variable during SATD protection.
         left_area = float(left_binary.sum())
         right_area = float(right_binary.sum())
         overlap = left_binary & right_binary
@@ -1387,6 +1515,10 @@ def align_earring_instance_v6(
     target_right_ear: torch.Tensor,
     *,
     max_shift: int = 0,
+    max_vertical_shift: int | None = None,
+    max_horizontal_shift: int | None = None,
+    identity_tolerance: int = 0,
+    force_identity_alignment: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Align one confirmed source-native instance once into target coordinates."""
     if instance.space not in (
@@ -1424,8 +1556,38 @@ def align_earring_instance_v6(
     raw_left_dx = torch.round(tgt_lx - src_lx)
     raw_right_dy = torch.round(tgt_ry - src_ry)
     raw_right_dx = torch.round(tgt_rx - src_rx)
-    left_in_range = (raw_left_dy.abs() <= float(max_shift)) & (raw_left_dx.abs() <= float(max_shift))
-    right_in_range = (raw_right_dy.abs() <= float(max_shift)) & (raw_right_dx.abs() <= float(max_shift))
+    vertical_limit = max(0, int(max_shift if max_vertical_shift is None else max_vertical_shift))
+    horizontal_limit = max(0, int(max_shift if max_horizontal_shift is None else max_horizontal_shift))
+    left_in_range = (
+        (raw_left_dy.abs() <= float(vertical_limit))
+        & (raw_left_dx.abs() <= float(horizontal_limit))
+    )
+    right_in_range = (
+        (raw_right_dy.abs() <= float(vertical_limit))
+        & (raw_right_dx.abs() <= float(horizontal_limit))
+    )
+    # HairFast keeps the source face/canonical coordinates.  If the extracted
+    # attachment already lies close to the final exposed lobe, moving it to a
+    # noisy parser centroid only places it on the cheek.  Prefer the exact
+    # source coordinate in that case; this is translation-only and never
+    # scales or redraws the object.
+    identity_limit = max(0, int(identity_tolerance))
+    if bool(force_identity_alignment):
+        # HairFast's face is source-canonical after hairstyle transfer.  The
+        # target masks supplied by this mode are visibility probes only; do
+        # not let their parser centroids translate a correct source object.
+        left_identity = left_valid
+        right_identity = right_valid
+    elif identity_limit > 0:
+        left_identity = left_valid & (
+            torch.maximum(raw_left_dy.abs(), raw_left_dx.abs()) <= float(identity_limit)
+        )
+        right_identity = right_valid & (
+            torch.maximum(raw_right_dy.abs(), raw_right_dx.abs()) <= float(identity_limit)
+        )
+    else:
+        left_identity = torch.zeros_like(left_valid)
+        right_identity = torch.zeros_like(right_valid)
     # For max_shift=0, permit only an already coincident attachment band
     # (within one native pixel).  A remote/face anchor remains rejected;
     # clamping it would place the source object at an arbitrary location.
@@ -1435,12 +1597,30 @@ def align_earring_instance_v6(
     right_zero_fallback = right_valid & ~right_in_range & (
         torch.maximum(raw_right_dy.abs(), raw_right_dx.abs()) <= 1.0
     )
-    left_shift_valid = left_valid & (left_in_range | left_zero_fallback)
-    right_shift_valid = right_valid & (right_in_range | right_zero_fallback)
-    left_dy = torch.where(left_shift_valid, raw_left_dy, torch.zeros_like(raw_left_dy))
-    left_dx = torch.where(left_shift_valid, raw_left_dx, torch.zeros_like(raw_left_dx))
-    right_dy = torch.where(right_shift_valid, raw_right_dy, torch.zeros_like(raw_right_dy))
-    right_dx = torch.where(right_shift_valid, raw_right_dx, torch.zeros_like(raw_right_dx))
+    left_shift_valid = left_valid & (left_identity | left_in_range | left_zero_fallback)
+    right_shift_valid = right_valid & (right_identity | right_in_range | right_zero_fallback)
+    left_zero = left_identity | left_zero_fallback
+    right_zero = right_identity | right_zero_fallback
+    left_dy = torch.where(
+        left_shift_valid & ~left_zero,
+        raw_left_dy,
+        torch.zeros_like(raw_left_dy),
+    )
+    left_dx = torch.where(
+        left_shift_valid & ~left_zero,
+        raw_left_dx,
+        torch.zeros_like(raw_left_dx),
+    )
+    right_dy = torch.where(
+        right_shift_valid & ~right_zero,
+        raw_right_dy,
+        torch.zeros_like(raw_right_dy),
+    )
+    right_dx = torch.where(
+        right_shift_valid & ~right_zero,
+        raw_right_dx,
+        torch.zeros_like(raw_right_dx),
+    )
     left_alpha = _shift_per_batch(left_instance, left_dy, left_dx)
     right_alpha = _shift_per_batch(right_instance, right_dy, right_dx)
     left_hole = _shift_per_batch(_mask(instance.left_hole_alpha, size, source), left_dy, left_dx)
@@ -1481,6 +1661,8 @@ def align_earring_instance_v6(
         "right_alignment_valid": right_shift_valid.view(-1, 1).to(source.dtype),
         "fallback_zero_shift_used_left": left_zero_fallback.view(-1, 1).to(source.dtype),
         "fallback_zero_shift_used_right": right_zero_fallback.view(-1, 1).to(source.dtype),
+        "identity_alignment_used_left": left_identity.view(-1, 1).to(source.dtype),
+        "identity_alignment_used_right": right_identity.view(-1, 1).to(source.dtype),
     }
 
 
