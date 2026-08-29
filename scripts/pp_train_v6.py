@@ -107,13 +107,13 @@ VAL_COLUMNS = (
 )
 
 # ========================= User Config: edit here only =========================
-USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
+USER_DATASET_PROFILE = "full_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
 USER_DATASET_DIR_SMALL = Path("images/pp_dataset_v6_direct_satd_100_r17")
 USER_OUTPUT_DIR_SMALL = Path("output/pp_v6_checkpoints_direct_satd_100_r17")
 USER_RUN_NAME_SMALL = "pp_v6_direct_satd_100_r17"
 
-USER_DATASET_DIR_FULL = Path("images/pp_dataset_v6_direct_satd_full_r17")
+USER_DATASET_DIR_FULL = Path("images/pp")
 USER_OUTPUT_DIR_FULL = Path("output/pp_v6_checkpoints_direct_satd_full_r17")
 USER_RUN_NAME_FULL = "pp_v6_direct_satd_full_r17"
 
@@ -124,7 +124,7 @@ USER_RESUME_CHECKPOINT = None
 USER_BASE_CHECKPOINT = "pretrained_models/PostProcess/pp_model.pth"
 USER_DIRECT_SATD_PP_INPUT = True
 
-USER_BATCH_SIZE = 4
+USER_BATCH_SIZE = 8
 USER_NUM_WORKERS = 0
 USER_EPOCHS = 120
 # Reserve 50 of the 100 generated samples for validation.  Every validation

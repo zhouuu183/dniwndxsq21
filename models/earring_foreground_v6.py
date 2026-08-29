@@ -1297,13 +1297,17 @@ def extract_source_native_earring_v6(
         right = result_arrays["source_native_right_alpha"][batch_index]
         left_binary = left > 0.01
         right_binary = right > 0.01
+        # These areas are also used by the later near-duplicate arbitration
+        # when both sides are present but do not overlap pixel-for-pixel.
+        # Compute them before the overlap-only branch so a valid two-earring
+        # sample cannot hit an uninitialised local variable.
+        left_area = float(left_binary.sum())
+        right_area = float(right_binary.sum())
         overlap = left_binary & right_binary
         if overlap.any():
             labels = parsing_np[batch_index]
             left_ear_support = float((left_binary & (labels == RAW_LEFT_EAR)).sum())
             right_ear_support = float((right_binary & (labels == RAW_RIGHT_EAR)).sum())
-            left_area = float(left_binary.sum())
-            right_area = float(right_binary.sum())
             # Keep the side with stronger native ear/parser support.  If both
             # supports tie, retain the larger verified object and remove only
             # the duplicate overlap pixels from the other side.

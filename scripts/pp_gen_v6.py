@@ -97,7 +97,7 @@ PP_EXTRA_MASK_KEYS = (
 )
 
 # ========================= User Config: edit here only =========================
-USER_DATASET_PROFILE = "small_accessory_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
+USER_DATASET_PROFILE = "full_ffhq"  # "small_accessory_ffhq" or "full_ffhq"
 
 USER_FACE_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/ear/")
 USER_DONOR_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/images/FFHQ_short/")
@@ -105,7 +105,7 @@ USER_DONOR_GALLERY_DIR_SMALL = Path("/data/coding/HairFastGAN/HairFastGAN-main/i
 USER_OUTPUT_DIR_SMALL = Path("images/pp_dataset_v6_direct_satd_100_r17")
 # Generate 100 distinct source/shape/colour triplets.  The matching trainer
 # reserves 50 of these samples for validation and writes all 50 previews.
-USER_DATASET_SIZE_SMALL = 60
+USER_DATASET_SIZE_SMALL = 100
 # Chunk size now controls checkpoint frequency only.  Render/mask work streams
 # one mask batch at a time, so this does not retain a whole chunk in memory.
 USER_CHUNK_SIZE_SMALL = 256
@@ -114,24 +114,26 @@ USER_MASK_BATCH_SIZE_SMALL = 8
 # torch container makes 100 samples need roughly 1.7 GB and can fail on a
 # quota-limited training volume. gzip is lossless: it changes only the outer
 # file container, not a serialized tensor value.
-USER_DATASET_COMPRESSION = "gzip"  # "gzip" or "none"
+USER_DATASET_COMPRESSION = "none"  # "gzip" or "none"
 USER_DATASET_GZIP_LEVEL = 1  # lossless and substantially faster than level 6
 
 USER_FACE_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
 USER_DONOR_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
-USER_OUTPUT_DIR_FULL = Path("images/pp_dataset_v6_direct_satd_full_r17")
+USER_OUTPUT_DIR_FULL = Path("images/pp_dataset")
 USER_DATASET_SIZE_FULL = 10_000
 USER_CHUNK_SIZE_FULL = 256
 USER_MASK_BATCH_SIZE_FULL = 16
 
 USER_RANDOM_SEED = 3407
+USER_SHARD_INDEX = 0
+USER_NUM_SHARDS = 1
 USER_BLENDING_CHECKPOINT = "pretrained_models/Blending/checkpoint.pth"
 # PP target construction may deliberately use the pre-v8 blending checkpoint
 # above.  The resulting PP dataset records this choice in dataset_config.json;
 # it is not an inference default for a newly trained blending checkpoint.
 USER_ALLOW_LEGACY_BLENDING_CHECKPOINT_V8 = True
 USER_USE_SATD_V8 = True
-USER_SATD_CHECKPOINT_V8 = "/data/coding/HairFastGAN/HairFastGAN-main/checkpoints/satd_3000_best.pth"
+USER_SATD_CHECKPOINT_V8 = "/root/shared-nvme/hairfast_ppmodify/checkpoints/satd_3000_best.pth"
 # Match the inference blend used when SATD itself was trained.  The final
 # compositor applies this candidate exactly once instead of amplifying its RGB
 # difference after decoding.
@@ -254,6 +256,8 @@ RESOLVED_USER_CONFIG = {
     "face_gallery_dir": ACTIVE_FACE_GALLERY_DIR,
     "donor_gallery_dir": ACTIVE_DONOR_GALLERY_DIR,
     "seed": USER_RANDOM_SEED,
+    "shard_index": USER_SHARD_INDEX,
+    "num_shards": USER_NUM_SHARDS,
     "size": ACTIVE_DATASET_SIZE,
     "output": ACTIVE_OUTPUT_DIR,
     "blending_checkpoint": USER_BLENDING_CHECKPOINT,
@@ -455,9 +459,16 @@ def build_parser(defaults):
     parser.add_argument("--face_gallery_dir", type=str2path, default=defaults["face_gallery_dir"])
     parser.add_argument("--donor_gallery_dir", type=str2path, default=defaults["donor_gallery_dir"])
     parser.add_argument("--seed", type=int, default=defaults["seed"])
+    parser.add_argument("--shard_index", type=int, default=defaults["shard_index"])
+    parser.add_argument("--num_shards", type=int, default=defaults["num_shards"])
     parser.add_argument("--size", type=int, default=defaults["size"])
     parser.add_argument("--output", type=Path, default=defaults["output"])
     parser.add_argument("--blending_checkpoint", type=str, default=defaults["blending_checkpoint"])
+    parser.add_argument(
+        "--allow_resume_policy_mismatch",
+        action="store_true",
+        help="Allow resume when only policy-file hashes changed.",
+    )
     parser.add_argument(
         "--allow_legacy_blending_checkpoint_v8",
         type=str2bool,
@@ -2513,9 +2524,14 @@ def build_dataset_identity(args, model_args) -> dict[str, object]:
             "sha256": _sha256_file(resolved) if resolved.exists() else None,
         }
 
+    generator_args = {
+        key: value
+        for key, value in vars(args).items()
+        if key != "allow_resume_policy_mismatch"
+    }
     identity = {
         "schema_version": DATASET_CONFIG_SCHEMA_VERSION,
-        "generator_args": _jsonable_config(vars(args)),
+        "generator_args": _jsonable_config(generator_args),
         "model_policy": {
             key: _jsonable_config(value)
             for key, value in vars(model_args).items()
@@ -2563,10 +2579,22 @@ def validate_pp_dataset_resume(args, model_args) -> None:
 
     if previous is not None and part_files_exist:
         if previous.get("identity_sha256") != identity["identity_sha256"]:
-            raise RuntimeError(
-                f"Cannot mix PP dataset policies in {output}: code, checkpoint, or generation "
-                "settings changed. Use a fresh output directory and regenerate all parts."
-            )
+            previous_without_code = dict(previous)
+            current_without_code = dict(identity)
+            previous_without_code.pop("identity_sha256", None)
+            current_without_code.pop("identity_sha256", None)
+            previous_without_code.pop("code_sha256", None)
+            current_without_code.pop("code_sha256", None)
+            for metadata in (previous_without_code, current_without_code):
+                generator_args = metadata.get("generator_args")
+                if isinstance(generator_args, dict):
+                    generator_args.pop("allow_resume_policy_mismatch", None)
+            if not (args.allow_resume_policy_mismatch and previous_without_code == current_without_code):
+                raise RuntimeError(
+                    f"Cannot mix PP dataset policies in {output}: code, checkpoint, or generation "
+                    "settings changed. Use a fresh output directory and regenerate all parts."
+                )
+            print("[resume] only policy-file hashes changed; continuing explicitly.")
 
     temporary = config_path.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -2602,6 +2630,12 @@ def main(args):
         raise ValueError("--io_num_workers must be non-negative")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch_factor must be positive")
+    if args.num_shards <= 0:
+        raise ValueError("--num_shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError(
+            f"--shard_index must be in [0, {args.num_shards}); got {args.shard_index}"
+        )
 
     seed_everything(args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -2702,15 +2736,26 @@ def main(args):
         f"donor_dir={args.donor_gallery_dir}, size={resolved_size}"
     )
 
-    experiments = []
+    all_experiments = []
     for exp in sample_distinct_triplets(face_images, donor_images, resolved_size):
         stem_names = [Path(name).stem for name in exp]
-        experiments.append(
+        all_experiments.append(
             {
                 "source_name": exp[0],
                 "target_name": f"{'_'.join(stem_names)}.png",
                 "triplet": exp,
             }
+        )
+
+    experiments = [
+        experiment
+        for index, experiment in enumerate(all_experiments)
+        if index % args.num_shards == args.shard_index
+    ]
+    if args.num_shards > 1:
+        print(
+            f"GPU shard {args.shard_index}/{args.num_shards}: "
+            f"processing {len(experiments)} of {len(all_experiments)} experiments."
         )
 
     total_parts = count_dataset_parts(len(experiments), args.chunk_size, args.mask_batch_size)
