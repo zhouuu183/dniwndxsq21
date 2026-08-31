@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from models.Blending import Blending as AuthorBlending
@@ -12,17 +13,16 @@ from utils.save_utils import save_gen_image, save_latents
 
 
 class BlendingV6(nn.Module):
-    """Author pre-PP transfer with a live PP decode and isolated SATD branch.
+    """Author transfer with SATD applied to ``F_author`` before colour blend.
 
-    The base path keeps the author hair-shape alignment and colour blending,
-    then runs SATD on the blended ``F`` feature and decodes
-    ``I_satd_blend``.  Its 256px image is the direct PP input for one StyleGAN
-    decode.  SATD's learned candidate delta is not applied again after PP;
-    only a background-only continuity field may harmonize the already cleaned
-    region with neighbouring visible background.
+    The runtime order is explicit: author alignment produces ``F_author``;
+    the V8 SATD branch prepares ``F_satd``; the original blending encoder then
+    produces ``S_blend``; and StyleGAN decodes ``S_blend + F_satd``.  The
+    resulting ``I_satd_blend`` is the direct PP input.  SATD is never applied
+    again after PP; only the verified earring compositor runs there.
     """
 
-    RUNTIME_REVISION = "v6-e5-canonical-object-20260828"
+    RUNTIME_REVISION = "v6-e10-direct-local-background-field-20260831"
 
     def __init__(self, opts, net=None):
         super().__init__()
@@ -129,7 +129,13 @@ class BlendingV6(nn.Module):
             f"right_hair={scalar('v6_canonical_right_hair_cover_ratio'):.3f} "
             f"visible_alpha={area('v6_canonical_visible_earring_alpha'):.1f} "
             f"final_alpha={area('output_source_earring_composite_mask'):.1f} "
-            f"satd_alpha={area('satd_background_cleanup_alpha'):.1f}"
+            f"baseline_left={scalar('v6_baseline_left_earring_detected'):.0f} "
+            f"baseline_right={scalar('v6_baseline_right_earring_detected'):.0f} "
+            f"satd_alpha={area('satd_background_cleanup_alpha'):.1f} "
+            f"satd_support={area('satd_background_effective_cleanup_support'):.1f} "
+            f"satd_ghost={area('satd_background_ghost_hair_write'):.1f} "
+            f"satd_ref_weight={scalar('satd_background_reference_weight'):.2f} "
+            f"satd_delta={scalar('satd_background_applied_delta_mean'):.4f}"
         )
 
     @staticmethod
@@ -139,7 +145,12 @@ class BlendingV6(nn.Module):
             ("satd_pp_before_01", "01_satd_pp_before.png"),
             ("satd_pp_after_01", "02_satd_pp_after.png"),
             ("satd_background_cleanup_alpha", "03_satd_cleanup_alpha.png"),
+            ("satd_background_m_remove", "03b_satd_m_remove.png"),
             ("satd_background_continuity_confidence", "04_satd_continuity_confidence.png"),
+            ("satd_background_reference_target_01", "14_satd_background_reference.png"),
+            ("satd_background_ghost_hair_write", "15_satd_ghost_hair_write.png"),
+            ("satd_background_target_hair_core", "16_satd_target_hair_core.png"),
+            ("satd_background_background_like", "17_satd_background_like.png"),
             ("source_native_earring_parser_seed", "05_source_parser_seed.png"),
             ("source_native_earring_strong_seed", "06_source_v5_strong_seed.png"),
             ("source_native_earring_recall_hint", "07_source_v5_recall_hint.png"),
@@ -224,13 +235,12 @@ class BlendingV6(nn.Module):
 
     @torch.inference_mode()
     def _render_satd_candidate(self, S_blend, I_blend, kwargs):
-        """Render SATD only after the author image path has consumed its noise.
+        """Decode the prepared SATD feature with the author's ``S_blend``.
 
-        StyleGAN defaults to sampled per-layer noise.  Constructing a SATD
-        candidate before the author transfer/PP decode changes that RNG
-        sequence even when SATD never enters S/F.  Resolve the side branch
-        lazily so the author image remains bit-for-bit on its own execution
-        schedule.
+        StyleGAN defaults to sampled per-layer noise.  The feature/mask branch
+        is prepared before colour blending; this method performs its paired
+        decode after the author's baseline render has consumed noise, then
+        replays the same noise state for a like-for-like comparison.
         """
         satd_alignment = kwargs.get("satd_alignment")
         if satd_alignment is None:
@@ -299,22 +309,80 @@ class BlendingV6(nn.Module):
 
         return I_blend, {}
 
+    @staticmethod
+    def _resolve_satd_alignment(kwargs):
+        """Build SATD's F-space correction before the colour blending encoder.
+
+        SATD preparation is an auxiliary model branch and must not advance the
+        random-noise sequence used by the author's baseline render.  The
+        factory is evaluated once and the caller receives the same alignment
+        dictionary for the later ``S_blend + F_satd`` decode.
+        """
+        satd_alignment = kwargs.get("satd_alignment")
+        if satd_alignment is not None:
+            return satd_alignment
+        factory = kwargs.get("satd_alignment_factory")
+        if not callable(factory):
+            return None
+        cpu_state = torch.random.get_rng_state()
+        cuda_state = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
+        try:
+            satd_alignment = factory()
+        finally:
+            torch.random.set_rng_state(cpu_state)
+            if cuda_state is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(cuda_state)
+        return satd_alignment
+
     @torch.inference_mode()
     def blend_images(self, align_shape, align_color, name_to_embed, **kwargs):
+        # F_author is already fixed by the author's alignment.  Prepare the
+        # V8 SATD feature correction now, before invoking the author's colour
+        # blending encoder, so the subsequent decode is unambiguously
+        # S_blend + F_satd rather than a post-colour residual.
+        satd_alignment = self._resolve_satd_alignment(kwargs)
+        render_kwargs = dict(kwargs)
+        render_kwargs["satd_alignment"] = satd_alignment
+        # The factory has already been evaluated above.  Prevent the legacy
+        # renderer fallback from constructing a second SATD branch.
+        render_kwargs.pop("satd_alignment_factory", None)
         I_1, HM_3E, HM_X, target_mask, S_blend, I_blend = self._author_transfer(
             align_shape,
             align_color,
             name_to_embed,
         )
-        # SATD is a separate F-space correction on top of the author's
-        # already-completed shape/colour latent.  The corrected image is the
-        # actual PP input in direct-SATD mode; the baseline I_blend is kept
-        # only as a diagnostic/reference image.
+        # Decode the same S_blend once with F_satd.  I_blend remains the exact
+        # author render (F_author) and is used only as a baseline reference.
         I_blend_satd, cleanup_masks = self._render_satd_candidate(
             S_blend,
             I_blend,
-            kwargs,
+            render_kwargs,
         )
+        # Old V8's successful background recovery was conditioned on the
+        # SEAN source-inpaint render, not on I_blend itself.  I_blend contains
+        # the source-hair shadow that must be removed, so it cannot be the
+        # colour-field reference.  Keep this reference separate from the
+        # author baseline used by SATD/PP and resize it only for the final
+        # high-resolution background compositor.
+        satd_background_clean_reference = None
+        if isinstance(satd_alignment, dict):
+            satd_background_clean_reference = satd_alignment.get("source_inpaint_256")
+            if torch.is_tensor(satd_background_clean_reference):
+                if satd_background_clean_reference.ndim == 3:
+                    satd_background_clean_reference = satd_background_clean_reference.unsqueeze(0)
+                satd_background_clean_reference = F.interpolate(
+                    satd_background_clean_reference.to(
+                        device=I_blend.device,
+                        dtype=I_blend.dtype,
+                    ),
+                    size=I_blend.shape[-2:],
+                    mode="bicubic",
+                    align_corners=False,
+                ).clamp(-1, 1)
+            else:
+                satd_background_clean_reference = None
         direct_satd_pp_input = bool(
             getattr(self.opts, "direct_satd_pp_input", True)
         )
@@ -360,11 +428,23 @@ class BlendingV6(nn.Module):
             target_hair_mask=HM_X,
             authoritative_hair_highres=I_blend_satd if direct_satd_pp_input else I_blend,
             authoritative_target_highres=I_blend_satd if direct_satd_pp_input else I_blend,
+            # Keep the unmodified author transfer available solely for the
+            # final earring deduplication guard.  SATD may change parser
+            # labels around an accessory, so it is not a reliable baseline
+            # presence signal.
+            baseline_target_highres=I_blend,
             # Keep the SATD render available to the background-only final
-            # continuity pass.  In direct mode it is not applied a second
-            # time as a residual; it supplies geometry/diagnostics while the
-            # final PP background is matched to nearby clean background.
+            # continuity pass.  It is applied only on approved background
+            # pixels, never on face, hair, ears or neck.
             satd_background_highres=I_blend_satd,
+            # Keep the SEAN inpaint canvas available as a fallback/diagnostic.
+            # The final compositor first samples visible, unoccluded pixels
+            # from the authoritative target canvas itself.
+            satd_background_reference_highres=(
+                satd_background_clean_reference
+                if satd_background_clean_reference is not None
+                else I_blend
+            ),
             direct_satd_pp_input=direct_satd_pp_input,
             earring_reference=name_to_embed["face"].get("image_1024"),
             source_face_reference=name_to_embed["face"].get("image_1024"),

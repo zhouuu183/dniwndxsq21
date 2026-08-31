@@ -1625,6 +1625,41 @@ class PostProcessModelV6(nn.Module):
         aux["authoritative_target_highres_01"] = ((authority + 1.0) * 0.5).clamp(0, 1)
 
     @staticmethod
+    def _attach_baseline_target_highres(
+        aux: dict[str, torch.Tensor],
+        baseline_target_highres: torch.Tensor | None,
+        reference: torch.Tensor,
+    ) -> None:
+        """Store the author's pre-SATD transfer for earring presence checks.
+
+        In direct-SATD mode ``authoritative_target_highres`` is intentionally
+        the SATD candidate used by PP.  Earring deduplication nevertheless
+        needs the original author ``I_blend`` because SATD may alter or erase
+        the parser label around an already-retained accessory.
+        """
+        if baseline_target_highres is None:
+            return
+        if not torch.is_tensor(baseline_target_highres):
+            raise TypeError("baseline_target_highres must be a torch.Tensor.")
+        baseline = baseline_target_highres
+        if baseline.ndim == 3:
+            baseline = baseline.unsqueeze(0)
+        if baseline.ndim != 4 or baseline.size(1) != 3:
+            raise ValueError(
+                "baseline_target_highres must have shape [B,3,H,W], "
+                f"got {tuple(baseline.shape)}."
+            )
+        if baseline.size(0) != reference.size(0):
+            raise ValueError(
+                "baseline_target_highres batch size must match the PP input: "
+                f"{baseline.size(0)} != {reference.size(0)}."
+            )
+        baseline = baseline.to(device=reference.device, dtype=reference.dtype)
+        if not bool(torch.isfinite(baseline).all()):
+            raise ValueError("baseline_target_highres contains non-finite values.")
+        aux["baseline_target_highres_01"] = ((baseline + 1.0) * 0.5).clamp(0, 1)
+
+    @staticmethod
     def _attach_satd_background_highres(
         aux: dict[str, torch.Tensor],
         satd_background_highres: torch.Tensor | None,
@@ -1652,6 +1687,35 @@ class PostProcessModelV6(nn.Module):
         if not bool(torch.isfinite(candidate).all()):
             raise ValueError("satd_background_highres contains non-finite values.")
         aux["satd_background_highres_01"] = ((candidate + 1.0) * 0.5).clamp(0, 1)
+
+    @staticmethod
+    def _attach_satd_background_reference_highres(
+        aux: dict[str, torch.Tensor],
+        satd_background_reference_highres: torch.Tensor | None,
+        reference: torch.Tensor,
+    ) -> None:
+        """Store the pre-SATD image used only for clean background sampling."""
+        if satd_background_reference_highres is None:
+            return
+        if not torch.is_tensor(satd_background_reference_highres):
+            raise TypeError("satd_background_reference_highres must be a torch.Tensor.")
+        source = satd_background_reference_highres
+        if source.ndim == 3:
+            source = source.unsqueeze(0)
+        if source.ndim != 4 or source.size(1) != 3:
+            raise ValueError(
+                "satd_background_reference_highres must have shape [B,3,H,W], "
+                f"got {tuple(source.shape)}."
+            )
+        if source.size(0) != reference.size(0):
+            raise ValueError(
+                "satd_background_reference_highres batch size must match the PP input: "
+                f"{source.size(0)} != {reference.size(0)}."
+            )
+        source = source.to(device=reference.device, dtype=reference.dtype)
+        if not bool(torch.isfinite(source).all()):
+            raise ValueError("satd_background_reference_highres contains non-finite values.")
+        aux["satd_background_reference_highres_01"] = ((source + 1.0) * 0.5).clamp(0, 1)
 
     @staticmethod
     def _attach_direct_satd_flag(
@@ -1733,7 +1797,9 @@ class PostProcessModelV6(nn.Module):
         target_hair_mask: torch.Tensor | None = None,
         authoritative_hair_highres: torch.Tensor | None = None,
         authoritative_target_highres: torch.Tensor | None = None,
+        baseline_target_highres: torch.Tensor | None = None,
         satd_background_highres: torch.Tensor | None = None,
+        satd_background_reference_highres: torch.Tensor | None = None,
         direct_satd_pp_input=None,
         query_mask: torch.Tensor | None = None,
         source_ear_mask: torch.Tensor | None = None,
@@ -1794,6 +1860,11 @@ class PostProcessModelV6(nn.Module):
                 authoritative_target_highres,
                 source,
             )
+            self._attach_baseline_target_highres(
+                aux,
+                baseline_target_highres,
+                source,
+            )
             if source_instance_verified_left is not None:
                 aux["source_instance_verified_left"] = source_instance_verified_left
             if source_instance_verified_right is not None:
@@ -1801,6 +1872,11 @@ class PostProcessModelV6(nn.Module):
             self._attach_satd_background_highres(
                 aux,
                 satd_background_highres,
+                source,
+            )
+            self._attach_satd_background_reference_highres(
+                aux,
+                satd_background_reference_highres,
                 source,
             )
             self._attach_direct_satd_flag(aux, direct_satd_pp_input, source)
@@ -1852,6 +1928,11 @@ class PostProcessModelV6(nn.Module):
             authoritative_target_highres,
             source,
         )
+        self._attach_baseline_target_highres(
+            aux,
+            baseline_target_highres,
+            source,
+        )
         if source_instance_verified_left is not None:
             aux["source_instance_verified_left"] = source_instance_verified_left
         if source_instance_verified_right is not None:
@@ -1859,6 +1940,11 @@ class PostProcessModelV6(nn.Module):
         self._attach_satd_background_highres(
             aux,
             satd_background_highres,
+            source,
+        )
+        self._attach_satd_background_reference_highres(
+            aux,
+            satd_background_reference_highres,
             source,
         )
         self._attach_direct_satd_flag(aux, direct_satd_pp_input, source)
@@ -2190,11 +2276,24 @@ class PostProcessModelV6(nn.Module):
         denom = known_mask.flatten(2).sum(dim=2, keepdim=True).clamp_min(1.0)
         known_mean = (value * known_mask).flatten(2).sum(dim=2, keepdim=True) / denom
         known_mean = known_mean.unsqueeze(-1)
-        # Seed the unknown region with the global known mean, then relax by
-        # repeated blur while re-anchoring the true known pixels each step.  This
-        # is a stable harmonic fill: unknown pixels converge to the surrounding
-        # known tone instead of drifting toward the peak value.
-        estimate = value * known_mask + known_mean * (1.0 - known_mask)
+        # Seed from the nearest measured background first.  A global mean alone
+        # creates broad colour islands when the visible background has a
+        # gradient; normalized local colour keeps each shadow pixel tied to its
+        # surrounding unoccluded tone.  Pixels with no local support fall back
+        # to the per-image mean and are then filled by the diffusion passes.
+        local_weight = gaussian_blur(
+            known_mask,
+            kernel_size=kernel_size,
+            sigma=sigma,
+        )
+        local_value = gaussian_blur(
+            value * known_mask,
+            kernel_size=kernel_size,
+            sigma=sigma,
+        ) / local_weight.clamp_min(1e-4)
+        local_valid = (local_weight > 1e-3).to(value.dtype)
+        initial = local_value * local_valid + known_mean * (1.0 - local_valid)
+        estimate = value * known_mask + initial * (1.0 - known_mask)
         for _ in range(max(1, int(iterations))):
             estimate = gaussian_blur(estimate, kernel_size=kernel_size, sigma=sigma)
             estimate = value * known_mask + estimate * (1.0 - known_mask)
@@ -2785,12 +2884,13 @@ class PostProcessModelV6(nn.Module):
                 0.1,
                 float(getattr(self.args, "earring_component_max_cumulative_cost", 1.85)),
             ),
-            # Keep the source instance contiguous and shape-preserving.  The
-            # r9 continuation graph admitted neighbouring highlights/background
-            # components and produced deformed earrings; long pendants are
-            # recovered by the verified structured source-instance fallback
-            # below instead of by a permissive component union.
-            allow_long_continuation=False,
+            # Long pendants are frequently split into a bright attachment
+            # rim and low-contrast lower body.  Use the bounded native
+            # continuation graph here as in dataset generation; it only joins
+            # lobe-connected, material-consistent components and never opens
+            # a free ear/background ROI.
+            allow_long_continuation=True,
+            allow_semantic_hair_continuation=True,
         )
         native_alpha = native_extracted["source_native_earring_alpha"]
         extracted = {
@@ -4003,8 +4103,10 @@ class PostProcessModelV6(nn.Module):
         # source object below.  This is a normal RGB replacement, never a
         # zero/black mask clear; genuine transfer accessories and the verified
         # source instance remain untouched.
-        completed_target = aux.get("authoritative_target_highres_01", aux.get("target_01"))
-        if torch.is_tensor(completed_target):
+        completed_target_value = aux.get("authoritative_target_highres_01", aux.get("target_01"))
+        completed_target_available = torch.is_tensor(completed_target_value)
+        completed_target = completed_target_value
+        if completed_target_available:
             completed_target = normalized_to_01(completed_target).to(
                 device=image_01.device, dtype=image_01.dtype
             )
@@ -4018,6 +4120,55 @@ class PostProcessModelV6(nn.Module):
             completed_target = image_01
             completed_earring = torch.zeros_like(image_01[:, :1])
         pp_existing_earring = parsing_label_mask(target_parsing_output, (RAW_EARRING,))
+
+        # The author transfer can already retain a source earring.  In that
+        # case this V6 compositor must not paste the source object a second
+        # time on the same target side.  Assign the completed target's parser
+        # earring pixels to the actual target ear/lobe cues rather than using
+        # an image-half split: long pendants can cross the centre line and
+        # profile faces do not obey a fixed left/right x coordinate.
+        baseline_target = aux.get("baseline_target_highres_01")
+        baseline_target_available = torch.is_tensor(baseline_target)
+        if baseline_target_available:
+            baseline_target = normalized_to_01(baseline_target).to(
+                device=image_01.device, dtype=image_01.dtype
+            )
+            if baseline_target.shape[-2:] != size:
+                baseline_target = F.interpolate(
+                    baseline_target, size=size, mode="bilinear", align_corners=False
+                )
+            baseline_target_parsing = self.parsing_helper.parse(
+                baseline_target, out_size=size
+            )
+            baseline_earring = parsing_label_mask(
+                baseline_target_parsing, (RAW_EARRING,)
+            )
+        else:
+            # Legacy callers did not provide a separate author image.  The
+            # completed target is the best available presence signal, but do
+            # not treat the PP decode itself as a baseline image.
+            baseline_earring = completed_earring if completed_target_available else torch.zeros_like(completed_earring)
+        baseline_left_earring = torch.zeros_like(baseline_earring)
+        baseline_right_earring = torch.zeros_like(baseline_earring)
+        if baseline_target_available or completed_target_available:
+            baseline_left_earring, baseline_right_earring = assign_components_to_ear_sides(
+                baseline_earring,
+                dilate_mask(target_left_gate_output, 25),
+                dilate_mask(target_right_gate_output, 25),
+                target_left_gate_output,
+                target_right_gate_output,
+            )
+        baseline_area_floor = max(1.0, min(4.0, 0.25 * float(min_target_area)))
+        baseline_left_present = (
+            baseline_left_earring.flatten(1).sum(dim=1, keepdim=True)
+            >= baseline_area_floor
+        ).view(-1, 1, 1, 1)
+        baseline_right_present = (
+            baseline_right_earring.flatten(1).sum(dim=1, keepdim=True)
+            >= baseline_area_floor
+        ).view(-1, 1, 1, 1)
+        aux["v6_baseline_left_earring_detected"] = baseline_left_present.to(image_01.dtype).detach()
+        aux["v6_baseline_right_earring_detected"] = baseline_right_present.to(image_01.dtype).detach()
         target_lobe_zone = dilate_mask(
             torch.maximum(
                 torch.maximum(target_left_gate_output, target_right_gate_output),
@@ -4038,11 +4189,43 @@ class PostProcessModelV6(nn.Module):
             image_01 * (1.0 - pp_duplicate_clear)
             + completed_target * pp_duplicate_clear
         ).clamp(0, 1)
+
+        # If the author baseline already contains an earring, its pixels are
+        # the authority for that side.  Restore them before the V6 compositor
+        # (the PP decode can otherwise blur/remove a valid baseline object),
+        # then the effective source gate below prevents a second overlay.
+        baseline_restore_mask = torch.clamp(
+            baseline_left_earring + baseline_right_earring,
+            0,
+            1,
+        )
+        if baseline_target_available:
+            baseline_target_output = baseline_target
+        else:
+            baseline_target_output = completed_target
+        base_before_object = (
+            base_before_object * (1.0 - baseline_restore_mask)
+            + baseline_target_output * baseline_restore_mask
+        ).clamp(0, 1)
+        aux["v6_baseline_earring_restore_mask"] = baseline_restore_mask.detach()
+
+        # Keep the original target gates for duplicate cleanup above, but use
+        # side-specific effective gates for source compositing.  This leaves
+        # an author-retained earring untouched and still permits recovery on
+        # the opposite ear when that side is genuinely empty.
+        source_left_gate_output = target_left_gate_output * (
+            1.0 - baseline_left_present.to(image_01.dtype)
+        ).clamp(0, 1)
+        source_right_gate_output = target_right_gate_output * (
+            1.0 - baseline_right_present.to(image_01.dtype)
+        ).clamp(0, 1)
+        aux["v6_source_left_gate_after_baseline_guard"] = source_left_gate_output.detach()
+        aux["v6_source_right_gate_after_baseline_guard"] = source_right_gate_output.detach()
         result, alpha = composite_earring_v6(
             base_before_object,
             aligned_output,
-            target_left_gate_output,
-            target_right_gate_output,
+            source_left_gate_output,
+            source_right_gate_output,
             min_visible_area=max(2.0, min_target_area),
         )
 
@@ -4074,6 +4257,8 @@ class PostProcessModelV6(nn.Module):
         aux["final_hole_alpha"] = aux["output_v19_hole_mask"]
         aux["output_v19_target_left_visible_ear"] = target_left_gate_output
         aux["output_v19_target_right_visible_ear"] = target_right_gate_output
+        aux["output_v19_target_left_ear_after_baseline_guard"] = source_left_gate_output
+        aux["output_v19_target_right_ear_after_baseline_guard"] = source_right_gate_output
         aux["pp_existing_earring_mask"] = pp_existing_earring.detach()
         aux["pp_duplicate_clear_mask"] = pp_duplicate_clear.detach()
         aux["v6_outside_authorized_write_area"] = alpha.new_zeros(
@@ -5758,7 +5943,12 @@ class PostProcessModelV6(nn.Module):
         can only authorize an edit after it intersects the parsed background.
         """
         candidate = aux.get("satd_background_highres_01")
+        # ``base_target`` is the actual SATD/author transfer used by PP.  The
+        # clean inpaint canvas is a colour reference only; using it here would
+        # manufacture a second residual between two different image domains.
         base_target = aux.get("authoritative_target_highres_01")
+        if base_target is None:
+            base_target = aux.get("satd_background_reference_highres_01")
         image_01 = normalized_to_01(image).clamp(0, 1)
         if candidate is None or base_target is None:
             aux["satd_background_cleanup_alpha"] = torch.zeros_like(image_01[:, :1])
@@ -5780,7 +5970,47 @@ class PostProcessModelV6(nn.Module):
         if base_target.shape[-2:] != size:
             base_target = F.interpolate(base_target, size=size, mode="bilinear", align_corners=False)
 
-        target_parsing = self.parsing_helper.parse(base_target, out_size=size)
+        # Use the visible background of the same author/SATD canvas as the
+        # colour source.  It is in the exact target coordinate system and its
+        # pixels outside M_remove are the unoccluded background seen in the
+        # desired result.  The SEAN inpaint canvas is only a fallback: its
+        # generated fill can contain black/grey padding, which must never be
+        # diffused into the output.
+        background_reference = base_target
+        if background_reference is None:
+            background_reference = aux.get("satd_background_reference_highres_01")
+        if background_reference is None:
+            background_reference = aux.get("source_face_reference_01")
+        else:
+            background_reference = normalized_to_01(background_reference).to(
+                device=image_01.device,
+                dtype=image_01.dtype,
+            )
+            if background_reference.shape[-2:] != size:
+                background_reference = F.interpolate(
+                    background_reference,
+                    size=size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+        # Geometry and colour reference are different sources.  Parse the
+        # authoritative SATD/PP target for geometry; the separate inpaint
+        # canvas remains colour-only and is never used to define face/hair
+        # ownership.
+        geometry_target = aux.get("authoritative_target_highres_01", candidate)
+        geometry_target = normalized_to_01(geometry_target).to(
+            device=image_01.device,
+            dtype=image_01.dtype,
+        )
+        if geometry_target.shape[-2:] != size:
+            geometry_target = F.interpolate(
+                geometry_target,
+                size=size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        target_parsing = self.parsing_helper.parse(geometry_target, out_size=size)
         target_labels = target_parsing.long()
         background = (target_labels == 0).to(dtype=image_01.dtype)
         parsed_hair = (target_labels == RAW_HAIR).to(dtype=image_01.dtype)
@@ -5792,14 +6022,19 @@ class PostProcessModelV6(nn.Module):
         # not target hair; M_remove may clean only those pixels.
         raw_target_hair_hint = aux.get("target_hair_mask")
         if raw_target_hair_hint is None:
-            target_hair_authority = parsed_hair
+            target_hair_core = parsed_hair
         else:
-            target_hair_authority = resize_mask(
+            target_hair_core = resize_mask(
                 raw_target_hair_hint,
                 size,
             ).to(device=image_01.device, dtype=image_01.dtype).clamp(0, 1)
+        # Keep the unexpanded target-hair core as the ownership mask.  A
+        # dilated copy is useful only as a narrow safety guard; using it for
+        # ghost-shadow classification would leave source-hair colour beside
+        # the new hairstyle untouched.
+        target_hair_core = (target_hair_core > 0.25).to(image_01.dtype)
         target_hair_authority = dilate_mask(
-            (target_hair_authority > 0.25).to(image_01.dtype),
+            target_hair_core,
             max(
                 1,
                 int(
@@ -5811,21 +6046,17 @@ class PostProcessModelV6(nn.Module):
                 ),
             ),
         )
-        ghost_hair = (parsed_hair * (1.0 - target_hair_authority)).clamp(0, 1)
-        # A candidate cleanup can cover both ordinary parsed background and
-        # the false-hair residue above.  All real subject semantics and the
-        # authoritative target hairstyle remain hard-blocked below.
-        safe_region = torch.clamp(background + ghost_hair, 0, 1)
-        # SATD's candidate is already a latent-space cleanup result.  The
-        # previous 17px exclusion ring removed nearly all pixels next to the
-        # transferred hair, which is exactly where the residual shadow lives;
-        # it made SATD appear disabled.  Keep a narrow safety ring so no
-        # semantic subject pixel is edited, while allowing nearby background
-        # cleanup to survive.
+        ghost_hair = (parsed_hair * (1.0 - target_hair_core)).clamp(0, 1)
+        # Parser background is the normal writable class.  Parser-hair pixels
+        # outside the target-hair core are source-hair-shadow candidates, but
+        # they may be written only after intersecting M_remove below.
         subject_hint = (
             (target_labels != 0) & (target_labels != RAW_HAIR)
         ).to(dtype=image_01.dtype)
-        subject_hint = torch.maximum(subject_hint, target_hair_authority)
+        # Protect actual target-hair pixels, but do not protect parser-hair
+        # pixels outside that core: those pixels are precisely the source-hair
+        # colour/shadow residue that M_remove is meant to clear.
+        subject_hint = torch.maximum(subject_hint, target_hair_core)
         # The high-resolution parser is the primary geometry source, but a
         # thin hair/face contour can be labelled background at one pass.  Add
         # the already-computed target subject masks as a second guard before
@@ -5850,77 +6081,38 @@ class PostProcessModelV6(nn.Module):
             max(1, int(getattr(self.args, "satd_background_exclude_dilate", 2))),
         )
 
-        cleanup_support = torch.zeros_like(background)
-        for key in (
-            # Boundary/context masks are still SATD-authorized support.  They
-            # are safe to use here because the semantic subject guard below
-            # remains the final authority on every individual pixel.
-            "M_boundary",
-            "M_remove",
-            "M_remove_halo",
-            "M_remove_tail",
-            "M_remove_face",
-            "M_remove_neck",
-            "M_remove_context",
-        ):
-            value = aux.get(key)
-            if value is not None:
-                cleanup_support = torch.maximum(
-                    cleanup_support,
-                    resize_mask(value, size).to(device=image_01.device, dtype=image_01.dtype),
-                )
-
-        # M_remove is usually conservative around the outer shadow boundary.
-        # Expand only its support mask before intersecting with semantic
-        # background below; this recovers the remaining shadow tail while the
-        # subject guard still blocks every face/hair/ear/neck pixel.
-        cleanup_expand = max(
-            0,
-            # M_remove is intentionally conservative.  Expand its support
-            # farther into the background so residual shadow tails are also
-            # cleaned; the semantic subject guard below still hard-blocks
-            # face, hair, ears and neck pixels.
-            int(getattr(self.args, "satd_background_cleanup_dilate", 110)),
-        )
-        if cleanup_expand > 0:
-            cleanup_support = dilate_mask(cleanup_support, cleanup_expand)
-
-        # The semantic guard above intentionally protects hair plus a small
-        # surrounding ring.  That ring also contains the original-hair shadow
-        # on the *background* side of the transferred contour, which is the
-        # white/transparent-looking strip seen along an outer hair edge.  Open
-        # only the background pixels in that contour and only when an existing
-        # M_remove support lies nearby.  This never grants SATD access to hair,
-        # face, neck, ears or an unsupported background region.
-        hair_edge_radius = max(
-            1,
-            int(getattr(self.args, "satd_background_hair_edge_dilate", 16)),
-        )
-        hair_edge_support_radius = max(
-            hair_edge_radius,
-            int(getattr(self.args, "satd_background_hair_edge_support_dilate", 24)),
-        )
-        hair_edge_background = (
-            dilate_mask(target_hair_authority, hair_edge_radius)
-            * background
+        # The write support is intentionally exact: only M_remove pixels may
+        # be edited.  Other SATD channels (halo/tail/face/neck/context and
+        # boundary) remain available to the latent SATD model, but they are
+        # never promoted to a post-PP RGB write region.  The final operation is
+        # M_remove intersected with background-like pixels: parser background
+        # is accepted directly, while parser-hair is accepted only as the
+        # source-hair shadow class inside M_remove and outside target hair.
+        m_remove = aux.get("M_remove")
+        if m_remove is None:
+            cleanup_support = torch.zeros_like(background)
+        else:
+            cleanup_support = resize_mask(m_remove, size).to(
+                device=image_01.device,
+                dtype=image_01.dtype,
+            ).clamp(0, 1)
+        reference_support = cleanup_support.clone()
+        effective_cleanup_support = cleanup_support
+        hair_edge_background = torch.zeros_like(background)
+        hair_edge_cleanup = torch.zeros_like(background)
+        # A parser-hair pixel can be an old-hair shadow only when it is inside
+        # M_remove and outside the target-hair core.  It is therefore included
+        # in the background-like write class below, while all pixels outside
+        # M_remove stay locked.
+        ghost_hair_write = (ghost_hair * cleanup_support).clamp(0, 1)
+        # This is the complete semantic definition of the editable area:
+        # parser background, plus parser-hair source shadow outside the target
+        # hair core.  No additional subject/earring intersection is needed;
+        # those labels are already absent from this background-like mask.
+        background_like = torch.maximum(
+            background * (1.0 - target_hair_core).clamp(0, 1),
+            ghost_hair,
         ).clamp(0, 1)
-        nearby_cleanup = dilate_mask(cleanup_support, hair_edge_support_radius)
-        hair_edge_cleanup = (
-            hair_edge_background
-            * nearby_cleanup
-            * float(
-                max(
-                    0.0,
-                    min(1.0, float(getattr(self.args, "satd_background_hair_edge_strength", 1.0))),
-                )
-            )
-        ).clamp(0, 1)
-        effective_cleanup_support = torch.maximum(cleanup_support, hair_edge_cleanup)
-        # Keep the subject guard intact on this band.  The earlier version
-        # removed it to chase a hair-edge shadow, which let SATD write a
-        # discontinuous white contour into parsed hair/neck pixels.  Cleanup
-        # now reaches the supported background through the expanded mask while
-        # the semantic guard remains authoritative at the boundary.
 
         earring_guard = torch.zeros_like(background)
         # Only target-coordinate masks can guard the target output.  The
@@ -5943,15 +6135,13 @@ class PostProcessModelV6(nn.Module):
             max(1, int(getattr(self.args, "satd_background_earring_exclude_dilate", 6))),
         )
 
-        # M_remove is the authority for residual cleanup.  Its write area is
-        # ordinary background plus parser-misclassified ghost hair, while the
-        # semantic guard deliberately excludes face, ears, neck and the true
-        # author target hairstyle.
+        # M_remove is the sole authority for the final RGB residual cleanup;
+        # background_like is the sole semantic filter.  This deliberately is
+        # not multiplied by another subject/earring guard: doing so creates
+        # holes inside M_remove and leaves the source-hair shadow in blocks.
         alpha = (
-            effective_cleanup_support.clamp(0, 1)
-            * safe_region
-            * (1.0 - subject_guard).clamp(0, 1)
-            * (1.0 - earring_guard).clamp(0, 1)
+            cleanup_support.clamp(0, 1)
+            * background_like
         ).clamp(0, 1)
         # A source-hair shadow is primarily a low-frequency background error.
         # Transfer that continuous SATD reference instead of relying only on
@@ -5970,42 +6160,168 @@ class PostProcessModelV6(nn.Module):
         # or uniformly faded patch.  Subject and target-hair guards remain in
         # force for both the samples and the write alpha.
         clean_background = (
-            safe_region
+            background
             * (1.0 - subject_guard).clamp(0, 1)
             * (1.0 - earring_guard).clamp(0, 1)
-            * (1.0 - effective_cleanup_support).clamp(0, 1)
+            * (1.0 - reference_support).clamp(0, 1)
         ).clamp(0, 1)
-        reference_kernel = 51
-        clean_weight = gaussian_blur(
-            clean_background,
-            kernel_size=reference_kernel,
-            sigma=15.0,
+        source_parsing = aux.get("source_parsing")
+        if source_parsing is not None:
+            source_hair_mask = parsing_label_mask(source_parsing, (RAW_HAIR,))
+            clean_background = (
+                clean_background
+                * (1.0 - resize_mask(source_hair_mask, size)).clamp(0, 1)
+            ).clamp(0, 1)
+        # Estimate the colour field at the SATD working scale, not at the
+        # final 1024px canvas.  A 51px kernel at 1024px only sees a 25px
+        # neighbourhood and therefore falls back to the dark candidate when
+        # the source-hair shadow is wider than that.  At 256px the same kernel
+        # covers roughly 100px in the output, allowing the clean background
+        # outside the removal support to propagate across the whole shadow.
+        reference_size = max(
+            32,
+            int(getattr(self.args, "satd_background_reference_size", 256)),
         )
-        clean_reference = gaussian_blur(
-            base_target * clean_background,
+        scale = min(1.0, reference_size / float(max(size)))
+        reference_hw = (
+            max(8, int(round(size[0] * scale))),
+            max(8, int(round(size[1] * scale))),
+        )
+        reference_kernel = max(
+            3,
+            int(getattr(self.args, "satd_background_reference_kernel", 51)),
+        )
+        reference_kernel = min(reference_kernel, min(reference_hw))
+        if reference_kernel % 2 == 0:
+            reference_kernel -= 1
+        reference_kernel = max(1, reference_kernel)
+        reference_sigma = max(
+            0.5,
+            float(getattr(self.args, "satd_background_reference_sigma", 15.0)),
+        )
+        clean_background_ref = F.interpolate(
+            clean_background,
+            size=reference_hw,
+            mode="area",
+        ).clamp(0, 1)
+        background_reference_ref = F.interpolate(
+            background_reference,
+            size=reference_hw,
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0, 1)
+        clean_weight_ref = gaussian_blur(
+            clean_background_ref,
             kernel_size=reference_kernel,
-            sigma=15.0,
-        ) / clean_weight.clamp_min(1e-3)
-        clean_reference_valid = (clean_weight >= 0.04).to(image_01.dtype)
+            sigma=reference_sigma,
+        )
+        # Iterative normalized diffusion keeps the measured clean pixels
+        # anchored while smoothly filling the M_remove interior.  A single
+        # masked Gaussian produces disconnected rectangular colour islands;
+        # diffusion propagates the same local RGB field continuously across
+        # the whole shadow.
+        diffuse_kernel = min(reference_kernel, 17)
+        if diffuse_kernel % 2 == 0:
+            diffuse_kernel -= 1
+        clean_reference_ref = self._diffuse_fill(
+            background_reference_ref,
+            clean_background_ref,
+            iterations=48,
+            kernel_size=max(3, diffuse_kernel),
+            sigma=max(1.0, min(reference_sigma, 6.0)),
+        )
+        # Once there is enough clean background anywhere in the sample, the
+        # diffused field is valid throughout M_remove.  A per-pixel coverage
+        # threshold would mark the centre of a broad shadow invalid and fall
+        # back to SATD's yellow/grey candidate, producing disconnected colour
+        # blocks.  The field itself is still anchored only by clean pixels.
+        clean_area_ref = clean_background_ref.flatten(1).sum(dim=1, keepdim=True)
+        sample_has_clean_reference = (clean_area_ref >= 4.0).to(image_01.dtype)
+        clean_reference_valid_ref = sample_has_clean_reference.view(-1, 1, 1, 1).expand(
+            -1,
+            1,
+            reference_hw[0],
+            reference_hw[1],
+        )
+        clean_reference = F.interpolate(
+            clean_reference_ref,
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0, 1)
+        clean_reference_valid = F.interpolate(
+            clean_reference_valid_ref,
+            size=size,
+            mode="nearest",
+        ).clamp(0, 1)
         continuity_low = (
             clean_reference * clean_reference_valid
             + candidate_low * (1.0 - clean_reference_valid)
         ).clamp(0, 1)
-        # SATD remains the primary learned correction; the local field fixes
-        # its colour drift without erasing the background texture carried by
-        # the already-decoded PP image.
-        reference_low = (
-            0.65 * candidate_low + 0.35 * continuity_low
-        ).clamp(0, 1)
-        low_frequency_residual = reference_low - base_target_low
+        # SATD remains one source of the correction, but the clean reference
+        # must be measured against the *actual PP output*.  Comparing it only
+        # with ``base_target`` (the pre-PP author image) leaves PP's grey
+        # background offset untouched and merely makes the shadow lighter.
+        # Use a low-frequency PP field so this changes background illumination
+        # while preserving the output's high-frequency texture.
+        reference_weight = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    getattr(
+                        self.args,
+                        "satd_background_reference_weight",
+                        1.0,
+                    )
+                ),
+            ),
+        )
+        current_low = gaussian_blur(image_01, kernel_size=31, sigma=9.0)
+        satd_residual = candidate_low - base_target_low
+        # ``continuity_low`` is the RGB colour field reconstructed from clean
+        # unoccluded pixels.  Align it against the *current PP output*, not
+        # against the pre-PP author image.  The delta is applied to all RGB
+        # channels, so a green/white background is restored as green/white;
+        # the current high-frequency detail is retained because only the
+        # low-frequency component is replaced.
+        reference_residual = continuity_low - current_low
+        low_frequency_residual = (
+            (1.0 - reference_weight) * satd_residual
+            + reference_weight * reference_residual
+        ).clamp(-1, 1)
         raw_residual = candidate - base_target
-        # Prefer the smooth SATD/background estimate for continuity, retaining
-        # only a small native residual fraction so the result is not a flat
-        # white patch.
-        residual = 0.85 * low_frequency_residual + 0.15 * raw_residual
+        # Where a valid clean reference exists, use that RGB alignment alone:
+        # adding the raw SATD residual on top would pull the result away from
+        # the surrounding background again.  Pixels without enough clean
+        # support retain a small SATD fallback instead.
+        satd_fallback_residual = 0.85 * low_frequency_residual + 0.15 * raw_residual
+        reference_valid_rgb = clean_reference_valid.expand(-1, image_01.size(1), -1, -1)
+        residual = torch.where(
+            reference_valid_rgb > 0.5,
+            low_frequency_residual,
+            satd_fallback_residual,
+        )
+        # Every approved M_remove/background pixel must receive the continuous
+        # reference field.  A residual-magnitude gate leaves pale yellow holes
+        # whenever PP happens to produce a small but chromatically wrong
+        # residual, so it is retained only as a diagnostic confidence map and
+        # is not used to suppress the authorized write.
+        residual_energy = residual.abs().mean(dim=1, keepdim=True)
+        gate_floor = max(
+            0.0,
+            float(getattr(self.args, "satd_background_residual_gate_floor", 0.01)),
+        )
+        gate_ceiling = max(
+            gate_floor + 1e-4,
+            float(getattr(self.args, "satd_background_residual_gate_ceiling", 0.06)),
+        )
+        residual_gate = (
+            (residual_energy - gate_floor) / (gate_ceiling - gate_floor)
+        ).clamp(0, 1)
         strength = max(
             0.0,
-            min(1.5, float(getattr(self.args, "satd_background_residual_strength", 1.25))),
+            min(1.5, float(getattr(self.args, "satd_background_residual_strength", 1.0))),
         )
         feather_kernel = max(
             1,
@@ -6022,23 +6338,46 @@ class PostProcessModelV6(nn.Module):
                     kernel_size=feather_kernel,
                     sigma=max(0.5, feather_kernel / 4.0),
                 )
-                * effective_cleanup_support
-                * safe_region
-                * (1.0 - subject_guard).clamp(0, 1)
-                * (1.0 - earring_guard).clamp(0, 1)
+                * cleanup_support
+                * background_like
             ).clamp(0, 1)
-        result = (image_01 + strength * residual * alpha).clamp(0, 1)
+        # Replace the approved pixels with the locally propagated visible
+        # background field.  Adding a residual to the old image preserves the
+        # yellow/black source-hair texture; direct replacement removes it while
+        # leaving every pixel outside M_remove untouched.
+        write_alpha = (alpha * strength).clamp(0, 1)
+        result = (
+            image_01 * (1.0 - write_alpha)
+            + continuity_low * write_alpha
+        ).clamp(0, 1)
         aux["satd_pp_before_01"] = image_01.detach()
         aux["satd_pp_after_01"] = result.detach()
         aux["satd_background_cleanup_alpha"] = alpha.detach()
+        aux["satd_background_m_remove"] = cleanup_support.detach()
         aux["satd_background_ghost_hair_support"] = ghost_hair.detach()
+        aux["satd_background_ghost_hair_write"] = ghost_hair_write.detach()
+        aux["satd_background_target_hair_core"] = target_hair_core.detach()
         aux["satd_background_target_hair_authority"] = target_hair_authority.detach()
+        aux["satd_background_background_like"] = background_like.detach()
         aux["satd_background_hair_edge_background"] = hair_edge_background.detach()
         aux["satd_background_hair_edge_cleanup"] = hair_edge_cleanup.detach()
         aux["satd_background_effective_cleanup_support"] = effective_cleanup_support.detach()
         aux["satd_background_cleanup_residual"] = residual.detach()
         aux["satd_background_continuity_reference_01"] = continuity_low.detach()
-        aux["satd_background_clean_reference_weight"] = clean_weight.detach()
+        aux["satd_background_reference_target_01"] = continuity_low.detach()
+        aux["satd_background_continuity_confidence"] = residual_gate.detach()
+        aux["satd_background_reference_weight"] = torch.full(
+            (image_01.size(0), 1, 1, 1),
+            reference_weight,
+            device=image_01.device,
+            dtype=image_01.dtype,
+        )
+        aux["satd_background_clean_reference_weight"] = F.interpolate(
+            clean_weight_ref,
+            size=size,
+            mode="bilinear",
+            align_corners=False,
+        ).detach()
         aux["satd_background_cleanup_alpha_area"] = alpha.flatten(1).sum(
             dim=1, keepdim=True
         ).view(-1, 1, 1, 1).detach()
@@ -6086,16 +6425,11 @@ class PostProcessModelV6(nn.Module):
             and direct_flag.detach().float().amin().item() > 0.5
         )
         if direct_mode:
-            # SATD has already been encoded in the PP target.  Applying the
-            # same candidate again after StyleGAN would double the correction
-            # and is the source of the washed-out/halo output seen in prior
-            # runs.  Keep the decoded PP image untouched before earring-only
-            # composition.
-            background_cleaned = image
-            image_01 = normalized_to_01(image).clamp(0, 1)
-            aux["satd_pp_before_01"] = image_01.detach()
-            aux["satd_pp_after_01"] = image_01.detach()
-            aux["satd_background_cleanup_alpha"] = torch.zeros_like(image_01[:, :1])
+            # SATD is already present in the PP target, but PP can attenuate
+            # its background correction.  Re-apply only the independently
+            # gated background continuity residual; no face/hair/ear/neck
+            # pixel can enter this path.
+            background_cleaned = self._apply_satd_background_residual(image, aux)
         elif torch.is_tensor(direct_flag) and direct_flag.detach().float().amax().item() > 0.5:
             # Mixed batches are uncommon but valid: apply the legacy residual
             # only to non-direct samples, preserving direct samples exactly.

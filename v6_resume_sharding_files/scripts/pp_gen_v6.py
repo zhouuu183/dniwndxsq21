@@ -114,7 +114,7 @@ USER_MASK_BATCH_SIZE_SMALL = 8
 # torch container makes 100 samples need roughly 1.7 GB and can fail on a
 # quota-limited training volume. gzip is lossless: it changes only the outer
 # file container, not a serialized tensor value.
-USER_DATASET_COMPRESSION = "gzip"  # "gzip" or "none"
+USER_DATASET_COMPRESSION = "none"  # "gzip" or "none"
 USER_DATASET_GZIP_LEVEL = 1  # lossless and substantially faster than level 6
 
 USER_FACE_GALLERY_DIR_FULL = Path("/root/shared-nvme/HairFastGAN/images/FFHQ")
@@ -137,9 +137,7 @@ USER_SATD_CHECKPOINT_V8 = "/root/shared-nvme/hairfast_ppmodify/checkpoints/satd_
 # Match the inference blend used when SATD itself was trained.  The final
 # compositor applies this candidate exactly once instead of amplifying its RGB
 # difference after decoding.
-# Calibrated with scripts/satd_train_v8.py and scripts/v8.py.  The SATD
-# checkpoint predicts a residual, so 0.75 over-amplifies the same correction.
-USER_SATD_BLEND_V8 = 0.34
+USER_SATD_BLEND_V8 = 0.75
 USER_DIRECT_SATD_PP_INPUT = True
 USER_SATD_BOUNDARY_V8 = 8
 USER_EQ8_REFERENCE_BLEND_V8 = 0.0
@@ -469,7 +467,7 @@ def build_parser(defaults):
     parser.add_argument(
         "--allow_resume_policy_mismatch",
         action="store_true",
-        help="Allow resume when only code/model-policy fields changed; data and weights must match.",
+        help="Allow resume when only policy-file hashes changed.",
     )
     parser.add_argument(
         "--allow_legacy_blending_checkpoint_v8",
@@ -2489,43 +2487,6 @@ def _jsonable_config(value):
     return str(value)
 
 
-def _resume_policy_differences(previous, current, prefix=""):
-    """Return readable leaf-level differences between two config objects."""
-
-    differences = []
-    if isinstance(previous, dict) and isinstance(current, dict):
-        for key in sorted(set(previous) | set(current)):
-            child_prefix = f"{prefix}.{key}" if prefix else str(key)
-            if key not in previous:
-                differences.append((child_prefix, "<missing>", current[key]))
-            elif key not in current:
-                differences.append((child_prefix, previous[key], "<missing>"))
-            else:
-                differences.extend(
-                    _resume_policy_differences(previous[key], current[key], child_prefix)
-                )
-        return differences
-    if isinstance(previous, list) and isinstance(current, list):
-        if previous != current:
-            differences.append((prefix, previous, current))
-        return differences
-    if previous != current:
-        differences.append((prefix, previous, current))
-    return differences
-
-
-def _resume_distribution_identity(identity):
-    """Fields that must match when appending to an existing dataset."""
-
-    comparable = {
-        "schema_version": identity.get("schema_version"),
-        "generator_args": dict(identity.get("generator_args") or {}),
-        "checkpoints": identity.get("checkpoints"),
-    }
-    comparable["generator_args"].pop("allow_resume_policy_mismatch", None)
-    return comparable
-
-
 def build_dataset_identity(args, model_args) -> dict[str, object]:
     """Fingerprint the exact target distribution used by resumable PP data."""
 
@@ -2618,41 +2579,22 @@ def validate_pp_dataset_resume(args, model_args) -> None:
 
     if previous is not None and part_files_exist:
         if previous.get("identity_sha256") != identity["identity_sha256"]:
-            previous_distribution = _resume_distribution_identity(previous)
-            current_distribution = _resume_distribution_identity(identity)
-            distribution_differences = _resume_policy_differences(
-                previous_distribution,
-                current_distribution,
-            )
-            if distribution_differences:
-                for key, old_value, new_value in distribution_differences[:40]:
-                    print(f"[resume-mismatch] {key}: existing={old_value!r}, current={new_value!r}")
-                if len(distribution_differences) > 40:
-                    print(
-                        f"[resume-mismatch] ... and {len(distribution_differences) - 40} more difference(s)"
-                    )
+            previous_without_code = dict(previous)
+            current_without_code = dict(identity)
+            previous_without_code.pop("identity_sha256", None)
+            current_without_code.pop("identity_sha256", None)
+            previous_without_code.pop("code_sha256", None)
+            current_without_code.pop("code_sha256", None)
+            for metadata in (previous_without_code, current_without_code):
+                generator_args = metadata.get("generator_args")
+                if isinstance(generator_args, dict):
+                    generator_args.pop("allow_resume_policy_mismatch", None)
+            if not (args.allow_resume_policy_mismatch and previous_without_code == current_without_code):
                 raise RuntimeError(
-                    f"Cannot mix PP dataset policies in {output}: data paths, weights, or generation "
-                    "settings changed. Use the exact original command or a fresh output directory."
+                    f"Cannot mix PP dataset policies in {output}: code, checkpoint, or generation "
+                    "settings changed. Use a fresh output directory and regenerate all parts."
                 )
-            if not args.allow_resume_policy_mismatch:
-                previous_without_identity = dict(previous)
-                current_without_identity = dict(identity)
-                previous_without_identity.pop("identity_sha256", None)
-                current_without_identity.pop("identity_sha256", None)
-                differences = _resume_policy_differences(
-                    previous_without_identity,
-                    current_without_identity,
-                )
-                for key, old_value, new_value in differences[:40]:
-                    print(f"[resume-mismatch] {key}: existing={old_value!r}, current={new_value!r}")
-                if len(differences) > 40:
-                    print(f"[resume-mismatch] ... and {len(differences) - 40} more difference(s)")
-                raise RuntimeError(
-                    f"Cannot resume {output}: code/model-policy fields changed. "
-                    "Re-run with --allow_resume_policy_mismatch after verifying the files."
-                )
-            print("[resume] code/model-policy fields changed; data and checkpoint policy match.")
+            print("[resume] only policy-file hashes changed; continuing explicitly.")
 
     temporary = config_path.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -2695,59 +2637,11 @@ def main(args):
             f"--shard_index must be in [0, {args.num_shards}); got {args.shard_index}"
         )
 
-    # Resolve model/checkpoint paths relative to this repository, not the
-    # shell's current working directory.  Running
-    # ``python /data/coding/hairfast_ppmodify/scripts/pp_gen_v6.py`` from
-    # ``/data/coding`` must still use the weights under the project itself.
-    repo_root = Path(__file__).resolve().parents[1]
-    # The author project keeps the large pretrained tree outside this V6
-    # checkout on the training servers.  Pick it automatically when present;
-    # this also keeps all legacy modules that use relative asset paths
-    # (e4e, BiSeNet, ShapeAdaptor, ArcFace, SEAN) on the same asset root.
-    asset_root = repo_root
-    for candidate in (
-        repo_root,
-        repo_root.parent / "HairFastGAN-main",
-        Path("/data/coding/HairFastGAN/HairFastGAN-main"),
-    ):
-        if (candidate / "pretrained_models" / "StyleGAN" / "ffhq.pt").is_file():
-            asset_root = candidate.resolve()
-            break
-
-    def resolve_project_path(value):
-        if value in {None, ""}:
-            return value
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            project_candidate = repo_root / path
-            asset_candidate = asset_root / path
-            path = project_candidate if project_candidate.exists() else asset_candidate
-        return str(path.resolve())
-
-    # Resolve user-facing paths before changing cwd so relative output and
-    # gallery paths retain the caller's intended location.
-    args.output = Path(args.output).expanduser().resolve()
-    if args.face_gallery_dir is not None:
-        args.face_gallery_dir = Path(args.face_gallery_dir).expanduser().resolve()
-    if args.donor_gallery_dir is not None:
-        args.donor_gallery_dir = Path(args.donor_gallery_dir).expanduser().resolve()
-    args.blending_checkpoint = resolve_project_path(args.blending_checkpoint)
-    args.satd_checkpoint_v8 = resolve_project_path(args.satd_checkpoint_v8)
-
-    # Several original author modules intentionally use paths relative to the
-    # project root.  Enter the selected asset root once before constructing
-    # those modules; checkpoint options above are already absolute.
-    os.chdir(asset_root)
-
     seed_everything(args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
 
     model_parser = get_parser()
     model_args = model_parser.parse_args([])
-    model_args.ckpt = resolve_project_path(model_args.ckpt)
-    model_args.rotate_checkpoint = resolve_project_path(model_args.rotate_checkpoint)
-    model_args.pp_checkpoint = resolve_project_path(model_args.pp_checkpoint)
-    model_args.pp_v6_checkpoint = resolve_project_path(model_args.pp_v6_checkpoint)
     model_args.smooth = args.smooth
     model_args.blending_checkpoint = args.blending_checkpoint
     model_args.allow_legacy_blending_checkpoint_v8 = args.allow_legacy_blending_checkpoint_v8
@@ -2853,9 +2747,6 @@ def main(args):
             }
         )
 
-    # Build the complete deterministic pairing list before slicing.  Both
-    # servers therefore see identical source/shape/colour assignments and
-    # process disjoint sample indices.
     experiments = [
         experiment
         for index, experiment in enumerate(all_experiments)

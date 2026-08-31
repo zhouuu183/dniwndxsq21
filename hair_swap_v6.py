@@ -158,7 +158,8 @@ def get_parser():
     parser.add_argument("--satd_checkpoint_v8", type=str, default="")
     # V6 applies SATD to the blended F feature before decoding, then feeds the
     # resulting I_satd_blend_256 directly into PP.
-    parser.add_argument("--satd_blend_v8", type=float, default=0.75)
+    # Keep the original SATD training/inference calibration.
+    parser.add_argument("--satd_blend_v8", type=float, default=0.34)
     parser.add_argument(
         "--direct_satd_pp_input",
         type=str2bool,
@@ -203,13 +204,55 @@ def get_parser():
         help="How far M_remove support may authorize hair-edge background cleanup.",
     )
     parser.add_argument("--satd_background_hair_edge_strength", type=float, default=1.0)
-    parser.add_argument("--satd_background_residual_strength", type=float, default=1.25)
+    parser.add_argument(
+        "--satd_background_shadow_corridor_dilate",
+        type=int,
+        default=140,
+        help="Background-only corridor around transferred hair for residual cleanup.",
+    )
+    parser.add_argument("--satd_background_residual_strength", type=float, default=1.0)
     parser.add_argument("--satd_background_alpha_feather", type=int, default=7)
+    parser.add_argument(
+        "--satd_background_residual_gate_floor",
+        type=float,
+        default=0.01,
+        help="Residual magnitude below which background restoration is suppressed.",
+    )
+    parser.add_argument(
+        "--satd_background_residual_gate_ceiling",
+        type=float,
+        default=0.06,
+        help="Residual magnitude at which background restoration reaches full strength.",
+    )
+    parser.add_argument(
+        "--satd_background_reference_size",
+        type=int,
+        default=256,
+        help="Working resolution used to propagate unoccluded background colour.",
+    )
+    parser.add_argument(
+        "--satd_background_reference_kernel",
+        type=int,
+        default=51,
+        help="Blur kernel for normalized clean-background colour sampling.",
+    )
+    parser.add_argument(
+        "--satd_background_reference_sigma",
+        type=float,
+        default=15.0,
+        help="Gaussian sigma for clean-background colour sampling.",
+    )
+    parser.add_argument(
+        "--satd_background_reference_weight",
+        type=float,
+        default=1.0,
+        help="Weight of clean unoccluded background when rebuilding the removed-shadow region.",
+    )
     parser.add_argument(
         "--satd_earring_protect_dilate",
         type=int,
-        default=7,
-        help="Source earring guard radius applied before SATD modifies the F feature.",
+        default=3,
+        help="Narrow source earring guard radius used only on M_remove overlap.",
     )
     parser.add_argument(
         "--satd_earring_hair_continuation_protect_dilate",
